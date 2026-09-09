@@ -1,0 +1,66 @@
+site_name: allbilly wiki
+site_url: https://allbilly.github.io/
+repo_url: https://github.com/allbilly
+repo_name: allbilly
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: black
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Light mode
+
+  features:
+    - navigation.indexes
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+
+plugins:
+  - search
+
+validation:
+  links:
+    absolute_links: ignore
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+
+extra_css:
+  - assets/extra.css
+
+nav:
+  - Home: index.md
+  - NPU:
+      - npu/index.md
+      - RK3588: npu/rk3588.md
+      - Apple ANE: npu/apple-ane.md
+      - NVDLA: npu/nvdla.md
+      - AMD XDNA: npu/amd-xdna.md
+  - GPU:
+      - gpu/index.md
+      - nvgpu: gpu/nvgpu.md
+      - amdgpu: gpu/amdgpu.md
+      - Mali: gpu/mali.md
+      - RK3588 Mali: gpu/rk3588gpu.md
+      - Vortex: gpu/vortex.md
+  - Blog:
+      - XDNA 4D DMA: blog/xdna-4d-dma.md

@@ -1,0 +1,39 @@
+.md-grid {
+  max-width: 1440px;
+}
+
+:root {
+  --md-primary-fg-color: #111318;
+  --md-default-bg-color: #1b1e26;
+}
+
+.md-header {
+  background-color: #111318;
+}
+
+.md-sidebar--primary {
+  width: 18rem;
+}
+
+.md-sidebar--primary .md-sidebar__scrollwrap {
+  padding-left: 2.75rem;
+  padding-right: 1rem;
+  scrollbar-width: none;
+}
+
+/* Keep the documentation tree visible like the tinygrad docs on desktop. */
+@media screen and (min-width: 768px) {
+  .md-sidebar--primary {
+    display: block;
+    visibility: visible;
+    transform: none;
+  }
+
+  .md-header__button[for="__drawer"] {
+    display: none;
+  }
+
+  .md-overlay {
+    display: none;
+  }
+}
