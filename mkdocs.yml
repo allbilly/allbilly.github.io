@@ -63,4 +63,4 @@ nav:
       - RK3588 Mali: gpu/rk3588gpu.md
       - Vortex: gpu/vortex.md
   - Blog:
-      - XDNA 4D DMA: blog/xdna-4d-dma.md
+      - Understanding AMD XDNA (part 1): blog/xdna-4d-dma.md

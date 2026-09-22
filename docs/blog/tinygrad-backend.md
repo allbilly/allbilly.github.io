@@ -316,14 +316,15 @@ and then pack our inputs
 ```diff
 +  def add(self, a:list[float], b:list[float]) -> list[float]:
 +    assert b is not None and len(a) == len(b)
-+    result:list[float] = []
++    result:list = []
 +    # The captured register sequence processes eight FP16 elements per submission.
 +    for start in range(0, len(a), 8):
-+      lhs, rhs = a[start:start+8], b[start:start+8]
-+      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8e", *(lhs + [0.0] * (8 - len(lhs))))
++      lanes, rhs = a[start:start+8], b[start:start+8]
++      packed = struct.pack("<8e", *(lanes + [0] * (8-len(lanes))))
++      to_mv(self.dev.input_buf, 16)[:] = packed
 +      to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8 - len(rhs))))
 +      self.submit()
-+      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lhs)])
++      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
 +    return result
 ```
 
@@ -418,7 +419,7 @@ We passed test_add on NPU, next for MUL. To add NPU MUL support, we shdnt rely o
 I wrote a decode script(https://github.com/allbilly/npu/blob/master/ops_reg/dump.py) to decode the RKNN weight BO, why weight u might ask, because RKNN put weight and regcmd in the same BO.
 You can use it with RKNN gdb here(https://github.com/allbilly/npu/blob/master/ops_reg/run.sh) and here(https://github.com/allbilly/npu/blob/master/ops_reg/test.gdb)
 
-The decoded registers are here (https://github.com/allbilly/rk3588/blob/c6944a6/examples/elementwise.py#L295-L352). This version also has `CAST_BOOL_HALF`, which runs an INT16 MUL on 0/1 lanes to form the FP16 bit patterns. We will expose that CAST to tinygrad later; for now we can carry its register mode into the builder.
+The decoded registers are in `~/rk3588/examples/elementwise.py`. The local example now has `CAST_BOOL_HALF`, which runs an INT16 MUL on 0/1 lanes to form the FP16 bit patterns, and `CAST_HALF_BOOL`, which converts an FP16 0/1 mask to packed bool bytes. We will expose those CASTs to tinygrad later; for now we can carry their register modes into the builder.
 Most important one for us is EW_CFG, and TRM shows
 
 | Bit   | Attr | Reset | Description |
@@ -467,65 +468,111 @@ MUL is is in ew_op_type
 And from the RKNN capture and playing around with different val, "MUL" would need to set not only DPU_EW_CFG_EW_OP_TYPE but also DPU_EW_CFG_EW_OP_CVT_BYPASS
 
 The following is extracted from elementwise.py in allbilly/rk3588
+The byte-output mode processes sixteen lanes per task: MRDMA reads the first eight FP16 values, ERDMA reads the next eight, and the output is sixteen bytes. The example pads the last atom and submits these conversion atoms separately. `CAST_HALF_BOOL` rejects inputs other than 0/1.
 ```python
 int16_mode = op == "CAST_BOOL_HALF"
-out_precision = 1 if int16_mode else (2 if hw_out_fp16 else 5)
+byte_output = op == "CAST_HALF_BOOL"
+out_precision = 0 if byte_output else 1 if int16_mode else (2 if hw_out_fp16 else 5)
 precision = 1 if int16_mode else 2
-out_cvt_scale = (1 if fdiv_op or int16_mode else ((1 << 16) | 1)) if hw_out_fp16 else 0
-scale_reg = reg.EW_CVT_SCALE_VALUE if int16_mode else reg.OUT_CVT_SCALE
+out_cvt_scale = (1 if fdiv_op or int16_mode or byte_output else ((1 << 16) | 1)) if hw_out_fp16 else 0
 
 task_regs.append([
     E(reg.DPU,  reg.S_POINTER, 0x0000000E),
     E(reg.DPU,  reg.FEATURE_MODE_CFG,
-        ((15 << 5) |                          # DPU_FEATURE_MODE_CFG_BYPASS
-          (2 << 1)  |                          # DPU_FEATURE_MODE_CFG_MODE
-          1)                                    # DPU_FEATURE_MODE_CFG_FLYING_MODE
+        ((byte_output << 31) |               # DPU_FEATURE_MODE_CFG_COMB_USE
+         (15 << 5) |                          # DPU_FEATURE_MODE_CFG_BYPASS
+         (2 << 1)  |                          # DPU_FEATURE_MODE_CFG_MODE
+         1)                                    # DPU_FEATURE_MODE_CFG_FLYING_MODE
     ),
     E(reg.DPU,  reg.DATA_FORMAT,
         ((out_precision << 29) |              # DPU_DATA_FORMAT_OUT_PRECISION
-          (precision << 26) |                  # DPU_DATA_FORMAT_IN_PRECISION
-          precision)                            # DPU_DATA_FORMAT_PROC_PRECISION
+         (precision << 26) |                  # DPU_DATA_FORMAT_IN_PRECISION
+         precision)                            # DPU_DATA_FORMAT_PROC_PRECISION
     ),
     E(reg.DPU,  reg.DATA_CUBE_WIDTH, dataout_width),
     E(reg.DPU,  reg.DATA_CUBE_HEIGHT, 0),
     E(reg.DPU,  reg.DATA_CUBE_NOTCH, 0),
     E(reg.DPU,  reg.DATA_CUBE_CHANNEL,
-        ((7 << 16) |                          # DPU_DATA_CUBE_CHANNEL_CUBE
-          7)                                    # DPU_DATA_CUBE_CHANNEL_ATOMICS
+        (((15 if byte_output else 7) << 16) | # DPU_DATA_CUBE_CHANNEL_CUBE
+         (15 if byte_output else 7))           # DPU_DATA_CUBE_CHANNEL_ATOMICS
     ),
+    # Each task owns its bypass state, including after BS/BN comparisons.
+    E(reg.DPU,  reg.BS_CFG,
+        ((1 << 6) |                          # DPU_BS_CFG_BS_RELU_BYPASS
+         ((not byte_output) << 4) |           # DPU_BS_CFG_BS_MUL_BYPASS
+         (1 << 1) |                          # DPU_BS_CFG_BS_ALU_BYPASS
+         (not byte_output))                   # DPU_BS_CFG_BS_BYPASS
+    ),
+    E(reg.DPU,  reg.BN_CFG,
+        (((2 if byte_output else 0) << 16) |  # DPU_BN_CFG_BN_ALU_ALGO: ADD
+         (1 << 6) |                          # DPU_BN_CFG_BN_RELU_BYPASS
+         (1 << 4) |                          # DPU_BN_CFG_BN_MUL_BYPASS
+         ((not byte_output) << 1) |           # DPU_BN_CFG_BN_ALU_BYPASS
+         (not byte_output))                   # DPU_BN_CFG_BN_BYPASS
+    ),
+    # Clear operands and clamp values left by earlier BS/BN tasks.
+    E(reg.DPU,  reg.BS_ALU_CFG, 0),
+    E(reg.DPU,  reg.BS_MUL_CFG,
+        (int(np.float16(1.0).view(np.uint16)) << 16) if byte_output else 0), # DPU_BS_MUL_CFG_BS_MUL_OPERAND
+    E(reg.DPU,  reg.BN_ALU_CFG, 0),
+    E(reg.DPU,  reg.BN_MUL_CFG, 0),
+    E(reg.DPU,  reg.BS_RELUX_CMP_VALUE, 0),
+    E(reg.DPU,  reg.BN_RELUX_CMP_VALUE, 0),
     E(reg.DPU,  reg.EW_CFG,
+        ((1 << 9) |                          # DPU_EW_CFG_EW_RELU_BYPASS
+         (1 << 8) |                          # DPU_EW_CFG_EW_OP_CVT_BYPASS
+         (1 << 7) |                          # DPU_EW_CFG_EW_LUT_BYPASS
+         (1 << 1) |                          # DPU_EW_CFG_EW_OP_BYPASS
+         1) if byte_output else              # DPU_EW_CFG_EW_BYPASS
         # selects MAX=0, ADD=2, FDIV=3, SUB=4 when EW_OP_TYPE[2]=0.
         # MUL/NEG/CAST_BOOL_HALF use EW_OP_TYPE[2]=1 instead of an ALU selector.
         # Base config: data_mode=1, data_size=2, relu_bypass=1, lut_bypass=1, op_src=1
         ((1 << 28) |                         # DPU_EW_CFG_EW_DATA_MODE
-          (2 << 22) |                         # DPU_EW_CFG_EDATA_SIZE
-          ({"MAX": 0, "ADD": 2, "FDIV": 3, "SUB": 4}.get(op, 0) << 16) |  # DPU_EW_CFG_EW_ALU_ALGO
-          (1 << 9)  |                         # DPU_EW_CFG_EW_RELU_BYPASS
-          ((op in ("MUL", "NEG", "FDIV") and not int16_mode) << 8) |  # DPU_EW_CFG_EW_OP_CVT_BYPASS
-          (1 << 7)  |                         # DPU_EW_CFG_EW_LUT_BYPASS
-          (1 << 6)  |                         # DPU_EW_CFG_EW_OP_SRC
-          ((op in ("MUL", "NEG", "CAST_BOOL_HALF")) << 2))  # DPU_EW_CFG_EW_OP_TYPE: MUL (0 selects ALU)
+         (2 << 22) |                         # DPU_EW_CFG_EDATA_SIZE
+         ({"MAX": 0, "ADD": 2, "FDIV": 3, "SUB": 4}.get(op, 0) << 16) |  # DPU_EW_CFG_EW_ALU_ALGO
+         (1 << 9)  |                         # DPU_EW_CFG_EW_RELU_BYPASS
+         ((op in ("MUL", "NEG", "FDIV") and not int16_mode) << 8) |  # DPU_EW_CFG_EW_OP_CVT_BYPASS
+         (1 << 7)  |                         # DPU_EW_CFG_EW_LUT_BYPASS
+         (1 << 6)  |                         # DPU_EW_CFG_EW_OP_SRC
+         ((op in ("MUL", "NEG", "CAST_BOOL_HALF")) << 2))  # DPU_EW_CFG_EW_OP_TYPE: MUL (0 selects ALU)
     ),
-    E(reg.DPU,  scale_reg, out_cvt_scale),
+    E(reg.DPU,  reg.EW_CVT_SCALE_VALUE, 1),
+    E(reg.DPU,  reg.OUT_CVT_OFFSET, 0),  # No bias from a previous output conversion.
+    E(reg.DPU,  reg.OUT_CVT_SCALE, out_cvt_scale),
+    E(reg.DPU,  reg.OUT_CVT_SHIFT, 0),  # Clear exponent adjustment left by comparisons.
     E(reg.RDMA, reg.RDMA_S_POINTER, 0x0000000E),
     E(reg.RDMA, reg.RDMA_DATA_CUBE_WIDTH, dataout_width),
     E(reg.RDMA, reg.RDMA_DATA_CUBE_HEIGHT, 0),
-    E(reg.RDMA, reg.RDMA_DATA_CUBE_CHANNEL, 7),
+    E(reg.RDMA, reg.RDMA_DATA_CUBE_CHANNEL, 15 if byte_output else 7),
     E(reg.RDMA, reg.RDMA_ERDMA_CFG,
         ((1 << 30) |                          # DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE
-          (2 << 2))                            # DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE
+         (2 << 2))                            # DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE
     ),
     E(reg.DPU,  reg.DST_BASE_ADDR, output_addr),
     E(reg.RDMA, reg.RDMA_SRC_BASE_ADDR, input_addr),
     E(reg.RDMA, reg.RDMA_EW_BASE_ADDR, weight_addr),
     E(reg.RDMA, reg.RDMA_FEATURE_MODE_CFG,
-        ((precision << 15) |                  # DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION
-          (15 << 11) |                         # DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN
-          (precision << 5) |                   # DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION
-          ((not fdiv_op and not int16_mode) << 3) |  # DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN
-          1)                                    # DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE
+        (((3 if byte_output else 0) << 8) |   # DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE
+         (precision << 15) |                  # DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION
+         (15 << 11) |                         # DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN
+         (precision << 5) |                   # DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION
+         ((not fdiv_op and not int16_mode) << 3) |  # DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN
+         1)                                    # DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE
     ),
+    E(reg.RDMA, reg.RDMA_SURF_NOTCH, (1 if byte_output else 0) << 4), # RDMA_SURF_NOTCH_ADDR
+    E(reg.RDMA, reg.RDMA_EW_SURF_NOTCH, (1 if byte_output else 0) << 4), # RDMA_EW_SURF_NOTCH
 ])
+if byte_output:
+    task_regs[-1] += [
+        E(reg.DPU, reg.BS_OW_CFG, 1 << 1),     # DPU_BS_OW_CFG_OD_BYPASS
+        E(reg.DPU, reg.WDMA_SIZE_0, 15),       # DPU_WDMA_SIZE_0_CHANNEL_WDMA
+        E(reg.DPU, reg.WDMA_SIZE_1, 0),        # DPU_WDMA_SIZE_1_WIDTH/HEIGHT_WDMA
+        E(reg.DPU, reg.DST_SURF_STRIDE, 1 << 4), # DPU_DST_SURF_STRIDE
+        E(reg.DPU, reg.SURFACE_ADD, 1 << 4),   # DPU_SURFACE_ADD_SURF_ADD
+        E(reg.RDMA, reg.RDMA_BRDMA_CFG, 0),
+        E(reg.RDMA, reg.RDMA_NRDMA_CFG, 0),
+        E(reg.RDMA, reg.RDMA_EW_SURF_STRIDE, 2 << 4), # RDMA_EW_SURF_STRIDE
+    ]
 ```
 
 Now replace the hardcoded hex blob in npu_regs in RockchipProgram. 
@@ -535,6 +582,8 @@ Here we use the `rk` shifts CONSTANT from autogen
 ```diff
 -ops_map = {Ops.ADD: 2}
 +ops_map = {Ops.ADD: 2, Ops.MUL: 0}
++
++def fp16(value:float) -> int: return int.from_bytes(struct.pack("<e", value), "little")
 @@
  class RockchipProgram(Program['RockchipDevice']):
 @@
@@ -544,11 +593,11 @@ Here we use the `rk` shifts CONSTANT from autogen
 @@
 +    self.npu_regs:list[int] = []
 +
-+  def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None) -> None:
++  def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
++                      input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 +    E = self.EMIT
-+    zero_tag, mask_bool = custom == "rk_zero_tag", custom == "rk_mask_to_bool"
-+    assert custom is None or (op is Ops.CUSTOM and custom in ("rk_zero_tag", "rk_mask_to_bool") and not int16_mode)
-+    def fp16(value:float) -> int: return int.from_bytes(struct.pack("<e", value), "little")
++    exp_shift = custom == "fp16_exponent_shift_minus(16)"
++    assert custom is None or (op is Ops.CUSTOM and custom == "fp16_exponent_shift_minus(16)" and not int16_mode)
 +    pc_enable = 0x80 # E adds 1: operation-enable target 0x0081, distinct from rk.PC (PC register writes).
 +    precision = 1 if int16_mode else 2
      self.npu_regs = [
@@ -568,83 +617,94 @@ Here we use the `rk` shifts CONSTANT from autogen
 -      0x0081000000180008,
 +      E(rk.DPU, rk.REG_DPU_S_POINTER, 0xE),
 +      E(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
++        (byte_output << rk.DPU_FEATURE_MODE_CFG_COMB_USE__SHIFT) |
 +        (15 << rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT) |
 +        (2 << rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT) |
 +        (1 << rk.DPU_FEATURE_MODE_CFG_FLYING_MODE__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_DATA_FORMAT,
-+        ((1 if mask_bool else precision) << rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT) |
++        ((0 if byte_output else precision) << rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT) |
 +        (precision << rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT) |
 +        (precision << rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH, 0),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, 0),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
-+        (7 << rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT) |
-+        (7 << rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT)),
++        ((15 if byte_output else 7) << rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT) |
++        ((15 if byte_output else 7) << rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_BS_CFG,
-+        (2 << rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT) |
++        ((0 if byte_output else 2) << rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT) |
 +        (1 << rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT) |
-+        (1 << rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT) if zero_tag else
++        (1 << rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT) if exp_shift or byte_output else
 +        (1 << rk.DPU_BS_CFG_BS_BYPASS__SHIFT) | (1 << rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT) |
 +        (1 << rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT) | (1 << rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_BN_CFG,
++        (2 << rk.DPU_BN_CFG_BN_ALU_ALGO__SHIFT) | (1 << rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT) |
++        (1 << rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT) if byte_output else
 +        (1 << rk.DPU_BN_CFG_BN_BYPASS__SHIFT) | (1 << rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT) |
 +        (1 << rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT) | (1 << rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0),
 +      E(rk.DPU, rk.REG_DPU_BS_MUL_CFG,
-+        (fp16(float("inf")) << rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT) if zero_tag else 0),
++        (fp16(1.0) << rk.DPU_BS_MUL_CFG_BS_MUL_OPERAND__SHIFT) if exp_shift or byte_output else 0),
 +      E(rk.DPU, rk.REG_DPU_BS_OW_CFG, 1 << rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT),
-+      E(rk.DPU, rk.REG_DPU_WDMA_SIZE_0, 7),
++      E(rk.DPU, rk.REG_DPU_WDMA_SIZE_0, 15 if byte_output else 7),
 +      E(rk.DPU, rk.REG_DPU_WDMA_SIZE_1, 0),
 +      E(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0),
++      E(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0),
 +      E(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0),
 +      E(rk.DPU, rk.REG_DPU_EW_CFG,
 +        (1 << rk.DPU_EW_CFG_EW_BYPASS__SHIFT) | (1 << rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) | (1 << rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT) |
-+        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) if zero_tag else
++        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) if exp_shift or byte_output else
 +        (1 << rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT) |
 +        (2 << rk.DPU_EW_CFG_EDATA_SIZE__SHIFT) |
-+        ((0 if mask_bool else self.ops_map[op]) << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
++        (self.ops_map[op] << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) |
-+        ((not int16_mode and (mask_bool or op in (Ops.MUL, Ops.NEG, Ops.FDIV))) << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) |
++        ((not int16_mode and op in (Ops.MUL, Ops.NEG, Ops.FDIV)) << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT) |
 +        ((op is not Ops.NEG) << rk.DPU_EW_CFG_EW_OP_SRC__SHIFT) |
-+        ((mask_bool or op in (Ops.MUL, Ops.NEG)) << rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT)),
++        ((op in (Ops.MUL, Ops.NEG)) << rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0),
-+      E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, (16 if zero_tag else 0) << rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT),
-+      E(rk.DPU, rk.REG_DPU_SURFACE_ADD, (2 if int16_mode or zero_tag or mask_bool else 4) << rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT),
++      E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, (16 if exp_shift else 0) << rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT),
++      E(rk.DPU, rk.REG_DPU_SURFACE_ADD,
++        (1 if byte_output else 2 if int16_mode or exp_shift else 4) << rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
-+        ((not int16_mode and not mask_bool and op is not Ops.FDIV) << rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT) |
++        ((not int16_mode and not byte_output and op is not Ops.FDIV) << rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT) |
 +        (1 << rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT)),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_S_POINTER, 0xE),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, 0),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, 0),
-+      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 7),
++      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, 15 if byte_output else 7),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
 +        (1 << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT) |
 +        (2 << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT) |
-+        ((zero_tag or op is Ops.NEG) << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE__SHIFT)),
-+      E(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, self.dev.output_mem.dma_addr),
-+      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, self.dev.input_mem.dma_addr),
++        ((exp_shift or op is Ops.NEG) << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE__SHIFT)),
++      E(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, self.dev.output_mem.dma_addr if output_addr is None else output_addr),
++      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, self.dev.input_mem.dma_addr if input_addr is None else input_addr),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
++        ((3 if byte_output else 0) << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__SHIFT) |
 +        (precision << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__SHIFT) |
 +        (15 << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__SHIFT) |
 +        (precision << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT) |
 +        ((not int16_mode and op is not Ops.FDIV) << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT) |
 +        (1 << rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT)),
++      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SURF_NOTCH,
++        (1 if byte_output else 0) << rk.DPU_RDMA_RDMA_SURF_NOTCH_SURF_NOTCH_ADDR__SHIFT),
++      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_NOTCH,
++        (1 if byte_output else 0) << rk.DPU_RDMA_RDMA_EW_SURF_NOTCH_EW_SURF_NOTCH__SHIFT),
 +    ]
-+    if zero_tag or mask_bool:
++    if exp_shift or byte_output:
 +      self.npu_regs += [
-+        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_BRDMA_CFG, 1),
-+        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_NRDMA_CFG, 1),
-+        E(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, 2 << rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT),
++        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_BRDMA_CFG, 0 if byte_output else 1),
++        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_NRDMA_CFG, 0 if byte_output else 1),
++        E(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, (1 if byte_output else 2) << rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT),
 +        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, 2 << rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__SHIFT),
 +      ]
 +    if op is Ops.NEG:
 +      self.npu_regs.append(E(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, fp16(-1.0)))
 +    else:
-+      self.npu_regs.append(E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR, self.dev.weight_mem.dma_addr))
++      self.npu_regs.append(E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
++                            self.dev.weight_mem.dma_addr if weight_addr is None else weight_addr))
 +    self.npu_regs.append(E(pc_enable, rk.REG_PC_OPERATION_ENABLE,
 +      rk.GLOBAL_OPERATION_ENABLE_DPU_OP_EN__MASK | rk.GLOBAL_OPERATION_ENABLE_DPU_RDMA_OP_EN__MASK))
 @@
@@ -652,7 +712,7 @@ Here we use the `rk` shifts CONSTANT from autogen
 +  def alu(self, op:Ops, a:list[float], b:list[float]) -> list[float]:
      assert b is not None and len(a) == len(b)
 +    self.build_registers(op)
-     result:list[float] = []
+     result:list = []
 @@
            if dtypes.is_float(u.dtype):
              if u.op not in self.ops_map or u.dtype != dtypes.half:
@@ -665,7 +725,9 @@ Here we use the `rk` shifts CONSTANT from autogen
 
 The decoded builder includes both operand routes. Binary ADD and MUL use `EW_OP_SRC=1` and read the second tensor through ERDMA. NEG uses the MUL datapath with `EW_OP_SRC=0`, reads FP16 `-1.0` from `EW_OP_VALUE_0`, and disables ERDMA. The FDIV converter settings are here too. Neither NEG nor FDIV is exposed in `ops_map` yet; this keeps the register setup together while the next step still tests only ADD and MUL.
 
-The builder also carries the example's `CAST_BOOL_HALF` INT16 mode now, but does not expose a general INT16 ALU op to tinygrad. `elementwise.py` resets the NPU before each submit; `RockchipProgram` does not. For the INT16 task, we therefore also write the BS/BN bypass, output scale/shift, and surface registers so it initializes that path after an FP16 task. Those extra writes are a runtime adaptation, not lines copied from the example. The later CAST step only needs to pack its bool lanes and select `int16_mode=True`.
+The builder also carries the example's `CAST_BOOL_HALF` INT16 mode and `CAST_HALF_BOOL` byte-output mode now, but does not expose those CASTs to tinygrad yet. Both paths explicitly initialize their register state. The optional DMA addresses keep the example's variable input/weight/output addresses; omitting them uses the device's default buffers. The exponent-shift mode multiplies by 1 and adjusts the exponent; its MUL inf input will be a separate UOp.
+
+The standalone byte-output mode can be tested with `python ~/rk3588/examples/elementwise.py CAST_HALF_BOOL`. It passed sizes 1, 3, 7, 8, 9, 15, 16, 17, 31, 32 and 4096, checking the raw packed output bytes as well as the bool values.
 
 now lets run test_add, test_tiny_mul and test_mul
 
@@ -718,13 +780,13 @@ test_sub is simply add Ops.SUB: 4 to ops_map, while Ops.NEG is an unary Ops, so 
 -  def alu(self, op:Ops, a:list[float], b:list[float]) -> list[float]:
 +  def alu(self, op:Ops, a:list[float], b:list[float]|None=None) -> list[float]:
 -    assert b is not None and len(a) == len(b)
-+    if op is Ops.NEG: assert b is None
-+    else: assert b is not None and len(a) == len(b)
++    assert (b is None and op is Ops.NEG) or (b is not None and len(a) == len(b))
      self.build_registers(op)
 @@
--      lhs, rhs = a[start:start+8], b[start:start+8]
-+      lhs = a[start:start+8]
-       to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8e", *(lhs + [0.0] * (8 - len(lhs))))
+-      lanes, rhs = a[start:start+8], b[start:start+8]
++      lanes = a[start:start+8]
+       packed = struct.pack("<8e", *(lanes + [0] * (8-len(lanes))))
+       to_mv(self.dev.input_buf, 16)[:] = packed
 -      to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8 - len(rhs))))
 +      if b is not None:
 +        rhs = b[start:start+8]
@@ -897,12 +959,9 @@ $ VIZ=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backe
 ```
 ![alt text](image-1.png)
 
-We found tinygrad rewrite Ops.MAX(dtypes.bool) into Ops.OR(dtypes.bool) for bool input, which we were only allowing dtypes.float16 before.
+We found tinygrad rewrite Ops.MAX(dtypes.bool) into Ops.OR(dtypes.bool) for bool input, which we were only allowing dtypes.half before.
 The solution is Pattern Matcher, its rewrite the UOps tree according to a predefined rule.
 We can add one to rewrite Ops.OR(dtypes.bool) into Ops.MAX(dtypes.half) in `RockchipRenderer.extra_matcher` and `RockchipProgram` would recieved the rewritten Uops tree
-
-TODO: standardize use dtypes.half or dtypes.float16
-
 
 ```diff
 -from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp
@@ -911,6 +970,7 @@ TODO: standardize use dtypes.half or dtypes.float16
  class RockchipRenderer(Renderer):
    code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
 +  extra_matcher = PatternMatcher([
++    # Bool OR is MAX of the FP16 0/1 inputs.
 +    (UPat(Ops.OR, dtypes.bool, name="u"),
 +     lambda u: u.src[0].cast(dtypes.half).maximum(u.src[1].cast(dtypes.half)).cast(dtypes.bool)),
 +  ])
@@ -922,7 +982,8 @@ As we are using cast, we need another NPU gate around `elif u.op is Ops.CAST`
  elif u.op is Ops.CAST:
 +  if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
 +    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
-   values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+-  values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
++  else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -945,72 +1006,33 @@ ERROR
 NotImplementedError: ROCKCHIP NPU bool-to-half CAST is not implemented
 ```
 
-As expected, NPU Ops.CAST not implemeted error raised
+As expected, NPU Ops.CAST NotImplementedError raised
 Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16)
 
-```python
-def cast_bool_half(self, values:list[bool]) -> list[float]:
-  self.build_registers(Ops.MUL, int16_mode=True)
-  # Note: result = bool_mask * 0x3c00 (1.0 in fp16)
-  weights = struct.pack("<H", 0x3c00) * 8
-  result:list[float] = []
-  for start in range(0, len(values), 8):
-    lanes = values[start:start+8]
-    to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h", *(lanes + [False] * (8-len(lanes))))
-    to_mv(self.dev.weight_buf, 16)[:] = weights
-    self.submit()
-    result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
-  return result
-```
-
 ```diff
+   def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
+@@
+-    assert (b is None and op is Ops.NEG) or (b is not None and len(a) == len(b))
+-    self.build_registers(op)
++    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
++    if op is Ops.CAST:
++      # result = mask * fp16(1.0)
++      self.build_registers(Ops.MUL, int16_mode=True)
++      to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
++    else: self.build_registers(op)
+     result:list = []
+@@
+       lanes = a[start:start+8]
+-      packed = struct.pack("<8e", *(lanes + [0] * (8-len(lanes))))
++      # CAST packs bools as eight INT16 0/1 lanes (8h); arithmetic packs eight FP16 lanes (8e).
++      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
+       to_mv(self.dev.input_buf, 16)[:] = packed
+@@
  elif u.op is Ops.CAST:
    if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
 -    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
-+    values[u] = self.cast_bool_half(src_values[0])
--  values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-+  else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-```
-
-
-```diff
--  def cast_bool_half(self, values:list[bool]) -> list[float]:
--    self.build_registers(Ops.MUL, int16_mode=True)
--    # Note: result = bool_mask * 0x3c00 (1.0 in fp16)
--    weights = struct.pack("<H", 0x3c00) * 8
--    result:list[float] = []
--    for start in range(0, len(values), 8):
--      lanes = values[start:start+8]
--      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h", *(lanes + [False] * (8-len(lanes))))
--      to_mv(self.dev.weight_buf, 16)[:] = weights
--      self.submit()
--      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
--    return result
-@@
-   def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
-@@
--    if op is Ops.NEG: assert b is None
--    else: assert b is not None and len(a) == len(b)
--    self.build_registers(op)
--    result:list[float] = []
-+    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
-+    if op is Ops.CAST:
-+      self.build_registers(Ops.MUL, int16_mode=True)
-+      to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", 0x3c00) * 8
-+    else: self.build_registers(op)
-+    result:list = []
-@@
--      lhs = a[start:start+8]
--      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8e", *(lhs + [0.0] * (8 - len(lhs))))
-+      lanes = a[start:start+8]
-+      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
-+      to_mv(self.dev.input_buf, 16)[:] = packed
-@@
--      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lhs)])
-+      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
-@@
--    values[u] = self.cast_bool_half(src_values[0])
 +    values[u] = self.run_npu(Ops.CAST, src_values[0])
+   else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -1090,80 +1112,15 @@ CONV(MAC) → BS(Norm/ReLUX) → BN(Another Norm/ReLUX) → EW(ALU_ALGO/ReLUX) �
 matching those in popular Convulution model in 2017 like YOLO. On BS/BN, the input floating point precision requirement is different, and TRM also mentioned that they can perform RELUX as well.
 
 ```
-BS: ReLU-X((x + FP32 bias) × FP16 scale)
-BN: ReLU-X((x × FP16 scale) + FP32 bias)
+BS: (x + FP32 bias) × FP16 scale
+BN: (x × FP16 scale) + FP32 bias
 ```
-
-ReLU-X is optional in each stage; without it, the formulas are just the affine operations inside the parentheses.
 
 > Why not use EW MUL we have been using?
 Because we want to fuse multiple Ops into one task instead of issusing many task per Ops, like GPU kerenl fusion. But the pipeline runs in squential order, we cant put everything into one task. I have made CMPEQ into 3 task, task1 EW_SUB, task2 BS_MUL+EXPON_SHF_MINUS, task3 BS_SUB+BS_MUL+BS_RELU. Other combination might still works and might be faster as well.
 
-Here we used BS RELU, enabled by setting BS_RELU_BYPASS to 0. BS_RELUX_EN stays 0, so no upper-bound register is needed.
+> But we are not actually fusing those Ops here, i want them to be sepearted in UOps tree for readabiliy, later maybe we can fuse them with pattern matcher.
 
-Like this,
-
-```python
-E(rk.DPU, rk.REG_DPU_BS_CFG,
-  (0 << rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT) |
-  (0 << rk.DPU_BS_CFG_BS_RELUX_EN__SHIFT) |
-  ...)
-```
-
-for EW RELU, we just set EW_RELU_BYPASS as 0
-```python
-E(rk.DPU, rk.REG_DPU_EW_CFG,
-  (0 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) |
-  ...
-  ) 
-```
-
-and for EW RELUX we need EW_RELU_BYPASS as 0, EW_RELUX_EN as 1 and set fp32 X in EW_RELUX_CMP_VALUE_EW_RELUX_CMP_DAT
-
-```python
-E(rk.DPU, rk.REG_DPU_EW_CFG,
-  (0 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) |
-  (1 << rk.DPU_EW_CFG_EW_RELUX_EN__SHIFT) |
-  ...)
-E(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE,
-  fbits(1.0, "<f") << rk.DPU_EW_RELUX_CMP_VALUE_EW_RELUX_CMP_DAT__SHIFT)
-```
-
-One more thing before implementing Ops.CMPEQ, we cannot just put registers belongs to mutiple task into one NPU submit, we need to advance the Program Counter PC so NPU know what next.
-
-```diff
- class RockchipProgram(Program['RockchipDevice']):
-@@
-+  def pc_tail(self, next_addr:int|None, next_amount:int=0) -> list[int]:
-+    E = self.EMIT # EMIT adds 1 to the target before packing it.
-+    return [
-+      E(rk.PC, rk.REG_PC_BASE_ADDRESS,
-+        0 if next_addr is None else next_addr & rk.PC_BASE_ADDRESS_PC_SOURCE_ADDR__MASK),
-+      E(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0 if next_addr is None else next_amount),
-+      E(0x80, rk.REG_PC_OPERATION_ENABLE,
-+        rk.GLOBAL_OPERATION_ENABLE_DPU_OP_EN__MASK | rk.GLOBAL_OPERATION_ENABLE_DPU_RDMA_OP_EN__MASK),
-+    ]
-
-   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None) -> None:
-@@
--    pc_enable = 0x80 # E adds 1: operation-enable target 0x0081, distinct from rk.PC (PC register writes).
-@@
--    self.npu_regs.append(E(pc_enable, rk.REG_PC_OPERATION_ENABLE,
--      rk.GLOBAL_OPERATION_ENABLE_DPU_OP_EN__MASK | rk.GLOBAL_OPERATION_ENABLE_DPU_RDMA_OP_EN__MASK))
-@@
-   def submit(self) -> None:
--    regs = self.npu_regs
-+    guard_offset = (len(self.npu_regs) + 3 + 1) // 2 * 16
-+    # The final PC fetch points to a mapped zero-filled page, not address 0.
-+    assert guard_offset + mmap.PAGESIZE <= self.dev.regcmd_mem.size
-+    regs = self.npu_regs + self.pc_tail(self.dev.regcmd_mem.dma_addr + guard_offset, 0)
-     # copy the registers to the C array regcmd
-     ctypes.memset(self.dev.regcmd_buf, 0, self.dev.regcmd_mem.size)
-```
-
-From the RKNN captured register pattern in weight/regcmd GEM, we observed a PC tail with REG_PC_BASE_ADDRESS, REG_PC_REGISTER_AMOUNTS and REG_PC_OPERATION_ENABLE exists after the task registers. We put next task dma address into REG_PC_BASE_ADDRESS and the task register count (excluding its PC tail) into REG_PC_REGISTER_AMOUNTS.
-
-And the last task shd sets `PC_REGISTER_AMOUNTS=0` and shd be pointed to a mapped zero-filled page like `pc_tail(guard_addr, 0)`
 so lets implement Ops.CMPEQ in ops_rockchip.py and do Ops.CMPNE with `1 - CMPEQ(A, B)`
 
 ```diff
@@ -1171,94 +1128,154 @@ so lets implement Ops.CMPEQ in ops_rockchip.py and do Ops.CMPNE with `1 - CMPEQ(
 -ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3}
 +ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
 @@
-     assert custom is None or (op is Ops.CUSTOM and custom in ("rk_zero_tag", "rk_mask_to_bool") and not int16_mode)
+     assert custom is None or (op is Ops.CUSTOM and custom == "fp16_exponent_shift_minus(16)" and not int16_mode)
 +    assert op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
 ```
 
+As test_maximum lowered Ops.CMPNE, we can implement it with Ops.CMPNE = 1 - Ops.CMPEQ and RELU in tinygrad can be done with MAX(x, 0).
 
-
-The ref in `~/rk3588/experimental/ops_rockchip.py` uses named CUSTOM stages. We can reuse SUB, MUL and MAX for the arithmetic, and keep CUSTOM only for the hardware-specific parts.
-
-```text
-a, b → SUB → rk_zero_tag → SUB 1 → MUL 1024 → MAX 0 → rk_mask_to_bool
-                                                    ↳ SUB from 1 for CMPNE, then rk_mask_to_bool
+```
+Ops.CMPEQ = a, b → SUB → MUL inf → CUSTOM fp16_exponent_shift_minus(16) → SUB 1 → MUL 1024 → RELU/MAX(0) → CAST(bool)
+Ops.CMPNE = a, b → SUB → MUL inf → CUSTOM fp16_exponent_shift_minus(16) → SUB 1 → MUL 1024 → RELU/MAX(0) → 1 - RESULT → CAST(bool)
 ```
 
-`rk_zero_tag` does MUL inf and exponent shift 16. This is not ordinary IEEE arithmetic, so a normal MUL cannot describe the whole operation. It also takes the original operands to reject NaN/inf inputs without rejecting a valid subtraction that overflows.
-
-`rk_mask_to_bool` only accepts an FP16 0/1 mask. EW MUL by 1 with INT16 output and `FP32TOFP16_EN=0` writes integer 0/1 on the NPU. We unpack those output words; Python does not calculate the comparison. This avoids casting back to bool through CMPNE again.
-
-The map still advertises CMPEQ/CMPNE, but the renderer must lower them before execution.
-
-Use names for what each CUSTOM does, not just stage 1/2/3. In this tinygrad version, `arg=(name, dtype)` supplies the CUSTOM result dtype.
+Lets apply the CMPNE formula with a pattern matcher. 
 
 ```diff
-@@
  class RockchipRenderer(Renderer):
 +  @staticmethod
-+  def lower_compare(u:UOp) -> UOp:
++  def _pm_lower_compare(u:UOp) -> UOp:
 +    a, b = (x.cast(dtypes.half) for x in u.src)
-+    delta = a.alu(Ops.SUB, b)
-+    # MUL inf + exponent-field shift is hardware-specific, not IEEE arithmetic.
-+    tag = UOp(Ops.CUSTOM, src=(delta, a, b), arg=("rk_zero_tag", dtypes.half))
++    product = a.alu(Ops.SUB, b).alu(Ops.MUL, a.const_like(float("inf")))
++    tag = UOp(Ops.CUSTOM, src=(product, a, b), arg=("fp16_exponent_shift_minus(16)", dtypes.half))
 +    mask = tag.alu(Ops.SUB, tag.const_like(1)).alu(Ops.MUL, tag.const_like(1024)).maximum(tag.const_like(0))
-+    if u.op is Ops.CMPNE: mask = mask.const_like(1).alu(Ops.SUB, mask)
-+    # This converts an already-normalized mask; it is not a general x != 0.
-+    return UOp(Ops.CUSTOM, src=(mask,), arg=("rk_mask_to_bool", dtypes.bool))
++    return mask.const_like(1).alu(Ops.SUB, mask).cast(dtypes.bool)
 +
    code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
    extra_matcher = PatternMatcher([
+     # Bool OR is MAX of the FP16 0/1 inputs.
      (UPat(Ops.OR, dtypes.bool, name="u"),
       lambda u: u.src[0].cast(dtypes.half).maximum(u.src[1].cast(dtypes.half)).cast(dtypes.bool)),
-+    (UPat.var("a", dtypes.half).ne(UPat.var("b", dtypes.half)).ne(UPat.const(True, dtypes.bool)),
-+     lambda a,b: a.alu(Ops.CMPEQ, b)),
-+    (UPat((Ops.CMPEQ, Ops.CMPNE), src=(UPat(dtype=(dtypes.half, dtypes.weakfloat)),
-+                                     UPat(dtype=(dtypes.half, dtypes.weakfloat))), name="u"),
-+     lambda u: RockchipRenderer.lower_compare(u)),
-+    (UPat(Ops.CMPNE, src=(UPat.var("x", dtypes.bool), UPat.const(True, dtypes.bool))),
-+     lambda x: UOp(Ops.CUSTOM, src=(UOp.const(1, dtypes.half).alu(Ops.SUB, x.cast(dtypes.half)),),
-+                  arg=("rk_mask_to_bool", dtypes.bool))),
++    # CMPNE inverts the equality mask: 1 - mask, then CAST(bool).
++    (UPat(Ops.CMPNE, src=(UPat(dtype=(dtypes.half, dtypes.weakfloat)),
++                         UPat(dtype=(dtypes.half, dtypes.weakfloat))), name="u"),
++     lambda u: RockchipRenderer._pm_lower_compare(u)),
    ])
 ```
 
-The zero constant can still have `dtypes.weakfloat` when the matcher runs, so we accept it and cast it to half. The boolean inversion rule handles `CMPNE(bool, True)` if the inner comparison was already lowered.
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 
-Each UOp now runs one task. We no longer build comparison stages or their intermediate DMA offsets inside `run_npu`.
+RuntimeError: infinite loop in graph_rewrite (stack too big)
+FAILED (errors=1)
+```
+
+The RuntimeError is caused by infinite rewrite. 
+In tinygrad, Ops.CAST bool is rewritten as `x != 0`:
+
+```python
+# tinygrad/uop/symbolic.py
+(UPat.var("x").cast(dtypes.bool), lambda x: x != 0),
+```
+
+and our formula CAST(bool) at the last step so
+```text
+CMPNE(a, b) → our formula → CAST(mask1, bool)
+                           ↓
+                           CMPNE(mask1, 0) → our formula → CAST(mask2, bool)
+                                                          ↓
+                                                          CMPNE(mask2, 0) → our formula → CAST(mask3, bool) → ...
+```
+
+To prevent inifinite rewrite, we seperate a new comparison_matcher from normal extra_matcher, and do a final stage of graph_rewrite ourself in RockchipRenderer.render()
+
+```diff
+-from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
++from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat, graph_rewrite
+@@
+   extra_matcher = PatternMatcher([
+     # Bool OR is MAX of the FP16 0/1 inputs.
+     (UPat(Ops.OR, dtypes.bool, name="u"),
+      lambda u: u.src[0].cast(dtypes.half).maximum(u.src[1].cast(dtypes.half)).cast(dtypes.bool)),
++  ])
++  comparison_matcher = PatternMatcher([
+-    # CMPNE inverts the equality mask: 1 - mask, then CAST(bool).
++    # Lower comparisons after general rewrites so the final mask CAST stays a CAST.
+     (UPat(Ops.CMPNE, src=(UPat(dtype=(dtypes.half, dtypes.weakfloat)),
+                          UPat(dtype=(dtypes.half, dtypes.weakfloat))), name="u"),
+      lambda u: RockchipRenderer._pm_lower_compare(u)),
+   ])
+@@
+-  def render(self, uops:list[UOp]) -> str: return base64.b64encode(pickle.dumps(uops)).decode()
++  def render(self, uops:list[UOp]) -> str:
++    # Keep the original UOp order; remove only the temporary sink after lowering.
++    sink = graph_rewrite(UOp.sink(*uops), self.comparison_matcher)
++    return base64.b64encode(pickle.dumps(list(sink.toposort())[:-1])).decode()
+```
+
+==== keep everything above unchange
+==== only fix below
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
+
+run and fill the result here
+```
 
 ```diff
 @@
-+  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None) -> list:
 -  def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
++  def run_npu(self, op:Ops, a:list, b:list|None=None, *, custom:str|None=None, dtype:DType=dtypes.half) -> list:
      if op is Ops.RECIPROCAL:
        if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
          raise NotImplementedError("ROCKCHIP NPU RECIPROCAL does not preserve the sign of negative zero or negative infinity")
        return self.run_npu(Ops.FDIV, [1.0] * len(a), a)
-+    assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
 -    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
-     if op is Ops.CAST:
-       self.build_registers(Ops.MUL, int16_mode=True)
-       to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", 0x3c00) * 8
-+    else:
-+      self.build_registers(op, custom=custom)
-+      if custom == "rk_mask_to_bool":
-+        if any(x not in (0.0, 1.0) for x in a): raise NotImplementedError("rk_mask_to_bool requires an FP16 0/1 mask")
-+        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *([1.0] * 8))
+-    if op is Ops.CAST:
+-      # result = mask * fp16(1.0)
+-      self.build_registers(Ops.MUL, int16_mode=True)
++    assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
++    byte_output = op is Ops.CAST and dtype in (dtypes.int8, dtypes.bool)
++    int16_mode = op is Ops.CAST and not byte_output
++    if byte_output and any(x not in (0.0, 1.0) for x in a):
++      raise NotImplementedError("ROCKCHIP FP16 to byte CAST currently requires a 0/1 mask")
++    if int16_mode:
+       to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
 -    else: self.build_registers(op)
++    self.build_registers(Ops.MUL if op is Ops.CAST else op, int16_mode=int16_mode, custom=custom, byte_output=byte_output)
      result:list = []
-     for start in range(0, len(a), 8):
-@@
+-    for start in range(0, len(a), 8):
++    for start in range(0, len(a), 16 if byte_output else 8):
+       lanes = a[start:start+8]
+-      # CAST packs bools as eight INT16 0/1 lanes (8h); arithmetic packs eight FP16 lanes (8e).
+-      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
+-      to_mv(self.dev.input_buf, 16)[:] = packed
+-      if b is not None:
+-        rhs = b[start:start+8]
++      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h" if int16_mode else "<8e", *(lanes + [0] * (8-len(lanes))))
++      if byte_output or b is not None:
++        rhs = a[start+8:start+16] if byte_output else b[start:start+8]
          to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
        self.submit()
-+      result.extend(struct.unpack("<8H" if custom == "rk_mask_to_bool" else "<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
 -      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
++      count = min(16 if byte_output else 8, len(a)-start)
++      fmt = "<?" if dtype == dtypes.bool else "<b" if dtype == dtypes.int8 else "<e"
++      out = to_mv(self.dev.output_buf, 16)
++      result.extend(struct.unpack_from(fmt, out, i*dtype.itemsize)[0] for i in range(count))
      return result
 @@
+         elif u.op is Ops.CAST:
+-          if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
+-            values[u] = self.run_npu(Ops.CAST, src_values[0])
++          if (src_dtypes[0], u.dtype) in ((dtypes.bool, dtypes.half), (dtypes.half, dtypes.int8), (dtypes.half, dtypes.bool)):
++            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
+@@
 +        elif u.op is Ops.CUSTOM:
-+          if u.arg == ("rk_zero_tag", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
++          if u.arg == ("fp16_exponent_shift_minus(16)", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
 +            # The original operands retain the finite-input check even if SUB overflows.
 +            if any(not math.isfinite(x) for xs in src_values[1:] for x in xs):
 +              raise NotImplementedError("ROCKCHIP NPU FP16 comparisons do not support NaN or infinity")
-+          elif not (u.arg == ("rk_mask_to_bool", dtypes.bool) and u.dtype == dtypes.bool and src_dtypes == [dtypes.half]):
++          else:
 +            raise NotImplementedError(f"ROCKCHIP NPU does not support CUSTOM {u.arg}")
 +          values[u] = self.run_npu(Ops.CUSTOM, src_values[0], custom=u.arg[0])
          elif u.op in GroupOp.ALU:
@@ -1266,140 +1283,128 @@ Each UOp now runs one task. We no longer build comparison stages or their interm
 -          if u.op not in self.ops_map or u.dtype != dtypes.half:
 +          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != dtypes.half:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
-           values[u] = self.run_npu(u.op, *src_values)
 ```
 
-The PC tail stays in `submit`. These are separate blocking submissions, not a PC chain.
-
-The arithmetic is now visible in TRACE/VIZ. The tradeoff is six tasks for CMPEQ and seven for CMPNE instead of the fused three/four; intermediate values also go through the existing Python interpreter's packing/readback. The arithmetic and mask conversion still run on the NPU.
-
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
-
-20 Ops.SUB dtypes.half
-21 Ops.CUSTOM dtypes.half ('rk_zero_tag', dtypes.half)
-22 Ops.SUB dtypes.half
-23 Ops.MUL dtypes.half
-24 Ops.MAX dtypes.half
-25 Ops.SUB dtypes.half
-26 Ops.CUSTOM dtypes.bool ('rk_mask_to_bool', dtypes.bool)
-
-Ran 1 test in 0.132s
-OK
-```
-
-Great test_maximum passed. But having rk_zero_tag and rk_mask_to_bool is not very readable in the UOps tree.
-We will try to replace rk_zero_tag with
-```
-MUL inf
-↓
-BITCAST half → int16/uint16
-↓
-integer manipulation of exponent bits
-↓
-BITCAST int16/uint16 → half
-```
-
-For that, we need a Ops.BITCAST implementation.
-
-==== keep everything above uncahnge
-==== only fix below
-
-BITCAST keeps the bytes and changes their interpretation. For example, `0x3c00` is fp16 `1.0` or int16 `15360`. No NPU arithmetic is needed.
-
-we keep a storage reference and its dtype. BITCAST creates a new typed reference to the same bytes, without unpacking, repacking or submitting an NPU task. This also preserves the NaN payload `0x7c01`.
+Keep the intermediate results as raw bytes. Unpacking `0x7c01` into a Python float and repacking gives `0x7e00`, which changes the exponent-shift result. Copy the bytes instead; no class or DMA-address tracking is needed here.
 
 ```diff
--from dataclasses import replace
-+from dataclasses import dataclass, replace
-@@
-+# BITCAST changes only the dtype of a storage reference, like the 1500 branch's carrier.
-+@dataclass(frozen=True)
-+class RockchipValue:
-+  raw:bytes
-+  dtype:DType
++def scalar(value, dtype:DType=dtypes.half):
++  return struct.unpack("<" + dtype.fmt, value)[0] if isinstance(value, bytes) else value
 +
-+  def bitcast(self, dtype:DType) -> 'RockchipValue': return RockchipValue(self.raw, dtype)
-+
-+def scalar16(value):
-+  return struct.unpack("<e" if value.dtype == dtypes.half else "<h", value.raw)[0] if isinstance(value, RockchipValue) else value
-+
-+def raw16(value, dtype:DType) -> bytes:
-+  if isinstance(value, RockchipValue): return value.raw
-+  return struct.pack("<e" if dtype == dtypes.half else "<h", value)
++def pack_lanes(lanes:list, fmt:str="<e") -> bytes:
++  return b"".join(x if isinstance(x, bytes) else struct.pack(fmt, x) for x in lanes).ljust(16, b"\0")
 +
  def _load(m, i, dtype: DType):
    if i is None: return 0.0
    if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
-+  if m.itemsize == 2 and dtype in (dtypes.half, dtypes.int16):
-+    return RockchipValue(bytes(m.cast("B")[i*2:i*2+2]), dtype)
++  if m.itemsize == 2 and dtype == dtypes.half: return bytes(m.cast("B")[i*2:i*2+2])
 @@
  def _store(m, i, v, dtype: DType):
    if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
-+  if m.itemsize == 2 and dtype in (dtypes.half, dtypes.int16):
-+    m.cast("B")[i*2:i*2+2] = raw16(v, dtype)
++  if isinstance(v, bytes):
++    offset = i * m.itemsize
++    m.cast("B")[offset:offset+dtype.itemsize] = v
 +    return
 ```
 
-Now half ↔ int16 BITCAST shares those same bytes instead of packing the Python float again:
+Copy each result before reusing the output buffer. The next task copies those same bytes into its input buffer:
 
 ```diff
--        elif u.op is Ops.BITCAST: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
-+        elif u.op is Ops.BITCAST:
-+          if {src_dtypes[0], u.dtype} == {dtypes.half, dtypes.int16}:
-+            values[u] = [(x if isinstance(x, RockchipValue) else RockchipValue(raw16(x, src_dtypes[0]), src_dtypes[0])).bitcast(u.dtype)
-+                         for x in src_values[0]]
-+          else: values[u] = [bitcast(scalar16(x), src_dtypes[0], u.dtype) for x in src_values[0]]
-```
-
-The NPU packing and readback must preserve the bytes too. Copy the output before the next submit reuses its buffer:
-
-```diff
-     for start in range(0, len(a), 8):
-       lanes = a[start:start+8]
--      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
-+      packed = b"".join(raw16(x, dtypes.int16 if op is Ops.CAST else dtypes.half) for x in lanes) + bytes(2*(8-len(lanes)))
-       to_mv(self.dev.input_buf, 16)[:] = packed
-       if b is not None:
-         rhs = b[start:start+8]
+@@
+-      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h" if int16_mode else "<8e", *(lanes + [0] * (8-len(lanes))))
++      to_mv(self.dev.input_buf, 16)[:] = pack_lanes(lanes, "<h" if int16_mode else "<e")
+@@
 -        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
-+        to_mv(self.dev.weight_buf, 16)[:] = b"".join(raw16(x, dtypes.half) for x in rhs) + bytes(2*(8-len(rhs)))
-       self.submit()
--      result.extend(struct.unpack("<8H" if custom == "rk_mask_to_bool" else "<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
-+      # Snapshot the output before the next submission reuses the DMA buffer.
++        to_mv(self.dev.weight_buf, 16)[:] = pack_lanes(rhs)
+@@
+       count = min(16 if byte_output else 8, len(a)-start)
+-      fmt = "<?" if dtype == dtypes.bool else "<b" if dtype == dtypes.int8 else "<e"
+-      out = to_mv(self.dev.output_buf, 16)
+-      result.extend(struct.unpack_from(fmt, out, i*dtype.itemsize)[0] for i in range(count))
 +      out = bytes(to_mv(self.dev.output_buf, 16))
-+      if custom == "rk_mask_to_bool": result.extend(struct.unpack("<8H", out)[:len(lanes)])
-+      else: result.extend(RockchipValue(out[i:i+2], dtypes.half) for i in range(0, len(lanes)*2, 2))
++      result.extend(out[i:i+dtype.itemsize] for i in range(0, count*dtype.itemsize, dtype.itemsize))
 ```
 
-The existing checks and Python CAST fallback still need numeric values, so decode only there, not in BITCAST:
+The existing checks and Python CAST fallback still need numeric values, so decode there:
 
 ```diff
 @@
 -      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
-+      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in map(scalar16, a)):
++      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in map(scalar, a)):
 @@
--        if any(x not in (0.0, 1.0) for x in a): raise NotImplementedError("rk_mask_to_bool requires an FP16 0/1 mask")
-+        if any(scalar16(x) not in (0.0, 1.0) for x in a): raise NotImplementedError("rk_mask_to_bool requires an FP16 0/1 mask")
+-    if byte_output and any(x not in (0.0, 1.0) for x in a):
++    if byte_output and any(scalar(x) not in (0.0, 1.0) for x in a):
+@@
+-            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
++            values[u] = self.run_npu(Ops.CAST, [scalar(x, src_dtypes[0]) for x in src_values[0]]
++                                     if src_dtypes[0] == dtypes.bool else src_values[0], dtype=u.dtype)
 @@
 -          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-+          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(scalar16(x))) for x in src_values[0]]
++          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(scalar(x, src_dtypes[0]))) for x in src_values[0]]
 @@
 -            if any(not math.isfinite(x) for xs in src_values[1:] for x in xs):
-+            if any(not math.isfinite(scalar16(x)) for xs in src_values[1:] for x in xs):
++            if any(not math.isfinite(scalar(x)) for xs in src_values[1:] for x in xs):
 ```
 
-BITCAST itself aliases storage; the existing LOAD/STORE and NPU packing/readback still copy bytes. This is not yet the 1500 branch's device-buffer pipeline. Python constants are packed once when making their storage reference.
+The CPU copies bytes between tasks; the NPU still does the arithmetic and mask conversion. Direct DMA reuse can come later.
 
-Both directions and round trips preserved all 65536 bit patterns. The typed references shared the same byte object with pack/unpack disabled during BITCAST.
 
-The Tensor round trip also preserved all 65536 patterns with NPU submit disabled. EW MUL `0 * inf` followed by BITCAST preserved `0x7c01`. The same seven regression tests passed in 8.78s.
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 
-This step adds raw-bit-preserving half ↔ int16 BITCAST only. Other BITCAST pairs still use the inherited Python implementation. INT16 SUB is not supported yet, so we have not replaced `rk_zero_tag` here.
+18 Ops.SUB dtypes.half
+21 Ops.MUL dtypes.half
+22 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half)
+23 Ops.SUB dtypes.half
+26 Ops.MUL dtypes.half
+27 Ops.MAX dtypes.half
+28 Ops.SUB dtypes.half
+29 Ops.CAST dtypes.bool dtypes.bool
+30 Ops.STORE dtypes.void
 
-The seven tests `test_maximum`, `test_add`, `test_sub`, `test_neg`, `test_mul`, `test_tiny_mul` and `test_div` gave `7 passed in 8.83s`. Another 390 Tensor equality/inequality lanes, all four boolean maximum pairs and NaN/inf rejection passed.
+Ran 1 test in 0.129s
+OK
+```
 
-The generated comparison graph also passed 4112 lanes across full and partial atoms. `rk_mask_to_bool` rejects values other than 0/1.
+Now the UOps follow our formula, with one extra SUB for CMPNE and CAST(bool) at the end. This test does not need the double-CMPNE or bool-inversion rules; we can add those when testing equality.
+
+This CAST only receives normalized 0/1 masks. General FP16 → bool still goes through CMPNE(x, 0) first. There is no BITCAST in this comparison path.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
+
+18 Ops.SUB dtypes.half
+21 Ops.MUL dtypes.half
+22 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half)
+23 Ops.SUB dtypes.half
+26 Ops.MUL dtypes.half
+27 Ops.MAX dtypes.half
+28 Ops.SUB dtypes.half
+29 Ops.CAST dtypes.bool dtypes.bool
+30 Ops.STORE dtypes.void
+
+Ran 1 test in 0.129s
+OK
+```
+
+Great test_maximum passed.
+
+The trace above omits constants and values. The CAST writes packed bool bytes on the NPU, not INT16 words for Python to compact.
+
+TRACE also showed `0x7c01` reaching the exponent-shift task unchanged, which returned `0x3c01`. The serialized comparison UOps contain CAST to bool, with no BITCAST or rk_mask_to_bool.
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q \
+    test/backend/test_ops.py::TestOps::test_maximum \
+    test/backend/test_ops.py::TestOps::test_add \
+    test/backend/test_ops.py::TestOps::test_sub \
+    test/backend/test_ops.py::TestOps::test_neg \
+    test/backend/test_ops.py::TestOps::test_mul \
+    test/backend/test_ops.py::TestOps::test_tiny_mul \
+    test/backend/test_ops.py::TestOps::test_div
+
+7 passed in 8.74s
+```
 
 Progress so far
 
@@ -1412,8 +1417,7 @@ Progress so far
 |                      | `CMPEQ`, `CMPNE`                      | `POW`, `SHL`, `SHR`                            |
 |                      | `OR` (bool)                           | `THREEFRY`, `XOR`                              |
 | `GroupOp.Ternary`    | —                                     | `MULACC`, `WHERE`                              |
-| `Elementwise` extras | `CAST` (bool → FP16)                  | —                                              |
-|                      | `BITCAST` (FP16 ↔ INT16)              |                                                |
-| **Total**            | **12 / 30**                           | **18 / 30**                                    |
+| `Elementwise` extras | `CAST` (bool → FP16, mask → bool)     | `BITCAST`                                      |
+| **Total**            | **11 / 30**                           | **19 / 30**                                    |
 
-This counts the paths implemented so far, not every dtype or test case. Arithmetic is FP16; CMPEQ/CMPNE accept finite FP16 inputs only. Bool OR uses the CAST → MAX → CMPNE matcher. General CAST back to bool lowers to CMPNE(x, 0); the matcher ends its normalized mask with rk_mask_to_bool.
+This counts the paths described so far, not every dtype or test case. Arithmetic is FP16; CMPEQ/CMPNE accept finite FP16 inputs only. Bool OR uses the CAST → MAX → CMPNE matcher. General CAST back to bool lowers to CMPNE(x, 0); the renderer ends its normalized mask with a direct NPU CAST to bool.

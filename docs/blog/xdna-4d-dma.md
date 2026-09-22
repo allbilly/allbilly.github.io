@@ -1,6 +1,19 @@
-# XDNA 4D DMA
+# Understanding AMD XDNA (part 1)
+Last update: Sep 9 2026
 
-## Why does MemTile need 4D addressing?
+The AMD XNDA NPU is a output stationary systolic array. It first appears with the Veral FPGA, and now appears on consumer CPU like the AI PRO 395.
+
+I dont own the hardware so I cant really play with the low level stuffs, but its still fun to read how Taka et al. (2025)[1] understand the XDNA NPU and optimize GEMM. The paper was released at 2025 and the SOTA GEMM TFLOPS has improved since then but still a very good read.
+
+One thing that took me so long to understand is the 4D address in MM2S.
+
+Reference
+
+1. [Striking the Balance: GEMM Performance Optimization Across Generations of Ryzen AI NPUs Text](https://arxiv.org/abs/2512.13282)
+
+![alt text](image.png)
+
+## Why does MemTile need 4D addressing? 
 
 The XDNA MemTile DMA path does not preserve a plain row-major matrix after a
 tile is packed. Step 2 writes each incoming `mct × kmt` slab as consecutive
