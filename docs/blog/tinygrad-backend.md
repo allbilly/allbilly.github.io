@@ -983,7 +983,10 @@ As we are using cast, we need another NPU gate around `elif u.op is Ops.CAST`
 +  if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
 +    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
 -  values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-+  else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
++  else:
++    if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
++      print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
++    values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -1024,7 +1027,7 @@ Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16
 @@
        lanes = a[start:start+8]
 -      packed = struct.pack("<8e", *(lanes + [0] * (8-len(lanes))))
-+      # CAST packs bools as eight INT16 0/1 lanes (8h); arithmetic packs eight FP16 lanes (8e).
++      # Bool-to-half CAST packs INT16 0/1 (8h); half-to-bool CAST and arithmetic pack FP16 (8e).
 +      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
        to_mv(self.dev.input_buf, 16)[:] = packed
 @@
@@ -1032,7 +1035,10 @@ Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16
    if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
 -    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
 +    values[u] = self.run_npu(Ops.CAST, src_values[0])
-   else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+   else:
+     if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
+       print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
+     values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -1048,7 +1054,7 @@ Ran 1 test in 0.223s
 FAILED (errors=1)
 ```
 
-Great we have Ops.CAST working on NPU already, but we have Ops.CMPNE NotImplementedError
+Great, we have bool-to-FP16 Ops.CAST working on NPU already, but Ops.CMPNE still raises NotImplementedError.
 It is just the last step in our pattern matcher cast fp16 back to bool usig x != 0.0,
 
 CMPEQ and CMPNE is very interesting here, as the NPU does not expose COMPARE/EQUAL/IF implementation, all we got are just MUL and those in EW_ALU_ALGO and RELU if u already found it in the registers name.
@@ -1139,6 +1145,18 @@ Ops.CMPEQ = a, b → SUB → MUL inf → CUSTOM fp16_exponent_shift_minus(16) �
 Ops.CMPNE = a, b → SUB → MUL inf → CUSTOM fp16_exponent_shift_minus(16) → SUB 1 → MUL 1024 → RELU/MAX(0) → 1 - RESULT → CAST(bool)
 ```
 
+CMPNE formulae represented in a table
+| Stage  | Operation                          | delta | delta |        delta | delta | delta |
+|--------|------------------------------------|------:|------:|-------------:|------:|------:|
+| SUB    | `a - b`                            |    -4 |    -2 |            0 |     2 |     4 |
+| MUL    | `* inf`                            | `-inf`| `-inf`|        `NaN` | `inf` | `inf` |
+| CUSTOM | `fp16_exponent_shift_minus(16)`    |    -1 |    -1 | 1.0009765625 |     1 |     1 |
+| SUB    | `- 1`                              |    -2 |    -2 | 0.0009765625 |     0 |     0 |
+| MUL    | `* 1024`                           | -2048 | -2048 |            1 |     0 |     0 |
+| MAX    | `MAX(x, 0)`                        |     0 |     0 |            1 |     0 |     0 |
+| SUB    | `1 - x` for CMPNE                  |     1 |     1 |            0 |     1 |     1 |
+| CAST   | `bool`                             |  True |  True |        False |  True |  True |
+
 Lets apply the CMPNE formula with a pattern matcher. 
 
 ```diff
@@ -1178,7 +1196,7 @@ In tinygrad, Ops.CAST bool is rewritten as `x != 0`:
 (UPat.var("x").cast(dtypes.bool), lambda x: x != 0),
 ```
 
-and our formula CAST(bool) at the last step so
+and our formula CAST(bool) is at the last step, so we got 
 ```text
 CMPNE(a, b) → our formula → CAST(mask1, bool)
                            ↓
@@ -1213,62 +1231,31 @@ To prevent inifinite rewrite, we seperate a new comparison_matcher from normal e
 +    return base64.b64encode(pickle.dumps(list(sink.toposort())[:-1])).decode()
 ```
 
-==== keep everything above unchange
-==== only fix below
-
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 
-run and fill the result here
+18 Ops.SUB dtypes.half
+21 Ops.MUL dtypes.half
+22 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half)
+
+AssertionError: UOp(Ops.CUSTOM, arg=('fp16_exponent_shift_minus(16)', dtypes.half), src=(...))
+Ran 1 test in 0.122s
+FAILED (failures=1)
 ```
 
+Great, no more inifinte rewrite and we got our Ops.SUB and Ops.CUSTOM here. 
+And we need to handle Ops.CUSTOM for fp16_exponent_shift_minus which set the register DPU_OUT_CVT_SHIFT_MINUS_EXP.
+
+Relax the gate for Ops.CUSTOM
 ```diff
-@@
 -  def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
-+  def run_npu(self, op:Ops, a:list, b:list|None=None, *, custom:str|None=None, dtype:DType=dtypes.half) -> list:
-     if op is Ops.RECIPROCAL:
-       if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
-         raise NotImplementedError("ROCKCHIP NPU RECIPROCAL does not preserve the sign of negative zero or negative infinity")
-       return self.run_npu(Ops.FDIV, [1.0] * len(a), a)
--    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
--    if op is Ops.CAST:
--      # result = mask * fp16(1.0)
--      self.build_registers(Ops.MUL, int16_mode=True)
-+    assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
-+    byte_output = op is Ops.CAST and dtype in (dtypes.int8, dtypes.bool)
-+    int16_mode = op is Ops.CAST and not byte_output
-+    if byte_output and any(x not in (0.0, 1.0) for x in a):
-+      raise NotImplementedError("ROCKCHIP FP16 to byte CAST currently requires a 0/1 mask")
-+    if int16_mode:
-       to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
--    else: self.build_registers(op)
-+    self.build_registers(Ops.MUL if op is Ops.CAST else op, int16_mode=int16_mode, custom=custom, byte_output=byte_output)
-     result:list = []
--    for start in range(0, len(a), 8):
-+    for start in range(0, len(a), 16 if byte_output else 8):
-       lanes = a[start:start+8]
--      # CAST packs bools as eight INT16 0/1 lanes (8h); arithmetic packs eight FP16 lanes (8e).
--      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
--      to_mv(self.dev.input_buf, 16)[:] = packed
--      if b is not None:
--        rhs = b[start:start+8]
-+      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h" if int16_mode else "<8e", *(lanes + [0] * (8-len(lanes))))
-+      if byte_output or b is not None:
-+        rhs = a[start+8:start+16] if byte_output else b[start:start+8]
-         to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
-       self.submit()
--      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
-+      count = min(16 if byte_output else 8, len(a)-start)
-+      fmt = "<?" if dtype == dtypes.bool else "<b" if dtype == dtypes.int8 else "<e"
-+      out = to_mv(self.dev.output_buf, 16)
-+      result.extend(struct.unpack_from(fmt, out, i*dtype.itemsize)[0] for i in range(count))
-     return result
++  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None) -> list:
 @@
-         elif u.op is Ops.CAST:
--          if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
--            values[u] = self.run_npu(Ops.CAST, src_values[0])
-+          if (src_dtypes[0], u.dtype) in ((dtypes.bool, dtypes.half), (dtypes.half, dtypes.int8), (dtypes.half, dtypes.bool)):
-+            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
+-    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
++    assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
+@@
+-    else: self.build_registers(op)
++    else: self.build_registers(op, custom=custom)
 @@
 +        elif u.op is Ops.CUSTOM:
 +          if u.arg == ("fp16_exponent_shift_minus(16)", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
@@ -1285,69 +1272,75 @@ run and fill the result here
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 ```
 
-Keep the intermediate results as raw bytes. Unpacking `0x7c01` into a Python float and repacking gives `0x7e00`, which changes the exponent-shift result. Copy the bytes instead; no class or DMA-address tracking is needed here.
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 
-```diff
-+def scalar(value, dtype:DType=dtypes.half):
-+  return struct.unpack("<" + dtype.fmt, value)[0] if isinstance(value, bytes) else value
-+
-+def pack_lanes(lanes:list, fmt:str="<e") -> bytes:
-+  return b"".join(x if isinstance(x, bytes) else struct.pack(fmt, x) for x in lanes).ljust(16, b"\0")
-+
- def _load(m, i, dtype: DType):
-   if i is None: return 0.0
-   if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
-+  if m.itemsize == 2 and dtype == dtypes.half: return bytes(m.cast("B")[i*2:i*2+2])
-@@
- def _store(m, i, v, dtype: DType):
-   if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
-+  if isinstance(v, bytes):
-+    offset = i * m.itemsize
-+    m.cast("B")[offset:offset+dtype.itemsize] = v
-+    return
+18 Ops.SUB dtypes.half None [[0.0], [0.0]] [dtypes.half, dtypes.half]
+21 Ops.MUL dtypes.half None [[0.0], [inf]] [dtypes.half, dtypes.half]
+22 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half) [[nan], [0.0], [0.0]] [dtypes.half, dtypes.half, dtypes.half]
+23 Ops.SUB dtypes.half None [[1.0009765625], [1.0]] [dtypes.half, dtypes.half]
+26 Ops.MUL dtypes.half None [[0.0009765625], [1024.0]] [dtypes.half, dtypes.half]
+27 Ops.MAX dtypes.half None [[1.0], [0.0]] [dtypes.half, dtypes.half]
+28 Ops.SUB dtypes.half None [[1.0], [1.0]] [dtypes.half, dtypes.half]
+29 Ops.CAST dtypes.bool dtypes.bool [[0.0]] [dtypes.half]
+warning: Ops.CAST from dtypes.half to dtypes.bool is not supported on ROCKCHIP NPU, emulating in python
+
+Ran 1 test in 0.135s
+OK
 ```
 
-Copy each result before reusing the output buffer. The next task copies those same bytes into its input buffer:
+test_maximum passed with our Ops.CMPNE implementation, but we got a warning of Ops.CAST emulated in python, we need to implement Ops.CAST on NPU as well.
+We can set input as fp16 and output as int8 to convert dtypes.half to dtypes.bool, the registers sequence extract from allbilly/rk3588 elementwise.py already contain int16 mode support and we just need to enable it.
 
 ```diff
 @@
--      to_mv(self.dev.input_buf, 16)[:] = struct.pack("<8h" if int16_mode else "<8e", *(lanes + [0] * (8-len(lanes))))
-+      to_mv(self.dev.input_buf, 16)[:] = pack_lanes(lanes, "<h" if int16_mode else "<e")
+-  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None) -> list:
++  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
 @@
--        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
-+        to_mv(self.dev.weight_buf, 16)[:] = pack_lanes(rhs)
-@@
-       count = min(16 if byte_output else 8, len(a)-start)
--      fmt = "<?" if dtype == dtypes.bool else "<b" if dtype == dtypes.int8 else "<e"
--      out = to_mv(self.dev.output_buf, 16)
--      result.extend(struct.unpack_from(fmt, out, i*dtype.itemsize)[0] for i in range(count))
-+      out = bytes(to_mv(self.dev.output_buf, 16))
-+      result.extend(out[i:i+dtype.itemsize] for i in range(0, count*dtype.itemsize, dtype.itemsize))
+     assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
++    byte_output = False
+     if op is Ops.CAST:
++      byte_output = dtype in (dtypes.int8, dtypes.bool)
++      if byte_output and any(x not in (0.0, 1.0) for x in a):
++        raise NotImplementedError("ROCKCHIP FP16 to byte CAST currently requires a 0/1 mask")
+       # result = mask * fp16(1.0)
+-      self.build_registers(Ops.MUL, int16_mode=True)
+-      to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
++      self.build_registers(Ops.MUL, int16_mode=not byte_output, byte_output=byte_output)
++      # Bool-to-half needs the FP16 1.0 bits as an INT16 multiplier; byte output uses this buffer for the second eight input lanes.
++      if not byte_output: to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
+     else: self.build_registers(op, custom=custom)
 ```
 
-The existing checks and Python CAST fallback still need numeric values, so decode there:
-
+Our previous Ops.CAST implements bool_to_fp16, now we are implmentig fp16_to_bool so we need to enable FP16 inputs (8e) packing for Ops.CAST and set both input and weight use the same packed.
 ```diff
 @@
--      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
-+      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in map(scalar, a)):
+     for start in range(0, len(a), 8):
+       lanes = a[start:start+8]
+-      # Bool-to-half CAST packs INT16 0/1 (8h); half-to-bool CAST and arithmetic pack FP16 (8e).
++      # Only bool-to-half CAST uses 8h; byte_output CAST takes FP16 inputs (8e), like arithmetic.
+-      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
++      packed = struct.pack("<8h" if op is Ops.CAST and not byte_output else "<8e", *(lanes + [0] * (8-len(lanes))))
+       to_mv(self.dev.input_buf, 16)[:] = packed
++      if byte_output: to_mv(self.dev.weight_buf, 16)[:] = packed
 @@
--    if byte_output and any(x not in (0.0, 1.0) for x in a):
-+    if byte_output and any(scalar(x) not in (0.0, 1.0) for x in a):
-@@
--            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
-+            values[u] = self.run_npu(Ops.CAST, [scalar(x, src_dtypes[0]) for x in src_values[0]]
-+                                     if src_dtypes[0] == dtypes.bool else src_values[0], dtype=u.dtype)
-@@
--          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-+          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(scalar(x, src_dtypes[0]))) for x in src_values[0]]
-@@
--            if any(not math.isfinite(x) for xs in src_values[1:] for x in xs):
-+            if any(not math.isfinite(scalar(x)) for xs in src_values[1:] for x in xs):
+       self.submit()
+-      result.extend(struct.unpack("<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
++      # The 16-byte output holds 16 bool/INT8 values or 8 FP16 values; keep only len(lanes).
++      fmt = "16?" if dtype == dtypes.bool else "16b" if dtype == dtypes.int8 else "8e"
++      result.extend(struct.unpack("<" + fmt, to_mv(self.dev.output_buf, 16))[:len(lanes)])
+     return result
 ```
 
-The CPU copies bytes between tasks; the NPU still does the arithmetic and mask conversion. Direct DMA reuse can come later.
+Now relax the NPU gate for half-to-bool CAST:
 
+```diff
+         elif u.op is Ops.CAST:
+-          if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
+-            values[u] = self.run_npu(Ops.CAST, src_values[0])
++          if (src_dtypes[0], u.dtype) in ((dtypes.bool, dtypes.half), (dtypes.half, dtypes.int8), (dtypes.half, dtypes.bool)):
++            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
+```
 
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
@@ -1362,51 +1355,13 @@ $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/bac
 29 Ops.CAST dtypes.bool dtypes.bool
 30 Ops.STORE dtypes.void
 
-Ran 1 test in 0.129s
+Ran 1 test in 0.130s
+
 OK
 ```
 
-Now the UOps follow our formula, with one extra SUB for CMPNE and CAST(bool) at the end. This test does not need the double-CMPNE or bool-inversion rules; we can add those when testing equality.
-
-This CAST only receives normalized 0/1 masks. General FP16 → bool still goes through CMPNE(x, 0) first. There is no BITCAST in this comparison path.
-
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
-
-18 Ops.SUB dtypes.half
-21 Ops.MUL dtypes.half
-22 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half)
-23 Ops.SUB dtypes.half
-26 Ops.MUL dtypes.half
-27 Ops.MAX dtypes.half
-28 Ops.SUB dtypes.half
-29 Ops.CAST dtypes.bool dtypes.bool
-30 Ops.STORE dtypes.void
-
-Ran 1 test in 0.129s
-OK
-```
-
-Great test_maximum passed.
-
-The trace above omits constants and values. The CAST writes packed bool bytes on the NPU, not INT16 words for Python to compact.
-
-TRACE also showed `0x7c01` reaching the exponent-shift task unchanged, which returned `0x3c01`. The serialized comparison UOps contain CAST to bool, with no BITCAST or rk_mask_to_bool.
-
-```bash
-$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q \
-    test/backend/test_ops.py::TestOps::test_maximum \
-    test/backend/test_ops.py::TestOps::test_add \
-    test/backend/test_ops.py::TestOps::test_sub \
-    test/backend/test_ops.py::TestOps::test_neg \
-    test/backend/test_ops.py::TestOps::test_mul \
-    test/backend/test_ops.py::TestOps::test_tiny_mul \
-    test/backend/test_ops.py::TestOps::test_div
-
-7 passed in 8.74s
-```
-
-Progress so far
+Good. This problematic test_maximum case passed, we have came a long way for this problematic case, where we implemented NPU Ops.CAST and Ops.CMPNE
+Lets do a quick progress review so far 
 
 | Group                | Working now                           | Remaining                                      |
 |----------------------|---------------------------------------|------------------------------------------------|
@@ -1414,10 +1369,66 @@ Progress so far
 |                      |                                       | `SIN`, `SQRT`, `TRUNC`                         |
 | `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`                   | `AND`, `CDIV`, `CMOD`                          |
 |                      | `FDIV`, `MAX`                         | `CMPLT`, `FLOORDIV`, `FLOORMOD`                |
-|                      | `CMPEQ`, `CMPNE`                      | `POW`, `SHL`, `SHR`                            |
+|                      | `CMPNE`                               | `POW`, `SHL`, `SHR` , `CMPEQ`,                            |
 |                      | `OR` (bool)                           | `THREEFRY`, `XOR`                              |
 | `GroupOp.Ternary`    | —                                     | `MULACC`, `WHERE`                              |
 | `Elementwise` extras | `CAST` (bool → FP16, mask → bool)     | `BITCAST`                                      |
-| **Total**            | **11 / 30**                           | **19 / 30**                                    |
+| **Total**            | **10 / 30**                           | **20 / 30**                                    |
 
-This counts the paths described so far, not every dtype or test case. Arithmetic is FP16; CMPEQ/CMPNE accept finite FP16 inputs only. Bool OR uses the CAST → MAX → CMPNE matcher. General CAST back to bool lowers to CMPNE(x, 0); the renderer ends its normalized mask with a direct NPU CAST to bool.
+We have 10/30 Ops implemented, the remaining Ops.CMPEQ can be done with another pattern matcher, Ops.WHERE / Ops.CMPLT can be done similarly with staged bit trick, we already have Ops.FDIV, and will see what we can do with Ops.CDIV/Ops.CMOD/Ops.FLOORDIV/Ops.FLOORMOD
+
+TODO: Ops.CMPEQ, Ops.WHERE, Ops.CMPLT, Ops.CDIV/Ops.CMOD/Ops.FLOORDIV/Ops.FLOORMOD
+
+Next we will uncomment all test cases in test_maximum
+
+```
+$NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
+
+test_maximum (__main__.TestOps.test_maximum) ...
+testing                     [(45, 65), (45, 65)]   torch/tinygrad fp: 0.21 / 794.28 ms  bp: nan / nan ms
+testing                                 [(), ()]   torch/tinygrad fp: 0.07 / 0.14 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.09 / 14.67 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.08 / 15.81 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.05 / 8.61 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.04 / 11.75 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.06 / 10.15 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.04 / 23.17 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.08 / 14.01 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.11 / 8.07 ms  bp: nan / nan ms
+testing                                     None   torch/tinygrad fp: 0.06 / 7.71 ms  bp: nan / nan ms ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.994s
+
+OK
+```
+
+Wonderful! Everycase passed, how about test_minimum
+
+```
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_minimum
+
+testing                                     None   torch/tinygrad fp: 0.07 / 11.86 ms  bp: nan / nan ms 0 Ops.PARAM dtypes.bool ParamArg(0, dtypes.bool, 3, device='ROCKCHIP') [] []
+1 Ops.PARAM dtypes.bool ParamArg(1, dtypes.bool, 3, device='ROCKCHIP') [] []
+2 Ops.PARAM dtypes.bool ParamArg(2, dtypes.bool, 3, device='ROCKCHIP') [] []
+3 Ops.CONST dtypes.weakint 3 [] []
+4 Ops.CAST dtypes.int dtypes.int [[3]] [dtypes.weakint]
+5 Ops.SPECIAL dtypes.int gidx0 [[3]] [dtypes.int]
+6 Ops.INDEX dtypes.bool None [[<memory at 0x7f464928c0>], [0]] [dtypes.bool, dtypes.int]
+7 Ops.LOAD dtypes.bool None [[(<memory at 0x7f464928c0>, 0)]] [dtypes.bool]
+8 Ops.INDEX dtypes.bool None [[<memory at 0x7f46492ec0>], [0]] [dtypes.bool, dtypes.int]
+9 Ops.LOAD dtypes.bool None [[(<memory at 0x7f46492ec0>, 0)]] [dtypes.bool]
+10 Ops.INDEX dtypes.bool None [[<memory at 0x7f464931c0>], [0]] [dtypes.bool, dtypes.int]
+11 Ops.CONST dtypes.bool True [] []
+12 Ops.CAST dtypes.bool dtypes.bool [[True]] [dtypes.bool]
+13 Ops.XOR dtypes.bool None [[True], [True]] [dtypes.bool, dtypes.bool]
+ERROR
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.XOR with dtypes.bool
+```
+
+We saw NotImplementedError for Ops.XOR with dtypes.bool, Ops.XOR isnt on our TODO list so we will have a look later.
+Now add a pather matcher for Ops.CMPEQ and run its test
+
+==== keep everything above unchange
+==== only fix below
