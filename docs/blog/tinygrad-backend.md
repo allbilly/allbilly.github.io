@@ -813,7 +813,7 @@ $ DEBUG=5 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/bac
 Ops.FDIV is an easy win and passed test_div, note that the NPU edge case handling is non-standard, 
 e.g.`+0 / -2` returns `+0` and `-0 / -2` returns `-0`, which is opposite of IEEE division, comparison still pass but keep this in mind, we might need to handle them with pattern matcher later. 
 
-How about RECIPROCAL? The ref does `1 / x` with FDIV, and the 1500 branch lowers it the same way. We can reuse our FDIV setup too:
+How about RECIPROCAL? We can do `RECIP = 1 / x` with FDIV
 
 ```diff
 -ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX:0 }
@@ -1175,8 +1175,7 @@ so lets implement Ops.CMPEQ in ops_rockchip.py and do Ops.CMPNE with `1 - CMPEQ(
 +    assert op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
 ```
 
-==== keep everything above uncahnge
-==== only fix below
+
 
 The ref in `~/rk3588/experimental/ops_rockchip.py` uses named CUSTOM stages. We can reuse SUB, MUL and MAX for the arithmetic, and keep CUSTOM only for the hardware-specific parts.
 
@@ -1289,6 +1288,115 @@ Ran 1 test in 0.132s
 OK
 ```
 
+Great test_maximum passed. But having rk_zero_tag and rk_mask_to_bool is not very readable in the UOps tree.
+We will try to replace rk_zero_tag with
+```
+MUL inf
+↓
+BITCAST half → int16/uint16
+↓
+integer manipulation of exponent bits
+↓
+BITCAST int16/uint16 → half
+```
+
+For that, we need a Ops.BITCAST implementation.
+
+==== keep everything above uncahnge
+==== only fix below
+
+BITCAST keeps the bytes and changes their interpretation. For example, `0x3c00` is fp16 `1.0` or int16 `15360`. No NPU arithmetic is needed.
+
+we keep a storage reference and its dtype. BITCAST creates a new typed reference to the same bytes, without unpacking, repacking or submitting an NPU task. This also preserves the NaN payload `0x7c01`.
+
+```diff
+-from dataclasses import replace
++from dataclasses import dataclass, replace
+@@
++# BITCAST changes only the dtype of a storage reference, like the 1500 branch's carrier.
++@dataclass(frozen=True)
++class RockchipValue:
++  raw:bytes
++  dtype:DType
++
++  def bitcast(self, dtype:DType) -> 'RockchipValue': return RockchipValue(self.raw, dtype)
++
++def scalar16(value):
++  return struct.unpack("<e" if value.dtype == dtypes.half else "<h", value.raw)[0] if isinstance(value, RockchipValue) else value
++
++def raw16(value, dtype:DType) -> bytes:
++  if isinstance(value, RockchipValue): return value.raw
++  return struct.pack("<e" if dtype == dtypes.half else "<h", value)
++
+ def _load(m, i, dtype: DType):
+   if i is None: return 0.0
+   if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
++  if m.itemsize == 2 and dtype in (dtypes.half, dtypes.int16):
++    return RockchipValue(bytes(m.cast("B")[i*2:i*2+2]), dtype)
+@@
+ def _store(m, i, v, dtype: DType):
+   if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
++  if m.itemsize == 2 and dtype in (dtypes.half, dtypes.int16):
++    m.cast("B")[i*2:i*2+2] = raw16(v, dtype)
++    return
+```
+
+Now half ↔ int16 BITCAST shares those same bytes instead of packing the Python float again:
+
+```diff
+-        elif u.op is Ops.BITCAST: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
++        elif u.op is Ops.BITCAST:
++          if {src_dtypes[0], u.dtype} == {dtypes.half, dtypes.int16}:
++            values[u] = [(x if isinstance(x, RockchipValue) else RockchipValue(raw16(x, src_dtypes[0]), src_dtypes[0])).bitcast(u.dtype)
++                         for x in src_values[0]]
++          else: values[u] = [bitcast(scalar16(x), src_dtypes[0], u.dtype) for x in src_values[0]]
+```
+
+The NPU packing and readback must preserve the bytes too. Copy the output before the next submit reuses its buffer:
+
+```diff
+     for start in range(0, len(a), 8):
+       lanes = a[start:start+8]
+-      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
++      packed = b"".join(raw16(x, dtypes.int16 if op is Ops.CAST else dtypes.half) for x in lanes) + bytes(2*(8-len(lanes)))
+       to_mv(self.dev.input_buf, 16)[:] = packed
+       if b is not None:
+         rhs = b[start:start+8]
+-        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
++        to_mv(self.dev.weight_buf, 16)[:] = b"".join(raw16(x, dtypes.half) for x in rhs) + bytes(2*(8-len(rhs)))
+       self.submit()
+-      result.extend(struct.unpack("<8H" if custom == "rk_mask_to_bool" else "<8e", to_mv(self.dev.output_buf, 16))[:len(lanes)])
++      # Snapshot the output before the next submission reuses the DMA buffer.
++      out = bytes(to_mv(self.dev.output_buf, 16))
++      if custom == "rk_mask_to_bool": result.extend(struct.unpack("<8H", out)[:len(lanes)])
++      else: result.extend(RockchipValue(out[i:i+2], dtypes.half) for i in range(0, len(lanes)*2, 2))
+```
+
+The existing checks and Python CAST fallback still need numeric values, so decode only there, not in BITCAST:
+
+```diff
+@@
+-      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
++      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in map(scalar16, a)):
+@@
+-        if any(x not in (0.0, 1.0) for x in a): raise NotImplementedError("rk_mask_to_bool requires an FP16 0/1 mask")
++        if any(scalar16(x) not in (0.0, 1.0) for x in a): raise NotImplementedError("rk_mask_to_bool requires an FP16 0/1 mask")
+@@
+-          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
++          else: values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(scalar16(x))) for x in src_values[0]]
+@@
+-            if any(not math.isfinite(x) for xs in src_values[1:] for x in xs):
++            if any(not math.isfinite(scalar16(x)) for xs in src_values[1:] for x in xs):
+```
+
+BITCAST itself aliases storage; the existing LOAD/STORE and NPU packing/readback still copy bytes. This is not yet the 1500 branch's device-buffer pipeline. Python constants are packed once when making their storage reference.
+
+Both directions and round trips preserved all 65536 bit patterns. The typed references shared the same byte object with pack/unpack disabled during BITCAST.
+
+The Tensor round trip also preserved all 65536 patterns with NPU submit disabled. EW MUL `0 * inf` followed by BITCAST preserved `0x7c01`. The same seven regression tests passed in 8.78s.
+
+This step adds raw-bit-preserving half ↔ int16 BITCAST only. Other BITCAST pairs still use the inherited Python implementation. INT16 SUB is not supported yet, so we have not replaced `rk_zero_tag` here.
+
 The seven tests `test_maximum`, `test_add`, `test_sub`, `test_neg`, `test_mul`, `test_tiny_mul` and `test_div` gave `7 passed in 8.83s`. Another 390 Tensor equality/inequality lanes, all four boolean maximum pairs and NaN/inf rejection passed.
 
 The generated comparison graph also passed 4112 lanes across full and partial atoms. `rk_mask_to_bool` rejects values other than 0/1.
@@ -1304,7 +1412,8 @@ Progress so far
 |                      | `CMPEQ`, `CMPNE`                      | `POW`, `SHL`, `SHR`                            |
 |                      | `OR` (bool)                           | `THREEFRY`, `XOR`                              |
 | `GroupOp.Ternary`    | —                                     | `MULACC`, `WHERE`                              |
-| `Elementwise` extras | `CAST` (bool → FP16)                  | `BITCAST`                                      |
-| **Total**            | **11 / 30**                           | **19 / 30**                                    |
+| `Elementwise` extras | `CAST` (bool → FP16)                  | —                                              |
+|                      | `BITCAST` (FP16 ↔ INT16)              |                                                |
+| **Total**            | **12 / 30**                           | **18 / 30**                                    |
 
 This counts the paths implemented so far, not every dtype or test case. Arithmetic is FP16; CMPEQ/CMPNE accept finite FP16 inputs only. Bool OR uses the CAST → MAX → CMPNE matcher. General CAST back to bool lowers to CMPNE(x, 0); the matcher ends its normalized mask with rk_mask_to_bool.
