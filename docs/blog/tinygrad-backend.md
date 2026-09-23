@@ -1369,7 +1369,7 @@ Lets do a quick progress review so far
 |                      |                                       | `SIN`, `SQRT`, `TRUNC`                         |
 | `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`                   | `AND`, `CDIV`, `CMOD`                          |
 |                      | `FDIV`, `MAX`                         | `CMPLT`, `FLOORDIV`, `FLOORMOD`                |
-|                      | `CMPNE`                               | `POW`, `SHL`, `SHR` , `CMPEQ`,                            |
+|                      | `CMPNE`                               | `POW`, `SHL`, `SHR` , `CMPEQ`,                 |
 |                      | `OR` (bool)                           | `THREEFRY`, `XOR`                              |
 | `GroupOp.Ternary`    | —                                     | `MULACC`, `WHERE`                              |
 | `Elementwise` extras | `CAST` (bool → FP16, mask → bool)     | `BITCAST`                                      |
@@ -1377,7 +1377,7 @@ Lets do a quick progress review so far
 
 We have 10/30 Ops implemented, the remaining Ops.CMPEQ can be done with another pattern matcher, Ops.WHERE / Ops.CMPLT can be done similarly with staged bit trick, we already have Ops.FDIV, and will see what we can do with Ops.CDIV/Ops.CMOD/Ops.FLOORDIV/Ops.FLOORMOD
 
-TODO: Ops.CMPEQ, Ops.WHERE, Ops.CMPLT, Ops.CDIV/Ops.CMOD/Ops.FLOORDIV/Ops.FLOORMOD
+TODO: Ops.CMPEQ, Ops.WHERE, Ops.CMPLT
 
 Next we will uncomment all test cases in test_maximum
 
@@ -1403,7 +1403,7 @@ Ran 1 test in 0.994s
 OK
 ```
 
-Wonderful! Everycase passed, how about test_minimum
+Wonderful! Everycase passed, how about test_minimum?
 
 ```
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_minimum
@@ -1428,7 +1428,636 @@ NotImplementedError: ROCKCHIP NPU does not support Ops.XOR with dtypes.bool
 ```
 
 We saw NotImplementedError for Ops.XOR with dtypes.bool, Ops.XOR isnt on our TODO list so we will have a look later.
-Now add a pather matcher for Ops.CMPEQ and run its test
+Now lets run test_cmp_eq first before adding the pattern matcher
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+testing                                     None   torch/tinygrad fp: 0.14 / 123.28 ms  bp: nan / nan ms 0 Ops.PARAM dtypes.bool ParamArg(0, dtypes.bool, 3, device='ROCKCHIP') [] []
+1 Ops.PARAM dtypes.int ParamArg(1, dtypes.int, 3, device='ROCKCHIP') [] []
+2 Ops.PARAM dtypes.int ParamArg(2, dtypes.int, 3, device='ROCKCHIP') [] []
+3 Ops.CONST dtypes.weakint 3 [] []
+4 Ops.CAST dtypes.int dtypes.int [[3]] [dtypes.weakint]
+5 Ops.SPECIAL dtypes.int gidx0 [[3]] [dtypes.int]
+6 Ops.INDEX dtypes.int None [[<memory at 0x7f5a270040>], [0]] [dtypes.int, dtypes.int]
+7 Ops.LOAD dtypes.int None [[(<memory at 0x7f5a270040>, 0)]] [dtypes.int]
+8 Ops.INDEX dtypes.int None [[<memory at 0x7f5a270280>], [0]] [dtypes.int, dtypes.int]
+9 Ops.LOAD dtypes.int None [[(<memory at 0x7f5a270280>, 0)]] [dtypes.int]
+10 Ops.INDEX dtypes.bool None [[<memory at 0x7f5b65c700>], [0]] [dtypes.bool, dtypes.int]
+11 Ops.CMPEQ dtypes.bool None [[0], [2]] [dtypes.int, dtypes.int]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.CMPEQ with dtypes.bool
+```
+
+We can reuse the mask without CMPNE final `1 - mask` and update the pattern matcher.
+
+```diff
+@@
+-    return mask.const_like(1).alu(Ops.SUB, mask).cast(dtypes.bool)
++    # CMPEQ keeps the equality mask; CMPNE inverts it.
++    return (mask.const_like(1).alu(Ops.SUB, mask) if u.op is Ops.CMPNE else mask).cast(dtypes.bool)
+@@
+   comparison_matcher = PatternMatcher([
+@@
+-    (UPat(Ops.CMPNE, src=(UPat(dtype=(dtypes.half, dtypes.weakfloat)),
+-                         UPat(dtype=(dtypes.half, dtypes.weakfloat))), name="u"),
++    (UPat((Ops.CMPEQ, Ops.CMPNE), src=(UPat(dtype=(dtypes.half, dtypes.weakfloat)),
++                                     UPat(dtype=(dtypes.half, dtypes.weakfloat))), name="u"),
+      lambda u: RockchipRenderer._pm_lower_compare(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+11 Ops.CMPEQ dtypes.bool None [[0], [2]] [dtypes.int, dtypes.int]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.CMPEQ with dtypes.bool
+
+----------------------------------------------------------------------
+Ran 1 test in 0.206s
+
+FAILED (errors=1)
+```
+
+We dont support input dtypes.int Ops.CMPEQ, can we just cast it to fp16?
+
+```diff
+   comparison_matcher = PatternMatcher([
++    # Lossy INT32 comparison: FP16 conversion can make distinct integers equal.
++    (UPat((Ops.CMPEQ, Ops.CMPNE), src=(UPat(dtype=dtypes.int32), UPat(dtype=dtypes.int32)), name="u"),
++     lambda u: RockchipRenderer._pm_lower_compare(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+10 Ops.INDEX dtypes.bool None [[<memory at 0x7f4eee84c0>], [0]] [dtypes.bool, dtypes.int]
+11 Ops.CMPEQ dtypes.bool None [[True], [False]] [dtypes.bool, dtypes.bool]
+ERROR
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.CMPEQ with dtypes.bool
+```
+
+We need handle input dtypes.bool as well
+```diff
+   comparison_matcher = PatternMatcher([
++    # Bool inputs convert exactly to FP16 0/1 on the NPU.
++    (UPat((Ops.CMPEQ, Ops.CMPNE), src=(UPat(dtype=dtypes.bool), UPat(dtype=dtypes.bool)), name="u"),
++     lambda u: RockchipRenderer._pm_lower_compare(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+8 Ops.SPECIAL dtypes.int gidx1 [[12]] [dtypes.int]
+9 Ops.MUL dtypes.int None [[0], [5]] [dtypes.int, dtypes.int]
+NotImplementedError: ROCKCHIP NPU does not support Ops.MUL with dtypes.int
+```
+
+Now we failed the broadcasting test cases with no input dtypes.int support for Ops.MUL.
+Lets try cast int32 MUL to fp16, and cast the result back to int32:
+
+```diff
+   comparison_matcher = PatternMatcher([
++    # Experimental: FP16 MUL is not exact for arbitrary INT32 inputs or products.
++    (UPat(Ops.MUL, dtypes.int32, name="u"),
++     lambda u: u.src[0].cast(dtypes.half).alu(Ops.MUL, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+13 Ops.ADD dtypes.int None [[0], [0]] [dtypes.int, dtypes.int]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.ADD with dtypes.int
+Ran 1 test in 0.400s
+FAILED (errors=1)
+```
+
+So CAST for Ops.ADD as well
+```diff
+-    # Experimental: FP16 MUL is not exact for arbitrary INT32 inputs or products.
+-    (UPat(Ops.MUL, dtypes.int32, name="u"),
+-     lambda u: u.src[0].cast(dtypes.half).alu(Ops.MUL, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
++    # Experimental: FP16 arithmetic is not exact for arbitrary INT32 values.
++    (UPat((Ops.MUL, Ops.ADD), dtypes.int32, name="u"),
++     lambda u: u.src[0].cast(dtypes.half).alu(u.op, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+NotImplementedError: ROCKCHIP NPU FP16 comparisons do not support NaN or infinity
+
+----------------------------------------------------------------------
+Ran 1 test in 0.623s
+
+FAILED (errors=1)
+```
+
+so we reached last part in test_cmp_eq
+```
+specials = [0.0, 1.0, -1.0, math.inf, -math.inf]#, math.nan]
+for s0 in specials:
+     for s1 in specials:
+     helper_test_op(None, fxn, fxn, forward_only=True, vals=[[s0], [s1]])
+```
+
+Temporarily bypassing the guard gives four wrong infinity pairs:
+
+| Inputs         | CMPEQ result | Expected | `1 - result` |
+|----------------|-------------:|---------:|-------------:|
+| `inf, inf`     |            0 |        1 |            1 |
+| `-inf, -inf`   |            0 |        1 |            1 |
+| `inf, -inf`    |            1 |        0 |            0 |
+| `-inf, inf`    |            1 |        0 |            0 |
+
+Tracing the first operation shows the problem is in EW SUB:
+
+| Inputs         | EW SUB output  | NPU `ADD(a, NEG(b))` output |
+|----------------|----------------|-----------------------------|
+| `inf, inf`     | `inf (0x7c00)` | `NaN (0x7c01)`              |
+| `inf, -inf`    | `NaN (0x7c01)` | `inf (0x7c00)`              |
+| `-inf, inf`    | `NaN (0x7c01)` | `-inf (0xfc00)`             |
+| `-inf, -inf`   | `inf (0x7c00)` | `NaN (0x7c01)`              |
+
+so lets try to replace Ops.SUB in CMP implementation with Ops.ADD and Ops.NEG
+
+```diff
+@@
+-    product = a.alu(Ops.SUB, b).alu(Ops.MUL, a.const_like(float("inf")))
++    # EW SUB mishandles infinity pairs; ADD with NPU NEG preserves their signs.
++    product = a.alu(Ops.ADD, b.alu(Ops.NEG)).alu(Ops.MUL, a.const_like(float("inf")))
+@@
+-            # The original operands retain the finite-input check even if SUB overflows.
+-            if any(not math.isfinite(x) for xs in src_values[1:] for x in xs):
+-              raise NotImplementedError("ROCKCHIP NPU FP16 comparisons do not support NaN or infinity")
++            # Equal infinities intentionally produce an intermediate NaN; check original inputs only.
++            if any(math.isnan(x) for xs in src_values[1:] for x in xs):
++              raise NotImplementedError("ROCKCHIP NPU FP16 comparisons do not support NaN inputs")
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_eq
+
+Ran 1 test in 0.811s
+
+OK
+```
+
+Cool! test_cmp_eq all passed. We actually forgot to run test for Ops.CMPNE before, but there is only test_cmp_ne_backward and no test_cmp_ne so we just skip it.
+
+TODO: Ops.WHERE, Ops.CMPLT
+
+Next we will implement Ops.CMPLT first with the formula
+```
+Ops.CMPLT(A, B) = RELU(((B-A)-ε)*2*inf)
+```
+
+`ε = 2^-24 ≈ 5.9604645e-8`
+| Stage | Op       | delta | delta | delta | delta = ε | delta | delta |
+|-------|----------|------:|------:|------:|----------:|------:|------:|
+| SUB   | `B - A`  | -4    | -2    | 0     | `ε`       | 2     | 4     |
+| MUL   | `× 2`    | -8    | -4    | 0     | `2ε`      | 4     | 8     |
+| ALU   | `- ε`    | `-8-ε`| `-4-ε`| `-ε`  | `ε`       | `4-ε` | `8-ε` |
+| MUL   | `× inf`  | `-inf`| `-inf`| `-inf`| `inf`     | `inf` | `inf` |
+| RELU  | `RELU`   | 0     | 0     | 0     | 1         | 1     | 1     |
+
+1. SUB to find delta
+2. MUL 2
+3. SUB ε as we need to make a zero delta negative, 
+we take ε = 2^-24 ≈ 5.9604645e-8, the smallest positive FP16 value here because we dont want a large value turn positive delta to negative. For example, if we take ε = 0.2 , for delta = 0.1 might became -0.1.
+But if the delta is exactly ε, a positive delta will become 0, so we MUL the delta by 2 first 
+4. MUL by inf turns negative values into `-inf` and positive values into `inf`
+5. RELU to turn all negative values to 0 and claim positive value to 1
+
+```diff
+@@
+-           Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
++           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP}
+
+@@
+ class RockchipRenderer(Renderer):
++  @staticmethod
++  def _pm_lower_cmplt(u:UOp) -> UOp:
++    a, b = (x.cast(dtypes.half) for x in u.src)
++    delta = b.alu(Ops.ADD, a.alu(Ops.NEG))
++    biased = delta.alu(Ops.MUL, delta.const_like(2)).alu(Ops.ADD, delta.const_like(-2**-24))
++    positive = biased.alu(Ops.MUL, delta.const_like(float("inf"))).maximum(delta.const_like(0))
++    # Clamp to [0, 1] with existing MAX/NEG operations, then write bool bytes.
++    return positive.alu(Ops.NEG).maximum(delta.const_like(-1)).alu(Ops.NEG).cast(dtypes.bool)
++
+@@
+   comparison_matcher = PatternMatcher([
++    # Scale before subtracting epsilon so the smallest positive FP16 delta stays positive.
++    (UPat(Ops.CMPLT, src=(UPat(dtype=(dtypes.half, dtypes.weakfloat, dtypes.int32, dtypes.bool)),
++                         UPat(dtype=(dtypes.half, dtypes.weakfloat, dtypes.int32, dtypes.bool))), name="u"),
++     lambda u: RockchipRenderer._pm_lower_cmplt(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_lt
+
+NotImplementedError: ROCKCHIP FP16 to byte CAST currently requires a 0/1 mask
+Ran 1 test in 0.810s
+FAILED (errors=1)
+```
+
+We failed at `inf < inf` because ADD(inf, NEG(inf)) got NaN, we can solve this by replace RELU implementaion from Ops.MAX to hardware RELUX.
+Hardware BN ReLU-X maps that NaN to finite 1, so we can multiply it by CMPNE(A, B) as a mask
+
+```text
+CMPLT(A, B) = RELUX1((2*(B-A) - ε)*inf) * CAST(CMPNE(A, B), half)
+```
+
+We will create `Ops.CUSTOM` with `arg=("RELUX", dtypes.half)` with the RELUX register sequence
+
+```diff
+   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False, output_shift:int=0,
+                       input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
+     E = self.EMIT
++    if custom == "RELUX":
++      self.build_registers(op, int16_mode, "fp16_exponent_shift_minus(16)", byte_output, output_shift,
++                           input_addr, weight_addr, output_addr)
++      self.npu_regs += [
++        E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0),
++        E(rk.DPU, rk.REG_DPU_BN_CFG,
++          (1 << rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT) | (1 << rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT) |
++          (1 << rk.DPU_BN_CFG_BN_RELUX_EN__SHIFT)),
++        E(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE,
++          int.from_bytes(struct.pack("<f", 1.0), "little") << rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__SHIFT),
++      ]
++      return
+     exp_shift = custom == "fp16_exponent_shift_minus(16)"
+```
+
+Allow in validation
+```diff
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+               raise NotImplementedError("ROCKCHIP NPU FP16 comparisons do not support NaN inputs")
++          elif u.arg == ("RELUX", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half]: pass
+           else:
+             raise NotImplementedError(f"ROCKCHIP NPU does not support CUSTOM {u.arg}")
+```
+
+```diff
+   def _pm_lower_cmplt(u:UOp) -> UOp:
+@@
+-    positive = biased.alu(Ops.MUL, delta.const_like(float("inf"))).maximum(delta.const_like(0))
+-    # Clamp to [0, 1] with existing MAX/NEG operations, then write bool bytes.
+-    return positive.alu(Ops.NEG).maximum(delta.const_like(-1)).alu(Ops.NEG).cast(dtypes.bool)
++    product = biased.alu(Ops.MUL, delta.const_like(float("inf")))
++    mask = UOp(Ops.CUSTOM, src=(product,), arg=("RELUX", dtypes.half))
++    # Hardware ReLU-X maps NaN to 1; clear equal inputs, including equal infinities.
++    unequal = RockchipRenderer._pm_lower_compare(a.alu(Ops.CMPNE, b)).cast(dtypes.half)
++    return mask.alu(Ops.MUL, unequal).cast(dtypes.bool)
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_cmp_lt
+
+Ran 1 test in 1.081s
+
+OK
+```
+
+Quick progress recap
+
+| Group                | Working now                           | Remaining                                      |
+|----------------------|---------------------------------------|------------------------------------------------|
+| `GroupOp.Unary`      | `NEG`, `RECIPROCAL`                   | `EXP2`, `LOG2`                                  |
+|                      |                                       | `SIN`, `SQRT`, `TRUNC`                         |
+| `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`                   | `AND`, `CDIV`, `CMOD`                          |
+|                      | `FDIV`, `MAX`                         | `FLOORDIV`, `FLOORMOD`                         |
+|                      | `CMPEQ`, `CMPNE`, `CMPLT`             | `POW`, `SHL`, `SHR`                            |
+|                      | `OR` (bool)                           | `THREEFRY`, `XOR`                              |
+| `GroupOp.Ternary`    | —                                     | `MULACC`, `WHERE`                              |
+| `Elementwise` extras | `CAST` (bool → FP16, mask → bool)     | `BITCAST`                                      |
+| **Total**            | **12 / 30**                           | **18 / 30**                                    |
+
+Next we will do Ops.WHERE, WHERE is mostly handled on hardware with `a×x + b×(1-x)` and with a spreadsheet, we can implement it ourself even official RKNN has no NPU WHERE/IF support.
+
+```
+Ops.WHERE(x, a, b) = a×x + b×(1-x)
+```
+
+| Stage      | Operation                      | `x = 0` | `x = 1` |
+|------------|--------------------------------|--------:|--------:|
+| `Ops.CAST` | `x → FP16`                     | 0       | 1       |
+| `Ops.MUL`  | mask = `a × x`                 | 0       | `a`     |
+|------------|--------------------------------|--------:|--------:|
+| `Ops.CAST` | `x → FP16`                     | 0       | 1       |
+| `Ops.SUB`  | `1 - x`                        | 1       | 0       |
+| `Ops.MUL`  | inverse = `b × (1 - x)`        | `b`     | 0       |
+|------------|--------------------------------|--------:|--------:|
+| `Ops.ADD`  | result = `mask + inverse`      | `b`     | `a`     |
+
+1. `Ops.CAST` bool to half
+2. `Ops.MUL` by a for true branch result 
+
+3. inverse branch reuses CAST result 
+4. `Ops.SUB` calculates inverse mask `1 - x` 
+5. `Ops.MUL` calculates false branch result `b × (1 - x)`
+
+6. `Ops.ADD` true branch and false branch 
+
+And implements Ops.WHERE in ops_rockchip.py
+```diff
+ ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
+-           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP}
++           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP}
+@@
+ class RockchipRenderer(Renderer):
++  @staticmethod
++  def _pm_lower_where(u:UOp) -> UOp:
++    x, a, b = u.src
++    mask = x.cast(dtypes.half)
++    positive = a.alu(Ops.MUL, mask)
++    inverse = b.alu(Ops.MUL, mask.const_like(1).alu(Ops.SUB, mask))
++    return positive.alu(Ops.ADD, inverse)
++
+@@
+   comparison_matcher = PatternMatcher([
++    # Arithmetic selection for FP16 branches; non-finite values and signed zero need separate handling.
++    (UPat(Ops.WHERE, dtypes.half, src=(UPat(dtype=dtypes.bool), UPat(dtype=dtypes.half), UPat(dtype=dtypes.half)), name="u"),
++     lambda u: RockchipRenderer._pm_lower_where(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_where
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.WHERE with dtypes.int
+Ran 1 test in 0.120s
+FAILED (errors=1)
+```
+
+Let do input dtype CAST from int32 to fp16, then CAST the result back to WHERE output dtype:
+
+```diff
+   def _pm_lower_where(u:UOp) -> UOp:
+     x, a, b = u.src
++    a, b = a.cast(dtypes.half), b.cast(dtypes.half)
+@@
+-    return positive.alu(Ops.ADD, inverse)
++    return positive.alu(Ops.ADD, inverse).cast(u.dtype)
+@@
+   comparison_matcher = PatternMatcher([
+-    # Arithmetic selection for FP16 branches; non-finite values and signed zero need separate handling.
+-    (UPat(Ops.WHERE, dtypes.half, src=(UPat(dtype=dtypes.bool), UPat(dtype=dtypes.half), UPat(dtype=dtypes.half)), name="u"),
++    # Arithmetic selection; INT32 casts are lossy, and non-finite values/signed zero need separate handling.
++    (UPat(Ops.WHERE, (dtypes.half, dtypes.int32), src=(UPat(dtype=dtypes.bool),
++      UPat(dtype=(dtypes.half, dtypes.int32, dtypes.weakint, dtypes.weakfloat)),
++      UPat(dtype=(dtypes.half, dtypes.int32, dtypes.weakint, dtypes.weakfloat))), name="u"),
+      lambda u: RockchipRenderer._pm_lower_where(u)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_where
+
+Ran 1 test in 0.125s
+
+OK
+```
+
+ALL test cases in test_where passed!
+Next we will do Ops.SHL with `x << n → MUL(x, 2^n)`
+
+first extend ops_map
+```diff
+ ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
+-           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP}
++           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0}
+```
+
+prepare input
+```diff
+   def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
+@@
++    if op is Ops.SHL:
++      assert b is not None
++      if dtype != dtypes.int16 or not b or not all_same(b) or not 0 <= b[0] <= 14:
++        raise NotImplementedError("ROCKCHIP SHL requires INT16 and one uniform shift count in 0..14")
++      shift = b[0]
++      # Select a constant multiplier instead of using CPU << inside the SHL implementation.
++      powers = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
++      b = [powers[shift]] * len(a)
+```
+
+Set Ops.SHL to build registers with Ops.MUL for `x << n → MUL(x, 2^n)` and set both input and output packing to int16 for Ops.SHL
+```diff
+@@
++    elif op is Ops.SHL: self.build_registers(Ops.MUL, int16_mode=True)
+     else: self.build_registers(op, custom=custom)
+@@
+-      packed = struct.pack("<8h" if op is Ops.CAST and not byte_output else "<8e", *(lanes + [0] * (8-len(lanes))))
++      packed = struct.pack("<8h" if op is Ops.SHL or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
+@@
+-        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8e", *(rhs + [0.0] * (8-len(rhs))))
++        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8h" if op is Ops.SHL else "<8e", *(rhs + [0] * (8-len(rhs))))
+@@
+-      fmt = "16?" if dtype == dtypes.bool else "16b" if dtype == dtypes.int8 else "8e"
++      fmt = "16?" if dtype == dtypes.bool else "16b" if dtype == dtypes.int8 else "8h" if dtype == dtypes.int16 else "8e"
+```
+
+Relax NPU gate for Ops.SHL
+```diff
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+-          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != dtypes.half:
++          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
+             raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
+-          values[u] = self.run_npu(u.op, *src_values)
++          values[u] = self.run_npu(u.op, *src_values, dtype=u.dtype)
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHL with dtypes.uint
+Ran 1 test in 0.169s
+FAILED (errors=1)
+```
 
 ==== keep everything above unchange
 ==== only fix below
+
+The NotImplementedError is caused by test_lshift using dtypes.uint, but our RKNPU doesnt supports dtypes.uint by default.
+tinygrad `codegen/decomp/dtype.py` can rewrite 64bit operations into 32bit ones, it doesnt lower UINT32 shifts into INT16 so we need to write our own decomposition.
+
+| Stage              | Representation | Values                                   | Meaning                                                   |
+|--------------------|----------------|------------------------------------------|-----------------------------------------------------------|
+| Input              | UINT32         | `0xABCD1234`                             | Original 32-bit value                                     |
+| Reinterpret        | 2 × INT16      | `0x1234 = 4660`, `0xABCD = -21555`      | Same 32 bits, viewed as two signed INT16 words            |
+| Split word 0       | bytes          | `low = 0x34 = 52`, `high = 0x12 = 18`   | `0x1234 → [52, 18]`                                       |
+| Split word 1       | bytes          | `low = 0xCD = 205`, `high = 0xAB = 171` | `0xABCD → [205, 171]`                                     |
+| Four limbs         | 4 × INT16      | `[52, 18, 205, 171]`                     | Each INT16 lane now holds one unsigned byte `0..255`      |
+| MUL by `2^4`       | INT16          | `[832, 288, 3280, 2736]`                 | Shift each byte left by 4                                 |
+| Carry              | INT16          | `[3, 1, 12, 10]`                         | `floor(product / 256)`                                    |
+| Low                | INT16          | `[64, 32, 208, 176]`                     | `product - carry * 256`                                   |
+| Add previous carry | bytes          | `[64, 35, 209, 188]`                     | Carry from each byte enters the next byte                 |
+| Repack             | 2 × INT16      | `0x2340`, `0xBCD1`                       | Pack every two bytes back into one INT16 word             |
+| Output             | UINT32         | `0xBCD12340`                              | `(0xABCD1234 << 4) & 0xffffffff`                          |
+
+lets shift four byte values. For a byte x and residual shift r=0..7:
+
+```text
+p = x * 2^r
+carry = floor(p / 256)
+low = p - carry * 256
+```
+
+Since `255 * 128 = 32640`, p fits INT16. But `OUT_CVT_SHIFT=8` rounds: 255 gives 1 instead of 0. Our probe gets an exact carry with:
+
+```text
+carry = round_to_nearest_even((2*p - 255) / 512)
+```
+
+1. EW MUL by 2.
+2. `OUT_CVT_OFFSET=-255`, `CVT_TYPE=1`: add the bias before shifting.
+3. `OUT_CVT_SCALE=1`, `OUT_CVT_SHIFT=9`, `CVT_ROUND=0`, `MINUS_EXP=0`.
+
+| Stage   | Op / setting                   |    p |    p |    p |     p |
+|---------|--------------------------------|-----:|-----:|-----:|------:|
+| Input   | INT16                          |    0 |  255 |  256 | 32640 |
+| EW MUL  | `× 2`                          |    0 |  510 |  512 | 65280 |
+| OUT CVT | `+ (-255)`                     | -255 |  255 |  257 | 65025 |
+| OUT CVT | shift 9, round to nearest even |    0 |    0 |    1 |   127 |
+
+Write `p = 256*q + remainder`, where remainder is 0..255. The expression becomes `q + (2*remainder - 255)/512`. The fraction is strictly between -0.5 and 0.5, so rounding returns q.
+
+All stages run in one task. The wide intermediate is shifted before the INT16 write, so 65280 does not saturate first. This passed every p from 0 through 32640, and signed `x >> 8` for all 65,536 INT16 values. Using EW multiplier `2^(r+1)` also passed all 256 byte values for each r=0..7. The probes are in `~/npu/ops_reg/probe_shl_primitives.py`, modes `exact` and `signed`.
+
+The direct INT8 widening/DMA chain timed out, so lets start from our two INT16 words instead. Use the same converter formula for `floor(word/256)`:
+
+```python
+high_signed = floor(word / 256)
+low = SUB(word, MUL(high_signed, 256))
+high = ADD(high_signed, MUL(CMPLT(high_signed, 0), 256))
+```
+
+Now low and high are both 0..255. For example, word -1 gives high_signed=-1, low=255 and high=255. The NPU does the splitting; no need to extract 16 individual bits.
+
+For shift n, use `r=n%8` for the byte arithmetic above. Add each byte's low part to the preceding byte's carry, then move the byte lanes by `n//8`, filling with zeros. Discard anything beyond the fourth byte.
+
+To pack each pair back into an INT16 word, first make the high byte signed so MUL cannot saturate:
+
+```text
+high_signed = SUB(high, MUL(CMPLT(127, high), 256))
+word = ADD(low, MUL(high_signed, 256))
+```
+
+Select binary MIN for the private INT16 CMPLT helper:
+
+```diff
+   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False, output_shift:int=0,
+                       input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
+@@
+-    assert op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
++    binary = int16_mode and op is Ops.CMPLT
++    assert binary or op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
+@@
+-        (self.ops_map[op] << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
++        ((1 if binary else self.ops_map[op]) << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) | # MIN in binary mode returns a < b.
++        (binary << rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT) |
+```
+
+Enable INT16 arithmetic for these private helper calls and pack both inputs as INT16. The public UOp gate stays unchanged here:
+
+```diff
+   def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
+@@
+-    elif op is Ops.SHL: self.build_registers(Ops.MUL, int16_mode=True)
++    elif dtype == dtypes.int16 and op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.CMPLT, Ops.SHL):
++      self.build_registers(Ops.MUL if op is Ops.SHL else op, int16_mode=True)
+     else: self.build_registers(op, custom=custom)
+@@
+-      packed = struct.pack("<8h" if op is Ops.SHL or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
++      packed = struct.pack("<8h" if dtype == dtypes.int16 or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
+@@
+-        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8h" if op is Ops.SHL else "<8e", *(rhs + [0] * (8-len(rhs))))
++        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8h" if dtype == dtypes.int16 else "<8e", *(rhs + [0] * (8-len(rhs))))
+```
+
+Add the carry converter after building the registers. Normal tasks still initialize its offset and shift to zero:
+
+```diff
+-  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
++  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half, carry:bool=False) -> list:
++    assert not carry or (op is Ops.MUL and dtype == dtypes.int16)
+@@
++    if carry:
++      # With EW multiplier 2: round((2*x - 255)/512) = floor(x/256).
++      self.npu_regs += [
++        self.EMIT(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, -255),
++        self.EMIT(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT,
++          (1 << rk.DPU_OUT_CVT_SHIFT_CVT_TYPE__SHIFT) | (9 << rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__SHIFT)),
++      ]
+     result:list = []
+```
+
+Now implement the formula. Python packs storage and routes lanes; the NPU does the arithmetic:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
++  def _i16(self, op:Ops, a:list, b:list|int, carry:bool=False) -> list:
++    return self.run_npu(op, a, [b]*len(a) if isinstance(b, int) else b, dtype=dtypes.int16, carry=carry)
++
++  def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
++    if not b or not all_same(b) or not 0 <= b[0] <= 31:
++      raise NotImplementedError("ROCKCHIP UINT32 SHL requires one uniform shift count in 0..31")
++    amount = int(b[0])
++    raw = b"".join(struct.pack("<I" if dtype == dtypes.uint else "<i", x) for x in a)
++    words = list(struct.unpack("<" + "h"*(len(raw)//2), raw))
++    # Split signed words into unsigned byte values on the NPU.
++    high = self._i16(Ops.MUL, words, 2, carry=True)
++    low = self._i16(Ops.SUB, words, self._i16(Ops.MUL, high, 256))
++    high = self._i16(Ops.ADD, high, self._i16(Ops.MUL, self._i16(Ops.CMPLT, high, 0), 256))
++    limbs = [v for pair in zip(low, high) for v in pair]
++    residual, displacement = amount % 8, amount // 8
++    # Use constant multipliers to avoid executing CPU << inside the SHL implementation.
++    product = self._i16(Ops.MUL, limbs, (1, 2, 4, 8, 16, 32, 64, 128)[residual])
++    carry = self._i16(Ops.MUL, product, 2, carry=True)
++    low = self._i16(Ops.SUB, product, self._i16(Ops.MUL, carry, 256))
++    previous = [v for i in range(0, len(carry), 4) for v in [0]+carry[i:i+3]]
++    combined = self._i16(Ops.ADD, low, previous)
++    moved = [v for i in range(0, len(combined), 4) for v in [0]*displacement+combined[i:i+4-displacement]]
++    lo, hi = moved[::2], moved[1::2]
++    # Make the high byte signed before multiplying, avoiding INT16 saturation.
++    negative = self._i16(Ops.CMPLT, [127]*len(hi), hi)
++    hi = self._i16(Ops.SUB, hi, self._i16(Ops.MUL, negative, 256))
++    words = self._i16(Ops.ADD, lo, self._i16(Ops.MUL, hi, 256))
++    raw = struct.pack("<" + "h"*len(words), *words)
++    return [struct.unpack_from("<I" if dtype == dtypes.uint else "<i", raw, i)[0] for i in range(0, len(raw), 4)]
+```
+
+Route 32-bit SHL to this helper:
+
+```diff
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+         elif u.op in GroupOp.ALU:
++          if u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
++            values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
+-          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
++          elif u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
+             raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
+-          values[u] = self.run_npu(u.op, *src_values, dtype=u.dtype)
++          else: values[u] = self.run_npu(u.op, *src_values, dtype=u.dtype)
+```
+
+Test the actual backend, without the prototype's monkeypatch:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift TestOps.test_lshift_signed
+
+test_lshift (__main__.TestOps.test_lshift) ... ok
+test_lshift_signed (__main__.TestOps.test_lshift_signed) ... ok
+
+Ran 2 tests in 0.419s
+
+OK
+```
+
+The ported backend also passed 2,112 randomized signed/unsigned shifts across all counts 0..31 with 33-lane inputs. Each helper call requires one uniform count. NOOPT=1 passes the test's per-element counts in separate calls. This still uses host storage packing between tasks, not a fully DMA-linked pipeline.
