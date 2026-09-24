@@ -1892,70 +1892,115 @@ so the plan is to
 - multply each Byte with 16, essentially shifting left 4 bit on each chunk, `0x34*16, 0x12*16, 0xCD*16, 0xAB*16` 
 - push the carry if any to the upper byte and adds it
 
-Heres is the plan in detail
+Heres are the steps in detail
 
-1. First, 4 Byte split 1 Byte each and its little-endian.
+| Task   | Stage          | Op / formula                                      | Dtype       | Byte 0 | Byte 1 | Byte 2 | Byte 3 |
+|-------:|----------------|---------------------------------------------------|-------------|-------:|-------:|-------:|-------:|
+| Input  | Original input | `0xABCD1234`, lowest byte first                   | UINT32      | `0x34` | `0x12` | `0xCD` | `0xAB` |
+| 1.1    | CNA read       | `DATA_SIGN=1`: read the same raw bytes as signed  | INT8        | 52     | 18     | -51    | -85    |
+| 1.2    | CONV/CVT       | compute `q`, equivalent to `floor((s+8)/16)`      | INT8        | 3      | 1      | -3     | -5     |
+| 2.1    | CNA read       | `DATA_SIGN=0`: reread the same bytes as unsigned  | UINT8       | 52     | 18     | 205    | 171    |
+| 2.2    | CNA CVT        | subtract `128` so the values fit signed INT8      | INT8        | -76    | -110   | 77     | 43     |
+| 2.3    | CONV/CVT       | compute `carry = floor(u/16)`                     | INT8        | 3      | 1      | 12     | 10     |
+| 3.1    | CONV           | `16*s - 256*q`                                    | accumulator | 64     | 32     | -48    | -80    |
+| 3.2    | CONV weights   | select carry from previous byte; byte 0 gets zero | INT8 source | 0      | 3      | 1      | 12     |
+| 3.3    | Output         | shifted byte + incoming carry                     | INT8        | 64     | 35     | -47    | -68    |
+| Output | Stored result  | reinterpret the four output bytes as UINT32       | UINT32      | `0x40` | `0x23` | `0xD1` | `0xBC` |
+
+Input. 4 Byte split 1 Byte each and its little-endian.
+
 ```
 0xABCD1234 
    ↓ 
 [0x34, 0x12, 0xCD, 0xAB]
 ```
 
-2. The NPU arithmetic path expects signed values, so Task 1 reads them as INT8 with `DATA_SIGN=1` but bytes in RAM still the same:
+Task 1.1. The NPU arithmetic path expects signed values, so Task 1 reads them as INT8 with `DATA_SIGN=1` but bytes in RAM still the same:
+
 ```
 [0x34, 0x12, 0xCD, 0xAB]
     ↓ INT8
 [52, 18, -51, -85]
 ```
 
-3. SHL by 4 means multiply each chunk by 2**4 = 16. However, some values might overflow INT8 (−128 to 127), 
-we need to keep the low 8 bits, simple approach is just `& 255` but we dont have `Ops.AND` yet, 
+
+Task 1.2. SHL by 4 means multiply each chunk by 2**4 = 16. However, some values might overflow INT8 (−128 to 127),
+we need to extract the low 8 bits, simple approach is just `& 255` but we dont have `Ops.AND` yet,
 but we can also extract low bits with MOD
 
-```text
+```
+on memory:       [0x34, 0x12, 0xCD, 0xAB]
+<< 4:            [0x340, 0x120, 0xCD0, 0xAB0] <- overflowed int8
+extract 8 bits:  [ 0x40,  0x20,  0xD0,  0xB0] <- diffcult step here
+INT8:            [   64,    32,   -48,   -80]
+```
+
+And there is 2 problems here, overflow and no easy Ops.AND/Ops.CMOD to extract low bits. 
+```
+Overflow without AND or MOD
 -51 * 16 = -816  (Overflow)
 -85 * 16 = -1360 (Overflow)
 
+With AND
 (-51 * 16) & 255 = 208 = 0xD0 = -48 in INT8 (What we need)
 (-85 * 16) & 255 = 176 = 0xB0 = -80 in INT8 
 
+With MOD
 (-51 * 16) MOD 256 (same as above)
 (-85 * 16) MOD 256 
 ```
 
-We dont have MOD implemented yet either, but we can still do MOD with `s*16 - 256*q`, 
-so we can find q with some simple maths
-```
-result = s*16 - 256*q  
+For overflow, we will propogate the carry to next byetes.
+For extracting low bits, we can split the MOD calcaution as illustrated below.
 
--128 <= result <= 127
+We dont have MOD implemented yet, but we can still do shifted = (X * 16) MOD 256 with `s*16 - 256*q`,
+In order to find shifted, we need to find q first
+
+```
+shifted = s*16 - 256*q  
+
+-128 <= shifted <= 127
 -128 <= 16*s - 256*q <= 127
 -8 <= s - 16*q <= 7
 0 <= s + 8 - 16*q <= 15
 16*q <= s + 8 <= 16*q + 15
 q <= (s + 8)/16 <= q + 15/16
 q <= (s + 8)/16 
+q = floor((s + 8)/16), q as interger
 
-we need q as interger so,
+for s = 0xCD = -51 in INT8
 q = floor((s + 8)/16)
+= floor((-51 + 8) / 16)
+= floor(-43 / 16)
+= floor(-2.6875) = -3
 ```
 
-Now we can do
+but seems we can find shifted directly without finding q first, why bother 
 ```
-result = s*16 - 256*q  ... eq1
-q = floor((s + 8)/16)  ... eq2
-
-result = -51 * 16 - 256 * floor((-51 + 8) / 16)
-       = -816 - 256 * floor(-43 / 16)
+shifted = -51 * 16 - 256 * floor((-51 + 8) / 16)
+       = -816 - 256 * floor((-51 + 8) / 16)
        = -816 - 256 * floor(-2.6875)
        = -816 - 256 * (-3)
        = -816 + 768
-       = -48
+       = -48  
 ```
-`-48` is INT8 bit pattern `0xD0`, which is exactly the low 8 bits of `0xCD << 4`.
 
-4. We now have the low 8 bits of each shifted byte chunk, but we still needs to propagate the carry into the next higher byte.
-For example, `0xCD`
+Because hardware still need intermediates and calcaute step by step, here in Task1.2 we will first find q and later combine with s*16 to form shifted.
+```
+INT8 s:     [     52,      18,      -51,      -85]
+2 * s:      [    104,      36,     -102,     -170]
++ 1:        [    105,      37,     -101,     -169]
+/ 32:       [3.28125, 1.15625, -3.15625, -5.28125]
+rounded q:  [      3,       1,       -3,       -5]
+```
+
+==== keep everything above unchange
+==== only fix below
+
+here before getting carry, shd we *16 on each byte chunk first?
+
+Task 2.1. Next we calculate the carry needed to propagate into the next higher byte.
+
 ```
 0xCD = 1100 1101
 
@@ -1963,10 +2008,11 @@ to get upper 4 bits with simple right shift
 c >> 4 = 1100 1101 >> 4 = 0000 1100 = 0xC = 12 in both UINT8 and INT8
 ```
 
-but how can we have right shift already implemented while we are implementing Ops.SHL? 
+but how can we have right shift already implemented while we are implementing Ops.SHL?
 Left shift is diffcult but right shift is not at all, because the NPU exposed hardware right shift by the OUT_CVT_SHIFT register, makes our life so much easier.
 
 One problem remains, earlier we interpered the byte as signed int8, but we might want uint8 here.
+
 ```
 0xCD = 1100 1101 = -51 in INT8 = -51 >> 4 = -4  = 1111 1100
 0xCD = 1100 1101 = 205 in UINT8 = 205 >> 4 = 12 = 0000 1100 (what we need)
@@ -1974,7 +2020,7 @@ One problem remains, earlier we interpered the byte as signed int8, but we might
 
 The NPU hardware only supported calculation on sigend dtype but its was kind enough to exposed an UINT8 byte reading path which was designed for reading quatized model weight. The UINT8 reading path was only available on the CNA/CMAC path not on our DPU path we were working all among. Therefore, we will need to setup CNA registers later and the CONVULUTION path can actually helps the Ops.SHL implementaion by saving lots of DPU EW Ops.
 
-So Task 2 rereads the exact same input bytes as unsigned values using `DATA_SIGN=0`:
+So Task 2.1 rereads the exact same input bytes as unsigned values using `DATA_SIGN=0`:
 
 ```text
 [0x34, 0x12, 0xCD, 0xAB]
@@ -1982,50 +2028,61 @@ So Task 2 rereads the exact same input bytes as unsigned values using `DATA_SIGN
 [52, 18, 205, 171]
 ```
 
-5. The CONVULUTION datapath still expects signed INT8 values, so `205` and `171` cannot be used directly. We will first -128 to let UINT8 values `[0, 255]` fits within INT8 range `[-128, 127]` and restore +128 later. The subtraction is done by the CNA converter, no DPU EW/BS/BN is needed here.
- 
+Task 2.2. The CONVULUTION datapath still expects signed INT8 values, so `205` and `171` cannot be used directly. We will first -128 to let UINT8 values `[0, 255]` fits within INT8 range `[-128, 127]` and restore +128 later. The subtraction is done by the CNA converter, no DPU EW/BS/BN is needed here.
+
 CNA's input converter subtracts `128` before convolution:
+
 ```text
 [52, 18, 205, 171]
     ↓ subtract 128
 [-76, -110, 77, 43]
 ```
 
-
-6. Task 2 now extracts the upper 4 bits without FLOOR op because convolution output converter comes with a biased rounded right shift with REG_DPU_OUT_CVT_OFFSET and REG_DPU_OUT_CVT_SHIFT
+Task 2.3. Task 2 now extracts the upper 4 bits without FLOOR op because convolution output converter comes with a biased rounded right shift with REG_DPU_OUT_CVT_OFFSET and REG_DPU_OUT_CVT_SHIFT, we can rearrange the math to make them useful.
 
 We want a simple >> 4 to get the upper 4 bits,
+
 ```
-on memory: [0x34, 0x12, 0xCD, 0xAB]
-UINT8:     [52, 18, 205, 171]
->>4:       [ 3,  1,  12,  10]
+on memory:  [0x34,      0x12,      0xCD,      0xAB]
+  in bin    [00110100,  00010010,  11001101,  10101011]
+  in UINT8  [52,        18,        205,       171]
+
+with physical lshift
+>> 4:       [00000011,  00000001,  00001100,  00001010]
+  in UINT8  [3,         1,         12,         10]
+
+with UINT8 calculation
+FLOORDIV 16 [3,         1,         12,         10]
 ```
 
-but we cannot do that because remember we need to calcaute in signed INT8 and -128 as mentioned. 
-Inteads, we do
+but we cannot do that because remember we need to calcaute in signed INT8 and `-128` as mentioned. Instead, we do
 
 ```
 carry 
 = u >> 4
 = floor(u / 16)
 = round((2*u - 15) / 32)
-= round((2*(u - 128) + 241) / 2^5)
-      
+= round((2*(u - 128) + 241) / 2^5) 
+
+Note: used *2 here to avoid 0.5 rounding ties and set the register as
 REG_DPU_OUT_CVT_OFFSET = 241
 REG_DPU_OUT_CVT_SHIFT  = 5
 
-on memory: [0x34, 0x12, 0xCD, 0xAB]
-UINT8:     [  52,   18,  205,  171]
-carry:     [   3,    1,   12,   10]
+on memory:            [0x34,      0x12,      0xCD,      0xAB]
+uint8:                [ 52,    18,    205,    171]
+u - 128:              [-76,  -110,     77,     43]
+2 * (u - 128):        [-152, -220,    154,     86]
++ 241:                [ 89,    21,    395,    327]
+/ 32:                 [2.78125, 0.65625, 12.34375, 10.21875]
+round:                [  3,     1,     12,      10]
 ```
 
-==== keep everything above unchange
-==== only fix below
+Thats exactly what we want as simple >> 4.
 
-7. Task 3 combines the original signed byte `s` with the correction `q` from Task 1:
+Task 3.1.1. Task 3 combines the original signed byte `s` with the correction `q` from Task 1:
 
 ```text
-shifted = 16*s - 256*q
+shifted = s*16 - 256*q
 ```
 
 For our four bytes:
@@ -2052,7 +2109,7 @@ which are exactly the low 8 bits of shifting each original byte left by 4 indepe
 0xAB << 4 → 0xB0
 ```
 
-8. Now propagate the carry from each lower byte into the next higher byte.
+Task 3.1.2. Now propagate the carry from each lower byte into the next higher byte.
 
 For a little-endian UINT32:
 
@@ -2071,7 +2128,7 @@ So the incoming carry vector is:
 
 The final convolution can select the previous byte's carry directly with constant weights, so Python does not need to move or reorder intermediate values.
 
-9. Add the incoming carry to the shifted low byte:
+Task 3.1.3. Add the incoming carry to the shifted low byte:
 
 ```text
 shifted: [64, 32, -48, -80]
@@ -2095,7 +2152,7 @@ so the four result bytes are:
 [0x40, 0x23, 0xD1, 0xBC]
 ```
 
-10. Since the bytes are already stored in little-endian UINT32 order, we can reinterpret them directly as:
+Output. Since the bytes are already stored in little-endian UINT32 order, we can reinterpret them directly as:
 
 ```text
 0xBCD12340
@@ -2129,20 +2186,6 @@ Task 3: compute shifted byte + preceding carry
 
 The final convolution reads the original bytes, `q`, and `carry` directly from scratch storage and performs the byte routing through constant weights.
 
-| Step | Stage           | Op / formula                                      | Dtype       | Byte 0 | Byte 1 | Byte 2 | Byte 3 |
-| ---: | --------------- | ------------------------------------------------- | ----------- | -----: | -----: | -----: | -----: |
-|    1 | Original input  | `0xABCD1234`, lowest byte first                   | UINT32      | `0x34` | `0x12` | `0xCD` | `0xAB` |
-|    2 | Task 1 CNA read | `DATA_SIGN=1`: read the same raw bytes as signed  | INT8        |     52 |     18 |    -51 |    -85 |
-|    3 | Task 1 conv/CVT | compute `q`, equivalent to `floor((s+8)/16)`      | INT8        |      3 |      1 |     -3 |     -5 |
-|    4 | Task 2 CNA read | `DATA_SIGN=0`: reread the same bytes as unsigned  | UINT8       |     52 |     18 |    205 |    171 |
-|    5 | Task 2 CNA CVT  | subtract `128` so the values fit signed INT8      | INT8        |    -76 |   -110 |     77 |     43 |
-|    6 | Task 2 conv/CVT | compute `carry = floor(u/16)`                     | INT8        |      3 |      1 |     12 |     10 |
-|    7 | Task 3 conv     | `16*s - 256*q`                                    | accumulator |     64 |     32 |    -48 |    -80 |
-|    8 | Task 3 weights  | select carry from previous byte; byte 0 gets zero | INT8 source |      0 |      3 |      1 |     12 |
-|    9 | Task 3 output   | shifted byte + incoming carry                     | INT8        |     64 |     35 |    -47 |    -68 |
-|   10 | Stored result   | reinterpret the four output bytes as UINT32       | UINT32      | `0x40` | `0x23` | `0xD1` | `0xBC` |
-
-
 Its constant weights select bytes, add the preceding carry and insert zeros. Calculate signed output bytes so the INT8 writer never needs to wrap.
 
 For `x << n`, let `r=n%8` and `k=8-r`. For r=1..6:
@@ -2156,7 +2199,6 @@ signed_result[i] = 2^r*s[i] - 256*q[i] + carry[i-1]
 ```
 
 The first byte has no incoming carry. `2^r*s - 256*q` is in [-128, 128-2^r]; adding carry in [0, 2^r-1] still fits INT8.
-
 
 Steps 6–8 are one convolution, not separate tasks. Its weights select the neighboring carry; no extra SHL is needed.
 
