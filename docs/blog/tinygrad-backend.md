@@ -1920,7 +1920,7 @@ Task 1.1. The NPU arithmetic path expects signed values, so Task 1 reads them as
 ```
 [0x34, 0x12, 0xCD, 0xAB]
     ↓ INT8
-[52, 18, -51, -85]
+s = [52, 18, -51, -85]
 ```
 
 
@@ -1933,10 +1933,7 @@ on memory:       [0x34, 0x12, 0xCD, 0xAB]
 << 4:            [0x340, 0x120, 0xCD0, 0xAB0] <- overflowed int8
 extract 8 bits:  [ 0x40,  0x20,  0xD0,  0xB0] <- diffcult step here
 INT8:            [   64,    32,   -48,   -80]
-```
 
-And there is 2 problems here, overflow and no easy Ops.AND/Ops.CMOD to extract low bits. 
-```
 Overflow without AND or MOD
 -51 * 16 = -816  (Overflow)
 -85 * 16 = -1360 (Overflow)
@@ -1950,12 +1947,20 @@ With MOD
 (-85 * 16) MOD 256 
 ```
 
-For overflow, we will propogate the carry to next byetes.
-For extracting low bits, we can split the MOD calcaution as illustrated below.
+And there is 2 problems here
+- s * 16 does not fit in INT8, so we need a way to calculate the low 8-bit result without relying on INT8 wraparound.
+- left shift produces carry-out bits that cross into the next higher byte.
 
-We dont have MOD implemented yet, but we can still do shifted = (X * 16) MOD 256 with `s*16 - 256*q`,
+```
+original byte:     [ upper 4 ][ lower 4 ]
+
+after << 4:
+carry to next byte: [ upper 4 ]
+current byte:                  [ lower 4 ][0000]
+```
+
+We dont have MOD implemented yet, but we can split the MOD calcaution as shifted = (X * 16) MOD 256 with `s*16 - 256*q`,
 In order to find shifted, we need to find q first
-
 ```
 shifted = s*16 - 256*q  
 
@@ -1985,7 +1990,7 @@ shifted = -51 * 16 - 256 * floor((-51 + 8) / 16)
        = -48  
 ```
 
-Because hardware still need intermediates and calcaute step by step, here in Task1.2 we will first find q and later combine with s*16 to form shifted.
+Because hardware still need intermediates and calcaute step by step, here in Task1.2 we will first find q and later in Task3 combine with s*16 to form shifted.
 ```
 INT8 s:     [     52,      18,      -51,      -85]
 2 * s:      [    104,      36,     -102,     -170]
@@ -1994,33 +1999,49 @@ INT8 s:     [     52,      18,      -51,      -85]
 rounded q:  [      3,       1,       -3,       -5]
 ```
 
-==== keep everything above unchange
-==== only fix below
+Task 2. We have now found q, so mathematically the next step would be to calculate
+```
+shifted = s*16 - 256*q
 
-here before getting carry, shd we *16 on each byte chunk first?
+s:            [52, 18, -51, -85] 
+q:            [ 3, 1, -3, -5] 
+s * 16:       [832, 288, -816, -1360] 
+256 * q:      [768, 256, -768, -1280] 
+s*16 - 256*q: [ 64, 32, -48, -80]
+as shifted
+```
 
-Task 2.1. Next we calculate the carry needed to propagate into the next higher byte.
+As mentioned, we also need the high bit as carry-out and final shifted is
 
 ```
-0xCD = 1100 1101
+s*16 - 256*q + incoming_carry
+```
 
-to get upper 4 bits with simple right shift
-c >> 4 = 1100 1101 >> 4 = 0000 1100 = 0xC = 12 in both UINT8 and INT8
+Here we find carry first, for example 
+```
+0xCD << 4 = 1100 1101 << 4 
+
+carry-out = 1100
+result    =      1101 0000
+```
+
+Carry-out is just the upper 4 bits for lshift 4 Ops, so funny enough to implement lshift we need rshift to get those upper bits.
+```
+0xCD >> 4 = 1100 1101 >> 4 = 0000 1100 = 0xC = 12 in both UINT8 and INT8
 ```
 
 but how can we have right shift already implemented while we are implementing Ops.SHL?
-Left shift is diffcult but right shift is not at all, because the NPU exposed hardware right shift by the OUT_CVT_SHIFT register, makes our life so much easier.
+Left shift is diffcult but right shift is not at all, because the NPU exposed hardware right shift by the OUT_CVT_SHIFT register, but does it makes our life so much easier? Answer is no.
 
 One problem remains, earlier we interpered the byte as signed int8, but we might want uint8 here.
-
 ```
-0xCD = 1100 1101 = -51 in INT8 = -51 >> 4 = -4  = 1111 1100
+0xCD = 1100 1101 = -51 in INT8 = -51 >> 4 = -4  = 1111 1100 (not we need)
 0xCD = 1100 1101 = 205 in UINT8 = 205 >> 4 = 12 = 0000 1100 (what we need)
 ```
 
-The NPU hardware only supported calculation on sigend dtype but its was kind enough to exposed an UINT8 byte reading path which was designed for reading quatized model weight. The UINT8 reading path was only available on the CNA/CMAC path not on our DPU path we were working all among. Therefore, we will need to setup CNA registers later and the CONVULUTION path can actually helps the Ops.SHL implementaion by saving lots of DPU EW Ops.
+The NPU hardware only supports calculation on sigend dtype but the developer was kind enough to exposed an UINT8 byte reading path which was designed for reading model weights. This UINT8 reading path is only available on the CNA/CMAC but not on our DPU path we were working all among. Therefore, we will setup CNA registers later and the configured CNA/CONVULUTION path can actually helps the Ops.SHL implementaion by saving lots of DPU EW Ops, will be shown on Task3.
 
-So Task 2.1 rereads the exact same input bytes as unsigned values using `DATA_SIGN=0`:
+Task 2.1 rereads the exact same input bytes as unsigned values using `DATA_SIGN=0`:
 
 ```text
 [0x34, 0x12, 0xCD, 0xAB]
@@ -2030,7 +2051,7 @@ So Task 2.1 rereads the exact same input bytes as unsigned values using `DATA_SI
 
 Task 2.2. The CONVULUTION datapath still expects signed INT8 values, so `205` and `171` cannot be used directly. We will first -128 to let UINT8 values `[0, 255]` fits within INT8 range `[-128, 127]` and restore +128 later. The subtraction is done by the CNA converter, no DPU EW/BS/BN is needed here.
 
-CNA's input converter subtracts `128` before convolution:
+CNA's input converter subtracts `128` as offset before convolution:
 
 ```text
 [52, 18, 205, 171]
@@ -2066,7 +2087,7 @@ carry
 
 Note: used *2 here to avoid 0.5 rounding ties and set the register as
 REG_DPU_OUT_CVT_OFFSET = 241
-REG_DPU_OUT_CVT_SHIFT  = 5
+REG_DPU_OUT_CVT_SHIFT  = 5   (right shift)
 
 on memory:            [0x34,      0x12,      0xCD,      0xAB]
 uint8:                [ 52,    18,    205,    171]
@@ -2079,54 +2100,41 @@ round:                [  3,     1,     12,      10]
 
 Thats exactly what we want as simple >> 4.
 
-Task 3.1.1. Task 3 combines the original signed byte `s` with the correction `q` from Task 1:
 
-```text
+Task 3.1.1. Task 3 combines the original signed byte `s` with the correction `q` from Task 1
+```
 shifted = s*16 - 256*q
-```
 
-For our four bytes:
+s:            [52, 18, -51, -85] 
+q:            [ 3, 1, -3, -5] 
+s * 16:       [832, 288, -816, -1360] 
+256 * q:      [768, 256, -768, -1280] 
+s*16 - 256*q: [ 64, 32, -48, -80]        
+= shifted
 
-```text
-s:        [52, 18, -51, -85]
-q:        [ 3,  1,  -3,  -5]
-
-shifted:  [64, 32, -48, -80]
-```
-
-These signed INT8 values correspond to the raw bytes:
-
-```text
-[0x40, 0x20, 0xD0, 0xB0]
-```
-
-which are exactly the low 8 bits of shifting each original byte left by 4 independently:
-
-```text
-0x34 << 4 → 0x40
-0x12 << 4 → 0x20
-0xCD << 4 → 0xD0
-0xAB << 4 → 0xB0
+simple << 4 we want
+on memory:       [0x34, 0x12, 0xCD, 0xAB]
+<< 4:            [0x340, 0x120, 0xCD0, 0xAB0] <- overflowed int8
+extract 8 bits:  [ 0x40,  0x20,  0xD0,  0xB0] <- diffcult step here
+INT8:            [   64,    32,   -48,   -80]
 ```
 
 Task 3.1.2. Now propagate the carry from each lower byte into the next higher byte.
 
-For a little-endian UINT32:
-
-```text
-Byte 0 gets 0
-Byte 1 gets carry from Byte 0 = 3
-Byte 2 gets carry from Byte 1 = 1
-Byte 3 gets carry from Byte 2 = 12
+From Task 2, we already calculated the carry-out from each byte:
+```
+byte:          [Byte 0, Byte 1, Byte 2, Byte 3]
+on memory:     [ 0x34,   0x12,   0xCD,   0xAB]
+carry-out:     [    3,      1,     12,     10]
+```
+For little-endian UINT32, each byte receives the carry-out from the byte below it:
+```
+carry-out:     [3, 1, 12, 10]
+                  ↘  ↘   ↘
+incoming carry:[0, 3,  1, 12] (right shifted 1)
 ```
 
-So the incoming carry vector is:
-
-```text
-[0, 3, 1, 12]
-```
-
-The final convolution can select the previous byte's carry directly with constant weights, so Python does not need to move or reorder intermediate values.
+The final convolution can select the previous byte's carry directly with constant weights, so we dont need to rshift or reorder by ourself.
 
 Task 3.1.3. Add the incoming carry to the shifted low byte:
 
@@ -2135,39 +2143,12 @@ shifted: [64, 32, -48, -80]
 carry:   [ 0,  3,   1,  12]
          -------------------
 result:  [64, 35, -47, -68]
+         [0x40, 0x23, 0xD1, 0xBC]
+
+As little-endian UINT32: 0xBCD12340 = 0xABCD1234 << 4
 ```
-
-Convert those signed INT8 values back to their raw byte representations:
-
-```text
- 64 = 0x40
- 35 = 0x23
--47 = 0xD1
--68 = 0xBC
-```
-
-so the four result bytes are:
-
-```text
-[0x40, 0x23, 0xD1, 0xBC]
-```
-
-Output. Since the bytes are already stored in little-endian UINT32 order, we can reinterpret them directly as:
-
-```text
-0xBCD12340
-```
-
-which is exactly:
-
-```text
-0xABCD1234 << 4 = 0xBCD12340
-```
-
-The high nibble `0xA` is discarded because UINT32 left shift wraps at 32 bits.
 
 Convolution is useful here because it can do both pieces of the final operation in one task:
-
 ```text
 shift each byte
 +
@@ -2176,21 +2157,12 @@ select carry from the preceding byte
 write the final INT8 byte
 ```
 
-The implementation therefore uses three NPU tasks for a non-byte-aligned UINT32 SHL:
-
+Quick recap
 ```text
 Task 1: compute q for signed INT8 wrapping
 Task 2: compute the unsigned carry
 Task 3: compute shifted byte + preceding carry
-```
 
-The final convolution reads the original bytes, `q`, and `carry` directly from scratch storage and performs the byte routing through constant weights.
-
-Its constant weights select bytes, add the preceding carry and insert zeros. Calculate signed output bytes so the INT8 writer never needs to wrap.
-
-For `x << n`, let `r=n%8` and `k=8-r`. For r=1..6:
-
-```text
 s = original byte read as INT8
 u = the same byte read as UINT8
 q = floor((s + 2^(k-1)) / 2^k)
@@ -2198,25 +2170,7 @@ carry = floor(u / 2^k)
 signed_result[i] = 2^r*s[i] - 256*q[i] + carry[i-1]
 ```
 
-The first byte has no incoming carry. `2^r*s - 256*q` is in [-128, 128-2^r]; adding carry in [0, 2^r-1] still fits INT8.
-
-Steps 6–8 are one convolution, not separate tasks. Its weights select the neighboring carry; no extra SHL is needed.
-
-1. Task 1 reads signed bytes without subtracting 128. Weight 2, output offset 1 and shift k+1 give `round((2*s+1)/2^(k+1)) = q`.
-2. Task 2 reads unsigned bytes. Its CNA converter subtracts 128 because the convolution consumes signed INT8; otherwise values above 127 saturate. This is a converter setting, not another SUB task. Weight 2 and output offset `256-(2^k-1)` give `round((2*(u-128)+256-(2^k-1))/2^(k+1)) = carry`.
-3. Task 3 reads the original bytes, q and carry directly through DMA. Its weights add the preceding carry and select the source byte for `n//8`. All-zero weight rows insert zeros. Python does not move these values.
-
-For r=7, +128 does not fit an INT8 weight. Use `q=floor(s/2)` and `-128*s + 256*q + carry_previous` instead. For r=0, only the byte-routing convolution is needed.
-
-For example, signed byte `s=3` with incoming carry 5:
-
-```text
-q = floor(3/2) = 1
-signed result = -128*3 + 256*1 + 5 = -123
-stored byte = 0x85, the same bits as (3*128 + 5) mod 256
-```
-
-Task 1 uses output offset -1 for this case: `round((2*s-1)/4) = floor(s/2)`. Task 3 uses weights 127, 127 and 2 on three copies of q, giving `256*q` without a weight outside INT8 range.
+Okay we have gone so far and now we are back to code.
 
 First add the shared CNA setup, reusing the existing DPU initialization. We will build it in three pieces: input shape, converter/DMA, then CORE/DPU output. Finish all three before running it. The task helper below selects signed/unsigned input and INT8 output.
 
@@ -2384,45 +2338,6 @@ In the final matrix, `j=i-displacement` selects the original source byte. Column
 +    return bytes(to_mv(self.dev.output_buf, 4))
 ```
 
-The task must enable CNA, CORE and DPU, not standalone DPU RDMA:
-
-```diff
-   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False, output_shift:int=0,
-                       input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
-@@
--    pc_enable = 0x80 # E adds 1: operation-enable target 0x0081, distinct from rk.PC (PC register writes).
-@@
--    self.npu_regs.append(E(pc_enable, rk.REG_PC_OPERATION_ENABLE,
--      rk.GLOBAL_OPERATION_ENABLE_DPU_OP_EN__MASK | rk.GLOBAL_OPERATION_ENABLE_DPU_RDMA_OP_EN__MASK))
-+    # submit selects the enabled engines after all register writes.
-+
-+  def pc_tail(self, next_addr:int, cna:bool=False) -> list[int]:
-+    E = self.EMIT
-+    return [
-+      E(rk.PC, rk.REG_PC_BASE_ADDRESS, next_addr & rk.PC_BASE_ADDRESS_PC_SOURCE_ADDR__MASK),
-+      E(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0),
-+      E(0x80, rk.REG_PC_OPERATION_ENABLE,
-+        rk.GLOBAL_OPERATION_ENABLE_DPU_OP_EN__MASK | (rk.GLOBAL_OPERATION_ENABLE_CNA_OP_EN__MASK |
-+        rk.GLOBAL_OPERATION_ENABLE_CORE_OP_EN__MASK if cna else rk.GLOBAL_OPERATION_ENABLE_DPU_RDMA_OP_EN__MASK)),
-+    ]
-@@
--  def submit(self) -> None:
-+  def submit(self, cna:bool=False) -> None:
-@@
--    regs = self.npu_regs
-+    guard_offset = (len(self.npu_regs) + 3 + 1) // 2 * 16
-+    assert guard_offset + mmap.PAGESIZE <= self.dev.regcmd_mem.size
-+    regs = self.npu_regs + self.pc_tail(self.dev.regcmd_mem.dma_addr + guard_offset, cna=cna)
-@@
--      op_idx=4,
--      enable_mask=0x18,
-+      op_idx=1 if cna else 4,
-+      enable_mask=0xd if cna else 0x18,
-```
-
-
-The terminal PC points into a zero-filled guard page. Enable CNA/CORE/DPU after all register overrides.
-
 Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read the final four bytes; no host intermediate arithmetic or routing:
 
 ```diff
@@ -2453,20 +2368,12 @@ Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read
 ```
 
 ```bash
-$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift TestOps.test_lshift_signed TestOps.test_add TestOps.test_maximum
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift TestOps.test_lshift_signed
 
 test_lshift (__main__.TestOps.test_lshift) ... ok
 test_lshift_signed (__main__.TestOps.test_lshift_signed) ... ok
-test_add (__main__.TestOps.test_add) ... ok
-test_maximum (__main__.TestOps.test_maximum) ... ok
 
 Ran 4 tests in 2.388s
 
 OK
 ```
-
-This is the ported backend, without a monkeypatch. The prototype also passed 8,416 cases across counts 0..31 and all 65,536 adjacent-byte pairs for shift 4.
-
-This processes one word at a time, with a uniform count per helper call. NOOPT=1 dispatches the test's per-element counts separately. Device-resident variable counts in one vector task are not implemented, and a speed advantage over the old batched path is not established. Python still submits tasks and copies initial/final storage; the NPU does the shift, carry routing and byte assembly.
-
-The tutorial reads each result immediately from the output base. The runtime keeps its existing scratch-page offset and raw-value wrapper to preserve other live results; the convolution sequence is the same.
