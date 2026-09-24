@@ -2172,19 +2172,57 @@ signed_result[i] = 2^r*s[i] - 256*q[i] + carry[i-1]
 
 Okay we have gone so far and now we are back to code.
 
-First add the shared CNA setup, reusing the existing DPU initialization. We will build it in three pieces: input shape, converter/DMA, then CORE/DPU output. Finish all three before running it. The task helper below selects signed/unsigned input and INT8 output.
+Like elementwise.py earlier, first extract the convolution registers from `examples/conv_simple.py` in `allbilly/rk3588`, function `make_int8_regs()`.
+Its integer mode already has byte packing, channel alignment, input conversion, CORE precision and INT8 output.
 
-Start with the four input bytes and the padded 32-channel weight tile:
+Think of the extracted setup as this CONV pseudocode, with NCHW input and OIHW weights:
+```python
+CONV(input_shape=(1, 4, 1, 1), weight_shape=(32, 4, 1, 1),
+     stride=(1, 1), padding=0, groups=1,
+     input_dtype=UINT8, weight_dtype=INT8, output_dtype=INT8)
+```
+
+For a `1×1` kernel with `groups=1`, every output channel is a weighted sum of converted input channels at the same position:
+```text
+acc[o] = sum(converted_input[c] * weight[o, c, 0, 0] for c in channels)
+```
+
+For `x << 4`, the three tasks use this setup:
+| Parameter        | Extracted setup      | Task 1: q             | Task 2: carry         | Task 3: result                     |
+|------------------|----------------------|-----------------------|-----------------------|------------------------------------|
+| Batch            | 1                    | 1                     | 1                     | 1                                  |
+| Height × width   | 1 × 1                | `rows=1`              | `rows=1`              | `rows=1`                           |
+| Kernel           | 1 × 1                | same                  | same                  | same                               |
+| Stride / padding | 1 / 0                | same                  | same                  | same                               |
+| Groups           | 1                    | same                  | same                  | same                               |
+| Input channels   | 4, padded to 32      | original four bytes   | original four bytes   | 64 scratch lanes: `s`, `q`, carry   |
+| Input mode       | UINT8 or INT8        | INT8 (`s`)            | UINT8 (`u`)           | INT8                               |
+| CNA conversion   | scale 1              | no offset             | subtract 128          | bypass                             |
+| Weights          | INT8                 | `2*s`                 | `2*(u-128)`           | `16*s - 256*q + preceding carry`    |
+| Output offset    | configurable         | +1                    | +241                  | 0                                  |
+| Output shift     | configurable         | 5                     | 5                     | 0                                  |
+| Output channels  | 32                   | 12 q copies used      | 4 carry lanes used    | 4 result lanes used                |
+| Output           | INT8                 | `floor((s+8)/16)`     | `floor(u/16)`         | final UINT32 bytes                 |
+| `unsigned`       | task selection       | False                 | True                  | False                              |
+| `features`       | task selection       | False                 | False                 | True                               |
+“Extracted setup” is the base configuration from `conv_simple.py`'s `make_int8_regs()`, before the task-specific changes.
+
+Our existing `build_registers(int16_mode=True)` supplies the shared integer DPU initialization, pointers and BS/BN bypasses. The code below extracts the CNA/CORE/output body.
+
+Copy the input, converter and output setup in one diff. We omit the reserved `0x3030` write only in this blog extraction. `conv_simple.py` still writes it; the earlier removal probes changed the emitted registers in memory and passed both supported FP16 examples and the SHL checks.
+
+TODO1: explain why choose Ops.MUL here while we are doing CONV
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
 @@
-+  def build_uint8_registers(self, rows:int, output_addr:int) -> None:
++  def build_conv_uint8_registers(self, rows:int, output_addr:int) -> None:
 +    assert 1 <= rows <= 64
 +    # Reuse the DPU initialization, then select CNA instead of standalone RDMA.
 +    self.build_registers(Ops.MUL, int16_mode=True, output_addr=output_addr)
 +    E = self.EMIT
 +    self.npu_regs += [
++      # Input shape and weights.
 +      E(rk.CNA, rk.REG_CNA_CONV_CON1, (1 << rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT) |
 +        (1 << rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT) | (11 << rk.CNA_CONV_CON1_ARGB_IN__SHIFT)),
 +      E(rk.CNA, rk.REG_CNA_CONV_CON2, (rows+1) << rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT),
@@ -2200,17 +2238,7 @@ Start with the four input bytes and the padded 32-channel weight tile:
 +        (1 << rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT) | 32),
 +      E(rk.CNA, rk.REG_CNA_CBUF_CON0, (11 << rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT) | 1),
 +      E(rk.CNA, rk.REG_CNA_CBUF_CON1, 4*rows),
-+    ]
-```
-
-Next add the unsigned converter and DMA addresses. Scale 1 and offset -128 fit the bytes into signed INT8. The task helper will override this for signed input:
-
-```diff
-   def build_uint8_registers(self, rows:int, output_addr:int) -> None:
-@@
-       E(rk.CNA, rk.REG_CNA_CBUF_CON1, 4*rows),
-     ]
-+    self.npu_regs += [
++      # UINT8 converter and DMA: scale 1, offset -128.
 +      E(rk.CNA, rk.REG_CNA_CVT_CON0, 1 << rk.CNA_CVT_CON0_CVT_TYPE__SHIFT), # unsigned, conversion enabled
 +      E(rk.CNA, rk.REG_CNA_CVT_CON1, (1 << rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT) | (-128 & rk.CNA_CVT_CON1_CVT_OFFSET0__MASK)),
 +      E(rk.CNA, rk.REG_CNA_CVT_CON2, (1 << rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT) | (-128 & rk.CNA_CVT_CON2_CVT_OFFSET1__MASK)),
@@ -2224,43 +2252,38 @@ Next add the unsigned converter and DMA addresses. Scale 1 and offset -128 fit t
 +      E(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0, (1 << rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT) | rows),
 +      E(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1, 32),
 +      E(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, self.dev.weight_mem.dma_addr),
-+    ]
-```
-
-Now finish the CORE/DPU output setup. This initializes INT16 output; `conv_shl_task` below changes it to INT8 before submission:
-
-```diff
-   def build_uint8_registers(self, rows:int, output_addr:int) -> None:
-@@
-       E(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, self.dev.weight_mem.dma_addr),
-     ]
-+    self.npu_regs += [
++      # Integer CORE and INT8 output layout.
 +      E(rk.CORE, rk.REG_CORE_MISC_CFG, 1 << rk.CORE_MISC_CFG_QD_EN__SHIFT),
 +      E(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0, (rows-1) << rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT),
 +      E(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1, 31),
-+      E(rk.CORE, 0x3030, 0), # reserved register cleared by the captured convolution sequence
 +      E(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG, (15 << rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT) |
 +        (2 << rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT)),
-+      E(rk.DPU, rk.REG_DPU_DATA_FORMAT, 1 << rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT),
++      E(rk.DPU, rk.REG_DPU_DATA_FORMAT, 0),
 +      E(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, 1 << rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, rows-1),
-+      E(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (3 << rk.DPU_DATA_CUBE_NOTCH_ADDR_NOTCH_ADDR_1__SHIFT) | 3),
++      E(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (1 << rk.DPU_DATA_CUBE_NOTCH_ADDR_NOTCH_ADDR_1__SHIFT) | 1),
 +      E(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL, (31 << rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT) | 31),
-+      E(rk.DPU, rk.REG_DPU_BS_OW_CFG, (3 << rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT) |
-+        (3 << rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT) | (3 << rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT)),
++      E(rk.DPU, rk.REG_DPU_BS_OW_CFG, (1 << rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT) |
++        (1 << rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT) | (1 << rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_WDMA_SIZE_0, 31),
 +      E(rk.DPU, rk.REG_DPU_WDMA_SIZE_1, (rows-1) << rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT),
 +      E(rk.DPU, rk.REG_DPU_EW_CFG, (1 << rk.DPU_EW_CFG_EW_BYPASS__SHIFT) | (1 << rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) | (1 << rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT)),
-+      E(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 128),
-+      E(rk.DPU, rk.REG_DPU_SURFACE_ADD, 64),
++      E(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0),
++      E(rk.DPU, rk.REG_DPU_SURFACE_ADD, 32),
 +    ]
 ```
 
-Use 32 input channels for the original four-byte word, or 64 to read all scratch values. INT8 output needs SIZE_E=1, notch=1 and SURFACE_ADD=32; changing OUT_PRECISION alone was not enough:
+
+As mentioned in the table, Task 2 keeps the UINT8 converter; Task 1 selects signed input and Task 3 also enables the 64-channel scratch layout.
+
+Now `conv_shl_task()` applies those choices and submits one convolution. Its `weights`, `offset` and `shift` arguments encode the formula in each task column. Defaults of offset=0 and shift=0 leave the sum unchanged; unsigned=False selects signed input, and features=False keeps the four-byte input layout.
 
 `weights[o][i]` is the constant multiplier from input lane i to output lane o. Hardware stores these in 32×32-byte tiles: `i//32` selects the tile, `o*32` selects its output row, and `i%32` selects the input within that row. `w & 255` stores a signed INT8 weight as one byte. This packs constants, not tensor values.
+
+===reviwed marker
+
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -2271,22 +2294,20 @@ Use 32 input channels for the original four-byte word, or 64 to read all scratch
 +    for o, row in enumerate(weights):
 +      for i, w in enumerate(row): tile[(i//32)*1024+o*32+i%32] = w & 255
 +    to_mv(self.dev.weight_buf, len(tile))[:] = tile
-+    self.build_uint8_registers(1, out_addr)
++    # TASK_FIX#1: Height × width is 1 × 1; the four bytes are channels.
++    self.build_conv_uint8_registers(1, out_addr)
 +    E = self.EMIT
 +    self.npu_regs += [
-+      E(rk.DPU, rk.REG_DPU_DATA_FORMAT, 0),
-+      E(rk.DPU, rk.REG_DPU_BS_OW_CFG, (1 << rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT) |
-+        (1 << rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT) | (1 << rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT)),
-+      E(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, (1 << rk.DPU_DATA_CUBE_NOTCH_ADDR_NOTCH_ADDR_1__SHIFT) | 1),
-+      E(rk.DPU, rk.REG_DPU_SURFACE_ADD, 32),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, offset),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, (1 << rk.DPU_OUT_CVT_SHIFT_CVT_TYPE__SHIFT) | (shift << rk.DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT__SHIFT)),
 +    ]
 +    if not unsigned:
++      # UINT32 SHL also needs signed byte reads for q and the final correction.
 +      self.npu_regs.append(E(rk.CNA, rk.REG_CNA_CVT_CON0, (1 << rk.CNA_CVT_CON0_CVT_TYPE__SHIFT) | (1 << rk.CNA_CVT_CON0_DATA_SIGN__SHIFT) |
 +        (features << rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT)))
 +      for reg in (rk.REG_CNA_CVT_CON1, rk.REG_CNA_CVT_CON2, rk.REG_CNA_CVT_CON3, rk.REG_CNA_CVT_CON4):
 +        self.npu_regs.append(E(rk.CNA, reg, 1 << rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT))
++    # TASK_FIX#2: The final task reads 64 signed scratch channels instead of the initial 32.
 +    if features:
 +      self.npu_regs += [
 +        E(rk.CNA, rk.REG_CNA_CONV_CON1, 1 << rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT),
@@ -2297,6 +2318,9 @@ Use 32 input channels for the original four-byte word, or 64 to read all scratch
 +      ]
 +    self.submit(cna=True)
 ```
+The helper packs weights, sets the output conversion, selects signed/unsigned input, then submits. The `features` branch changes channel count, weight sizes, DMA stride and CBUF layout together: Task 3 reads 64 scratch channels, so changing only the channel count is not enough. These are task settings, not another copy of the base register setup.
+
+One call submits one task; `conv_shl_word()` runs the whole shift for one 32-bit word (four bytes). It chooses one task for a whole-byte shift, or the three tasks above when bits cross byte boundaries, and connects their scratch outputs.
 
 The original bytes stay at scratch offset 0. Task 1 writes q copies at offsets 16, 20 and 24; task 2 writes carry at offset 48. The copies let INT8 weights express -256 as -128-128, or +256 as 127+127+2. The NPU writes these copies.
 
@@ -2315,13 +2339,13 @@ In the final matrix, `j=i-displacement` selects the original source byte. Column
 +      self.conv_shl_task([[int(j==i-displacement) for j in range(4)] for i in range(4)], output_addr)
 +    else:
 +      k = 8-residual
-+      # Task 1: compute q and write its copies to scratch (table step 2).
++      # Task 1: compute q and write its copies to scratch (table steps 1.1–1.2).
 +      qweights = [[2*int(j==i%4) for j in range(4)] for i in range(12)]
 +      self.conv_shl_task(qweights, self.dev.input_mem.dma_addr+16, offset=-1 if residual == 7 else 1, shift=k+1)
-+      # Task 2: compute unsigned carry into scratch (table steps 3–5).
++      # Task 2: compute unsigned carry into scratch (table steps 2.1–2.3).
 +      self.conv_shl_task([[2*int(j==i) for j in range(4)] for i in range(4)],
 +                         self.dev.input_mem.dma_addr+48, offset=256-(2**k-1), shift=k+1, unsigned=True)
-+      # Task 3: select s, q and the preceding carry, then write INT8 (table steps 6–8).
++      # Task 3: select s, q and the preceding carry, then write INT8 (table steps 3.1–3.3).
 +      weights = [[0]*64 for _ in range(4)]
 +      for i in range(4):
 +        j = i-displacement
@@ -2338,7 +2362,8 @@ In the final matrix, `j=i-displacement` selects the original source byte. Column
 +    return bytes(to_mv(self.dev.output_buf, 4))
 ```
 
-Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read the final four bytes; no host intermediate arithmetic or routing:
+
+Finally dispatch UINT32 SHL to the helper. Pack the original word and read the final four bytes; no host intermediate arithmetic or routing:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -2346,7 +2371,7 @@ Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read
 +  def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
 +    if not b or not all_same(b) or not 0 <= b[0] <= 31:
 +      raise NotImplementedError("ROCKCHIP UINT32 SHL requires one uniform shift count in 0..31")
-+    fmt = "<I" if dtype == dtypes.uint else "<i"
++    fmt = "<I"
 +    result:list = []
 +    for x in a:
 +      raw = self.conv_shl_word(struct.pack(fmt, x), int(b[0]))
@@ -2359,7 +2384,7 @@ Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read
 @@
          elif u.op in GroupOp.ALU:
 -          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-+          if u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
++          if u.op is Ops.SHL and u.dtype == dtypes.uint:
 +            values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
 +          elif u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
@@ -2368,12 +2393,54 @@ Finally dispatch INT32/UINT32 SHL to the helper. Pack the original word and read
 ```
 
 ```bash
-$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift TestOps.test_lshift_signed
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift
 
 test_lshift (__main__.TestOps.test_lshift) ... ok
+
+Ran 1 test in 0.267s
+
+OK
+```
+
+Now try the signed case:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift_signed
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHL with dtypes.int
+
+Ran 1 test in 0.152s
+
+FAILED (errors=1)
+```
+
+The input is INT32, but our gate only accepts UINT32. Left shift moves the same bits for both: discard bits past bit 31 and insert zeros at the bottom. No sign extension is needed, so we can reuse the same convolution tasks.
+
+Allow INT32 at the gate and use signed packing for its input/output. `<I` cannot pack negative inputs; `<i` keeps their two's-complement bytes and reads the result as signed INT32:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+   def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
+@@
+-    fmt = "<I"
++    fmt = "<I" if dtype == dtypes.uint else "<i"
+@@
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+-          if u.op is Ops.SHL and u.dtype == dtypes.uint:
++          if u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
+             values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
+```
+
+Run the signed case again:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_lshift_signed
+
 test_lshift_signed (__main__.TestOps.test_lshift_signed) ... ok
 
-Ran 4 tests in 2.388s
+Ran 1 test in 0.289s
 
 OK
 ```
