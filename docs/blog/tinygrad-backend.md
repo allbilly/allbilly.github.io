@@ -21,8 +21,6 @@ TLDR: This blog will mainly use DPU EW op for the 28 GroupOps.ALU, treat CMAC li
 | [Ops.SHL](#opsshl)                                        |
 | [Ops.SHR](#opsshr)                                        |
 
-TOREVIEW1: Removed the “What we add” column.
-
 Tinygrad is a zero-dependency minmial codebase (25407 core lines @20260920) to do ML in python, those lines already included a PyTorch like frontend and kernel space GPU driver down to MMIO written in user space, so makes it the perfect place to support USB3 eGPU thats can drives a car (https://www.youtube.com/watch?v=nmTepfv3Itg) and add new accelorator support. 
 
 "Your accelerator of choice only needs to support a total of ~25 low level ops."
@@ -54,9 +52,11 @@ cp tinygrad/runtime/ops_python.py tinygrad/runtime/ops_rockchip.py
 
 In tinygrad, u can choose a runtime with env like DEV=ROCKCHIP. If u want to run tests, some dependenceis are still needed like pytest and numpy/torch to generte reference output. 
 ```
-uv pip install -e . numpy torch --torch-backend=cpu
+uv pip install -e . numpy torch pytest pytest-xdist --torch-backend=cpu
 DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_add
 ```
+
+The sequential replay checks use Python 3.12.12, NumPy 2.5.3, CPU Torch 2.14.0, pytest 9.1.1 and pytest-xdist 3.8.0 with the pinned tinygrad checkout above. The older timings below are recorded runs, not speed guarantees for this environment.
 
 ```
 (tinygrad) orangepi@orangepi5:~/tinygrad$ DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_add
@@ -202,54 +202,57 @@ AGENTS.md
 -import pickle, base64, itertools, time, sys, ctypes
 +import pickle, base64, itertools, time, sys, ctypes, os
 +from tinygrad.runtime.support.hcq import FileIOInterface
-  ...
-  class RockchipDevice(Compiled):
-    def __init__(self, device:str):
+@@
+ class RockchipDevice(Compiled):
+   def __init__(self, device:str):
 +    self.fd_ctl = FileIOInterface("/dev/dri/card1", os.O_RDWR)
 ```
 
 we also need the C struct and registers offset from rknpu_driver/inlcude/*.h (https://github.com/allbilly/rknpu_driver/tree/main/include) to be imported in python, here i will just reuse the autogen from liej6799(https://github.com/liej6799/tinygrad/blob/3588-new/tinygrad/runtime/autogen/rockchip.py)
 
 ```
-cd ~/tinygrad/tinygrad/runtime/autogen
-wget https://raw.githubusercontent.com/liej6799/tinygrad/refs/heads/3588-new/tinygrad/runtime/autogen/rockchip.py
+cd ~/tinygrad
+wget -O tinygrad/runtime/autogen/rockchip.py https://raw.githubusercontent.com/liej6799/tinygrad/5101a24d100dc08ef612fada1d0766b44f4cbad9/tinygrad/runtime/autogen/rockchip.py
 ```
+
+Keep running the following commands from ~/tinygrad. This pinned register file has SHA256 `2ae597cd73a2c2a4afa245f5afbddb416485fcd479529ed7e16f4ddaf31e2ebf`.
 
 And allocate task/regcmd/input/weight/output Buffer Object
 ```diff
 -import pickle, base64, itertools, time, sys, ctypes, os
 +import pickle, base64, itertools, time, sys, ctypes, os, mmap
 +from tinygrad.runtime.autogen import rockchip as rk
-
-class RockchipDevice(Compiled):
-     def __init__(self, device:str):
-       self.fd_ctl = FileIOInterface("/dev/dri/card1", os.O_RDWR)
-       super().__init__(device, HostAllocator(self), [RockchipRenderer], RockchipProgram)
-+      self.task_buf, self.task_mem = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING)
-+      self.regcmd_buf, self.regcmd_mem = self._gpu_alloc(8192)
-+      self.input_buf, self.input_mem = self._gpu_alloc(4194304)
-+      self.weight_buf, self.weight_mem = self._gpu_alloc(4194304)
-+      self.output_buf, self.output_mem = self._gpu_alloc(4194304)
+@@
+ class RockchipDevice(Compiled):
+   def __init__(self, device:str):
+     self.fd_ctl = FileIOInterface("/dev/dri/card1", os.O_RDWR)
+     super().__init__(device, HostAllocator(self), [RockchipRenderer], RockchipProgram)
++    self.task_buf, self.task_mem = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING)
++    self.regcmd_buf, self.regcmd_mem = self._gpu_alloc(8192)
++    self.input_buf, self.input_mem = self._gpu_alloc(4194304)
++    self.weight_buf, self.weight_mem = self._gpu_alloc(4194304)
++    self.output_buf, self.output_mem = self._gpu_alloc(4194304)
 +  
-+    def _gpu_alloc(self, size:int, flags:int=0) -> tuple[int, rk.struct_rknpu_mem_create]:
-+      mem = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
-+      try:
-+        mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem.handle)
-+        addr = self.fd_ctl.mmap(0, mem.size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mapping.offset)
-+      except Exception:
-+        rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=mem.handle, obj_addr=mem.obj_addr)
-+        raise
-+      return addr, mem
-+  
-+    def _gpu_free(self, addr:int, mem:rk.struct_rknpu_mem_create) -> None:
-+      FileIOInterface.munmap(addr, mem.size)
++  def _gpu_alloc(self, size:int, flags:int=0) -> tuple[int, rk.struct_rknpu_mem_create]:
++    mem = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
++    try:
++      mapping = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem.handle)
++      addr = self.fd_ctl.mmap(0, mem.size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mapping.offset)
++    except Exception:
 +      rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=mem.handle, obj_addr=mem.obj_addr)
++      raise
++    return addr, mem
++  
++  def _gpu_free(self, addr:int, mem:rk.struct_rknpu_mem_create) -> None:
++    FileIOInterface.munmap(addr, mem.size)
++    rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=mem.handle, obj_addr=mem.obj_addr)
 ```
 
 Next, update dma_addr of input/weight/output in the register sequence, dma_addr are owned by RockchipDevice so we can get it with self.dev.output_mem.dma_addr
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __init__(self, dev:'RockchipDevice', obj:TinyELF):
 +    self.dev = dev
      self.uops: list[UOp] = pickle.loads(obj.lib)
@@ -278,6 +281,7 @@ Next, copy the registers to the C array regcmd, set the regcmd DMA address in a 
 we will add a function submit() in RockchipProgram
 
 ```diff
+ class RockchipProgram(Program['RockchipDevice']):
 +  def submit(self) -> None:
 +    regs = self.npu_regs
 +    # copy the registers to the C array regcmd
@@ -325,8 +329,9 @@ and then pack our inputs
 ```diff
 -import pickle, base64, itertools, time, sys, ctypes, os, mmap
 +import pickle, base64, itertools, time, sys, ctypes, os, mmap, struct
-
+@@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __init__(self, dev:'RockchipDevice', obj:TinyELF):
      self.dev = dev
 +    self.ops_map = ops_map
@@ -335,6 +340,7 @@ and then pack our inputs
 `self.ops_map` uses the shared module-level map introduced above. It currently contains only ADD, whose EW algorithm code is 2. At this step the runtime uses map membership to select the NPU execution path, and the renderer uses the same keys to select code-generation rewrites. The captured register sequence remains hardcoded for ADD.
 
 ```diff
+ class RockchipProgram(Program['RockchipDevice']):
 +  def add(self, a:list[float], b:list[float]) -> list[float]:
 +    assert b is not None and len(a) == len(b)
 +    result:list = []
@@ -364,12 +370,17 @@ but exec_alu() is still doing the calculation on CPU and stores result to values
 Floating-point ALU operations now either run on the NPU or raise a clear error. Our map only contains ADD and the captured registers use FP16, so FP32 ADD and unsupported floating-point operations are rejected. Non-floating-point ALU operations, including integer address calculations, still use the CPU interpreter. This avoids a successful ROCKCHI-labelled floating-point kernel silently calculating on the CPU.
 
 and for simplicity, comment the other cases and leave the first one  
-```python
-def test_add(self):
-  helper_test_op([(45,68), (45,68)], lambda x,y: x+y, Tensor.add)
-  # helper_test_op([], lambda: torch.tensor(1)+0.5, lambda: Tensor(1)+0.5, forward_only=True)
-  # helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
-  # helper_test_op([(), ()], lambda x,y: x+y)
+```diff
+ class TestOps(unittest.TestCase):
+@@
+   def test_add(self):
+     helper_test_op([(45,68), (45,68)], lambda x,y: x+y, Tensor.add)
++    # helper_test_op([], lambda: torch.tensor(1)+0.5, lambda: Tensor(1)+0.5, forward_only=True)
++    # helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
++    # helper_test_op([(), ()], lambda x,y: x+y)
+-    helper_test_op([], lambda: torch.tensor(1)+0.5, lambda: Tensor(1)+0.5, forward_only=True)
+-    helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
+-    helper_test_op([(), ()], lambda x,y: x+y)
 ```
 
 ```bash
@@ -432,6 +443,31 @@ OK
 ```
 
 Great now all kernels are on ROCKCHIP and we shd uncomment the remaining cases in test_add one by one
+
+```diff
+ class TestOps(unittest.TestCase):
+@@
+   def test_add(self):
+     helper_test_op([(45,68), (45,68)], lambda x,y: x+y, Tensor.add)
++    helper_test_op([], lambda: torch.tensor(1)+0.5, lambda: Tensor(1)+0.5, forward_only=True)
++    helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
++    helper_test_op([(), ()], lambda x,y: x+y)
+-    # helper_test_op([], lambda: torch.tensor(1)+0.5, lambda: Tensor(1)+0.5, forward_only=True)
+-    # helper_test_op([(45,68), (45,68)], lambda x,y: x+y)
+-    # helper_test_op([(), ()], lambda x,y: x+y)
+```
+
+
+The scalar case also needs both frameworks to use the same default float dtype. DEFAULT_FLOAT=HALF changes tinygrad, not Torch, so it otherwise gives `dtype mismatch: tinygrad=float16 | torch=float32`. Add this in test/backend/test_ops.py before continuing; the dtype assertion stays unchanged:
+
+```diff
+ from tinygrad.renderer.nir import NIRRenderer
++
++# Match scalar promotion when DEFAULT_FLOAT selects a non-FP32 test dtype.
++torch.set_default_dtype(getattr(torch, dtypes.default_float.name))
+ 
+ TINY_BACKEND = getenv("TINY_BACKEND")
+```
 2. torch.tensor(1)+0.5 : showed a CPU kernel even with NOOPT=1 because constant folding in symbolic.py still optimized it
 3. [(45,68), (45,68)]  : ROCKCHIP only kernels
 4. [(), ()]            : showed a CPU kernel just like (2)
@@ -490,7 +526,7 @@ MUL is is in ew_op_type
 
 And from the RKNN capture and playing around with different val, "MUL" would need to set not only DPU_EW_CFG_EW_OP_TYPE but also DPU_EW_CFG_EW_OP_CVT_BYPASS
 
-The following is extracted from elementwise.py in allbilly/rk3588
+The following is extracted from our local elementwise.py in allbilly/rk3588. Its extended modes are not all committed upstream yet; use the complete diff below for this tutorial, not a fresh checkout's register list.
 The byte-output mode processes sixteen lanes per task: MRDMA reads the first eight FP16 values, ERDMA reads the next eight, and the output is sixteen bytes. The example pads the last atom and submits these conversion atoms separately. `CAST_HALF_BOOL` rejects inputs other than 0/1.
 ```python
 int16_mode = op == "CAST_BOOL_HALF"
@@ -609,7 +645,6 @@ Here we use the `rk` shifts CONSTANT from autogen
 +def fp16(value:float) -> int: return int.from_bytes(struct.pack("<e", value), "little")
 @@
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  @staticmethod
 +  def EMIT(target:int, reg:int, value:int) -> int: return ((target + 1) << 48) | ((value & 0xFFFFFFFF) << 16) | reg
 +
@@ -638,6 +673,7 @@ Here we use the `rk` shifts CONSTANT from autogen
 -      ((rk.DPU_RDMA + 1) << 48) | ((self.dev.weight_mem.dma_addr & 0xFFFFFFFF) << 16) | rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
 -      0x2001000178495044,
 -      0x0081000000180008,
+-    ]
 +      E(rk.DPU, rk.REG_DPU_S_POINTER, 0xE),
 +      E(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
 +        (byte_output << rk.DPU_FEATURE_MODE_CFG_COMB_USE__SHIFT) |
@@ -750,7 +786,7 @@ The decoded builder includes both operand routes. Binary ADD and MUL use `EW_OP_
 
 The builder also carries the example's `CAST_BOOL_HALF` INT16 mode and `CAST_HALF_BOOL` byte-output mode now, but does not expose those CASTs to tinygrad yet. Both paths explicitly initialize their register state. The optional DMA addresses keep the example's variable input/weight/output addresses; omitting them uses the device's default buffers. The exponent-shift mode multiplies by 1 and adjusts the exponent; its MUL inf input will be a separate UOp.
 
-The standalone byte-output mode can be tested with `python ~/rk3588/examples/elementwise.py CAST_HALF_BOOL`. It passed sizes 1, 3, 7, 8, 9, 15, 16, 17, 31, 32 and 4096, checking the raw packed output bytes as well as the bool values.
+The local elementwise.py extension's CAST_HALF_BOOL probe passed sizes 1, 3, 7, 8, 9, 15, 16, 17, 31, 32 and 4096, checking raw packed bytes as well as bool values. A fresh upstream checkout does not include that mode yet. For this tutorial, use the complete register diff above; we will test it through tinygrad when we enable the mask CAST below.
 
 now lets run test_add, test_tiny_mul and test_mul
 
@@ -967,6 +1003,41 @@ helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 
 
 lets comment out other case and inspect its UOps list with TRACE=1
 
+```diff
+ class TestOps(unittest.TestCase):
+@@
+   def test_maximum(self):
++    # helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
++    # helper_test_op([(), ()], torch.maximum, Tensor.maximum)
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
++    # helper_test_op(None, torch.maximum, Tensor.maximum,
++    #                vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
++    # helper_test_op(None, torch.maximum, Tensor.maximum,
++    #                vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
+-    helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
+-    helper_test_op([(), ()], torch.maximum, Tensor.maximum)
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
+-    helper_test_op(None, torch.maximum, Tensor.maximum,
+-                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
+-    helper_test_op(None, torch.maximum, Tensor.maximum,
+-                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
+     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], [True, True, False]], forward_only=True)
+ 
++    # # test applying to different dtype
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1, 2, 3], 1.2], forward_only=True)
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 1.2], forward_only=True)
++    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 3], forward_only=True)
+-    # test applying to different dtype
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1, 2, 3], 1.2], forward_only=True)
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 1.2], forward_only=True)
+-    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 3], forward_only=True)
+```
+
+
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 
@@ -997,9 +1068,9 @@ The solution is Pattern Matcher, its rewrite the UOps tree according to a predef
 We can add one to rewrite Ops.OR(dtypes.bool) into Ops.MAX(dtypes.half) in `RockchipRenderer.extra_matcher` and `RockchipProgram` would recieved the rewritten Uops tree
 
 ```diff
--from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp
+-from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
 +from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
-
+@@
  class RockchipRenderer(Renderer):
    code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
 +  extra_matcher = PatternMatcher([
@@ -1012,14 +1083,14 @@ We can add one to rewrite Ops.OR(dtypes.bool) into Ops.MAX(dtypes.half) in `Rock
 As we are using cast, we need another NPU gate around `elif u.op is Ops.CAST`
 
 ```diff
- elif u.op is Ops.CAST:
-+  if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
-+    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
--  values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
-+  else:
-+    if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
-+      print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
-+    values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+         elif u.op is Ops.CAST:
++          if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
++            raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
+-          values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
++          else:
++            if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
++              print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
++            values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -1066,14 +1137,14 @@ Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16
 +      packed = struct.pack("<8h" if op is Ops.CAST else "<8e", *(lanes + [0] * (8-len(lanes))))
        to_mv(self.dev.input_buf, 16)[:] = packed
 @@
- elif u.op is Ops.CAST:
-   if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
--    raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
-+    values[u] = self.run_npu(Ops.CAST, src_values[0])
-   else:
-     if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
-       print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
-     values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+         elif u.op is Ops.CAST:
+           if (src_dtypes[0], u.dtype) == (dtypes.bool, dtypes.half):
+-            raise NotImplementedError(f"ROCKCHIP NPU CAST from {src_dtypes[0]} to {u.dtype} is not implemented")
++            values[u] = self.run_npu(Ops.CAST, src_values[0])
+           else:
+             if (src_dtypes[0], u.dtype) == (dtypes.half, dtypes.bool):
+               print(f"warning: {u.op} from {src_dtypes[0]} to {u.dtype} is not supported on ROCKCHIP NPU, emulating in python")
+             values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
 ```
 
 ```bash
@@ -1169,7 +1240,8 @@ so lets implement Ops.CMPEQ in ops_rockchip.py and do Ops.CMPNE with `1 - CMPEQ(
 ```diff
 +CMP = 9  # Internal multi-stage comparison marker, not an EW algorithm.
 -ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3}
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
++ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
++           Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
 @@
      assert custom is None or (op is Ops.CUSTOM and custom == "fp16_exponent_shift_minus(16)" and not int16_mode)
 +    assert op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
@@ -1419,6 +1491,41 @@ We have 10/30 Ops implemented, the remaining Ops.CMPEQ can be done with another 
 TODO: Ops.CMPEQ, Ops.WHERE, Ops.CMPLT
 
 Next we will uncomment all test cases in test_maximum
+
+```diff
+ class TestOps(unittest.TestCase):
+@@
+   def test_maximum(self):
++    helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
++    helper_test_op([(), ()], torch.maximum, Tensor.maximum)
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
++    helper_test_op(None, torch.maximum, Tensor.maximum,
++                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
++    helper_test_op(None, torch.maximum, Tensor.maximum,
++                   vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
+-    # helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
+-    # helper_test_op([(), ()], torch.maximum, Tensor.maximum)
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], 3.])
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1., 0., 3., -4.], [-1., -2., 3., 0.]])
+-    # helper_test_op(None, torch.maximum, Tensor.maximum,
+-    #                vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.max], forward_only=True)
+-    # helper_test_op(None, torch.maximum, Tensor.maximum,
+-    #                vals=[[-1234, 0, 1234, dtypes.int.max, dtypes.int.min], dtypes.int.min], forward_only=True)
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], True], forward_only=True)
+     helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], [True, True, False]], forward_only=True)
+ 
++    # test applying to different dtype
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1, 2, 3], 1.2], forward_only=True)
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 1.2], forward_only=True)
++    helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 3], forward_only=True)
+-    # # test applying to different dtype
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[1, 2, 3], 1.2], forward_only=True)
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 1.2], forward_only=True)
+-    # helper_test_op(None, torch.maximum, Tensor.maximum, vals=[[True, False, False], 3], forward_only=True)
+```
+
 
 ```
 $NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
@@ -2227,7 +2334,7 @@ signed_result[i] = 2^r*s[i] - 256*q[i] + carry[i-1]
 
 Okay we have gone so far and now we are back to code.
 
-Like elementwise.py earlier, first extract the convolution registers from `examples/conv_simple.py` in `allbilly/rk3588`, function `make_int8_regs()`.
+Like elementwise.py earlier, first extract the convolution registers from `examples/conv_simple.py` in `allbilly/rk3588`, function `make_int8_regs()`. This function is in our local integer-mode extension, not the published FP16 example. The complete extracted setup is included below; no import from that local file is required.
 Its integer mode already has byte packing, channel alignment, input conversion, CORE precision and INT8 output.
 
 Think of the extracted setup as this CONV pseudocode, with NCHW input and OIHW weights:
@@ -2274,7 +2381,6 @@ Our existing `build_registers(int16_mode=True)` supplies the shared integer DPU 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def build_conv_uint8_registers(self, rows:int, output_addr:int) -> None:
 +    E = self.EMIT
 +    assert 1 <= rows <= 64
@@ -2338,6 +2444,7 @@ We need to add CNA/CORE enable as we were working with DPU/RDMA only before .
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
                        input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 @@
@@ -2376,7 +2483,6 @@ For Task 3, `scratch_input=True` updates the channel count, weight sizes, DMA st
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def conv_shl_subtask(self, weights:list[list[int]], out_addr:int, offset:int=0, shift:int=0, unsigned:bool=False, scratch_input:bool=False) -> None:
 +    E = self.EMIT
 +    # weights/offset/shift encode the task formula; zero offset/shift leave the sum unchanged before INT8 saturation.
@@ -2413,12 +2519,11 @@ For Task 3, `scratch_input=True` updates the channel count, weight sizes, DMA st
 +    self.submit(cna=True)
 ```
 
-Now add `conv_shl()` under `RockchipProgram` to prepare and call the 3 subtasks with `conv_shl_subtask()`
+Now add `conv_shift()` under `RockchipProgram` to prepare and call the 3 subtasks with `conv_shl_subtask()`
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
-+  def conv_shl(self, raw:bytes, amount:int) -> bytes:
++  def conv_shift(self, raw:bytes, amount:int) -> bytes:
 +    output_addr = self.dev.output_mem.dma_addr
 +    # One initial upload; original bytes stay in lanes 0..3 of the scratch input.
 +    to_mv(self.dev.input_buf, 128)[:] = raw+bytes(128-len(raw))
@@ -2461,17 +2566,17 @@ Pack the original word and read the final four bytes;
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
 +    if not b or not all_same(b) or not 0 <= b[0] <= 31:
 +      raise NotImplementedError("ROCKCHIP UINT32 SHL requires one uniform shift count in 0..31")
-+    return [struct.unpack("<I", self.conv_shl(struct.pack("<I", x), int(b[0])))[0] for x in a]
++    return [struct.unpack("<I", self.conv_shift(struct.pack("<I", x), int(b[0])))[0] for x in a]
 ```
 
 ```diff
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
          elif u.op in GroupOp.ALU:
+@@
 -          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
 +          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
 +             u.dtype not in ((dtypes.int16, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
@@ -2516,9 +2621,9 @@ Allow INT32 at the gate and use signed packing for its input/output.
 @@
    def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
 @@
--    return [struct.unpack("<I", self.conv_shl(struct.pack("<I", x), int(b[0])))[0] for x in a]
+-    return [struct.unpack("<I", self.conv_shift(struct.pack("<I", x), int(b[0])))[0] for x in a]
 +    fmt = "<I" if dtype == dtypes.uint else "<i"
-+    return [struct.unpack(fmt, self.conv_shl(struct.pack(fmt, x), int(b[0])))[0] for x in a]
++    return [struct.unpack(fmt, self.conv_shift(struct.pack(fmt, x), int(b[0])))[0] for x in a]
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
@@ -2545,7 +2650,9 @@ OK
 ## Ops.SHR
 
 Next lets do Ops.SHR, we have hardware right shift as mentioned, so it should be much easier?
-OUT_CVT_SHIFT shifts each calculated lane, but it does not move bits between neighbouring bytes of a UINT32 word. We still need to shift and recombine the bytes like Ops.SHL did.
+
+OUT_CVT_SHIFT shifts each calculated lane, but it does not move bits between neighbouring bytes of a UINT32 word. 
+We still need to shift and recombine the bytes like Ops.SHL did.
 
 Take input as `0xABCD1234`, for `0xABCD1234 >> 4`
 
@@ -2686,26 +2793,64 @@ incoming = -128*s + 256*q
 
 That explains the -1 bias for r=1 and the three q weights 127+127+2 below. Other counts use +1 and two weights -128-128. The carry formula stays the same for r=1. The q copies are still at 16/20/24 and carry at 48; `17+j` selects the next byte's q.
 
+Use conv_shift from its first definition; this step adds the op argument and SHR routing.
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
 @@
-+  def conv_shr(self, raw:bytes, amount:int) -> bytes:
-+    output_addr = self.dev.output_mem.dma_addr
-+    to_mv(self.dev.input_buf, 128)[:] = raw+bytes(128-len(raw))
-+    # displacement selects whole bytes; residual is the remaining 0..7 bits.
-+    residual, displacement = amount%8, amount//8
-+    if residual == 0:
-+      # Whole-byte shift: select higher bytes and leave missing bytes zero.
-+      self.conv_shl_subtask([[int(j==i+displacement) for j in range(4)] for i in range(4)], output_addr)
-+    else:
-+      # Task 1: correction for the next byte's low bits, shifted left by 8-r.
-+      self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
-+                         self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
-+      # Task 2: unsigned current byte shifted right by r, rounded down exactly.
-+      self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
-+                         self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
-+      weights = [[0]*64 for _ in range(4)]
-+      for i in range(4):
+-  def conv_shift(self, raw:bytes, amount:int) -> bytes:
++  def conv_shift(self, op:Ops, raw:bytes, amount:int) -> bytes:
++    assert op in (Ops.SHL, Ops.SHR)
++    left = op is Ops.SHL
+     output_addr = self.dev.output_mem.dma_addr
+     # One initial upload; original bytes stay in lanes 0..3 of the scratch input.
+     to_mv(self.dev.input_buf, 128)[:] = raw+bytes(128-len(raw))
+     residual, displacement = amount%8, amount//8
+     if residual == 0: # Shifts by 0, 8, 16 or 24 bits: only whole-byte routing, no carry calculation.
+       # Whole-byte shift: one convolution selects bytes and inserts zeros.
+-      self.conv_shl_subtask([[int(j==i-displacement) for j in range(4)] for i in range(4)], output_addr)
++      self.conv_shl_subtask([[int(j==(i-displacement if left else i+displacement)) for j in range(4)] for i in range(4)], output_addr)
+     else:
+-      k = 8-residual
++      k = 8-residual if left else residual
+       # Task 1: the NPU writes q copies at scratch offsets 16, 20 and 24.
+       qweights = [[2*int(j==i%4) for j in range(4)] for i in range(12)]
+-      self.conv_shl_subtask(qweights, self.dev.input_mem.dma_addr+16, offset=-1 if residual == 7 else 1, shift=k+1)
++      self.conv_shl_subtask(qweights, self.dev.input_mem.dma_addr+16, offset=-1 if k == 1 else 1, shift=k+1)
+       
+       # Task 2: the NPU writes unsigned carry at scratch offset 48.
+       self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
+@@
+       # Task 3: select s, q and the preceding carry, then write INT8 (table steps 3.1–3.3).
+       weights = [[0]*64 for _ in range(4)]
+       for i in range(4):
+-        # Select the source byte; negative j leaves a zero output row.
+-        j = i-displacement
+-        if j < 0: continue
+-        if residual == 7:
+-          weights[i][j] = -128
+-          # Three q copies let INT8 weights express +256 as 127+127+2.
+-          weights[i][16+j], weights[i][20+j], weights[i][24+j] = 127, 127, 2
+-        else:
+-          weights[i][j] = 2**residual
+-          # Two q copies express -256 as -128-128.
+-          weights[i][16+j] = weights[i][20+j] = -128
+-        # Select the preceding byte's carry; byte 0 has none.
+-        if j > 0: weights[i][48+j-1] = 1
++        if left:
++          # Select the source byte; negative j leaves a zero output row.
++          j = i-displacement
++          if j < 0: continue
++          if residual == 7:
++            weights[i][j] = -128
++            # Three q copies let INT8 weights express +256 as 127+127+2.
++            weights[i][16+j], weights[i][20+j], weights[i][24+j] = 127, 127, 2
++          else:
++            weights[i][j] = 2**residual
++            # Two q copies express -256 as -128-128.
++            weights[i][16+j] = weights[i][20+j] = -128
++          # Select the preceding byte's carry; byte 0 has none.
++          if j > 0: weights[i][48+j-1] = 1
++          continue
 +        # Output byte i gets source byte j and incoming bits from j+1.
 +        j = i+displacement
 +        if j >= 4: continue
@@ -2719,15 +2864,16 @@ That explains the -1 bias for r=1 and the three q weights 127+127+2 below. Other
 +            # Two q copies let INT8 weights supply -256*q.
 +            weights[i][j+1] = 2**(8-residual)
 +            weights[i][17+j] = weights[i][21+j] = -128
-+      # Task 3: current carry plus incoming bits, already in output byte order.
-+      self.conv_shl_subtask(weights, output_addr, scratch_input=True)
-+    return bytes(to_mv(self.dev.output_buf, 4))
+       self.conv_shl_subtask(weights, output_addr, scratch_input=True)
+     # The four output bytes are already in UINT32 order. No packing/rearrangement.
+     return bytes(to_mv(self.dev.output_buf, 4))
 ```
 
-TOREVIEW1: Reuse SHL's packing loop. Rename it to `run_u32_shift` and select the convolution with op; input and output packing stay unchanged.
+Reuse SHL's packing loop. Rename it to `run_u32_shift` and select the convolution with op; input and output packing stay unchanged.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
 -  def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
 +  def run_u32_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 +    assert op in (Ops.SHL, Ops.SHR)
@@ -2735,9 +2881,8 @@ TOREVIEW1: Reuse SHL's packing loop. Rename it to `run_u32_shift` and select the
 -      raise NotImplementedError("ROCKCHIP UINT32 SHL requires one uniform shift count in 0..31")
 +      raise NotImplementedError("ROCKCHIP 32-bit shift requires one uniform shift count in 0..31")
      fmt = "<I" if dtype == dtypes.uint else "<i"
--    return [struct.unpack(fmt, self.conv_shl(struct.pack(fmt, x), int(b[0])))[0] for x in a]
-+    conv = self.conv_shl if op is Ops.SHL else self.conv_shr
-+    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0])))[0] for x in a]
+-    return [struct.unpack(fmt, self.conv_shift(struct.pack(fmt, x), int(b[0])))[0] for x in a]
++    return [struct.unpack(fmt, self.conv_shift(op, struct.pack(fmt, x), int(b[0])))[0] for x in a]
 ```
 
 Add SHR to ops_map, allow UINT32 SHR at the gate, then dispatch it:
@@ -2748,6 +2893,7 @@ Add SHR to ops_map, allow UINT32 SHR at the gate, then dispatch it:
 +           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0, Ops.SHR: 0}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
            if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
@@ -2803,8 +2949,6 @@ Lets allow INT32 at the gate
              values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
 ```
 
-TOREVIEW1: Run the same test again. The shared wrapper already packs INT32 with `i`, but the convolution still fills the upper bits with zero:
-
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_rshift_signed
 
@@ -2823,27 +2967,30 @@ Ran 1 test in 0.170s
 FAILED (errors=1)
 ```
 
-So why half of the result got mismatch?
-The four mismatches are the four negative inputs. For example, `0xABCD1234` is negative as INT32 because its highest bit is 1:
+So why half of the result got mismatch? Well, the mismatches are the four negative inputs. 
+As `0xABCD1234` in INT32 is negative because its highest bit is 1:
 
-| Stage                   | UINT32 >> 4   | INT32 >> 4         |
-| ----------------------- | ------------- | ------------------ |
-| Input bytes             | `34 12 CD AB` | `34 12 CD AB`      |
-| Top byte in binary      | `1010 1011`   | `1010 1011`        |
-| Keep its upper 4 bits   | `____ 1010`   | `____ 1010`        |
-| Fill the empty 4 bits   | zeros: `0000` | sign bit 1: `1111` |
-| Combined top byte       | `0000 1010`   | `1111 1010`        |
-| Top byte after shifting | `0A`          | `FA`               |
-| Result bytes            | `23 D1 BC 0A` | `23 D1 BC FA`      |
+| Stage                  | UINT32 >> 4  | INT32 >> 4        |
+| ---------------------- | ------------ | ----------------- |
+| Input bytes            | `34 12 CD AB`| `34 12 CD AB`     |
+| Top byte               | `AB`         | `AB`              |
+| In binary              | `1010 1011`  | `1010 1011`       |
+| Shift upper 4 bits down| `____ 1010` | `____ 1010`        |
+| Fill the empty 4 bits  | zeros `0000` | sign bit 1 `1111` |
+| Top byte combined      | `0000 1010`  | `1111 1010`       |
+| Top byte in hex        | `0`   `A`    | `F`   `A`         |
+| Result bytes           | `23 D1 BC 0A`| `23 D1 BC FA`     |
 
-So how can we fill the upper bits with ones for negative INT32 inputs?
-First let us find a formula that returns the fill byte, 
+As shown in the table, unsigned SHR gives `0A`, but signed SHR needs `FA`
+So how can it add signed int32 support?
 
-We need a byte of `0xFF` for negative inputs and `0x00` for non-negative inputs.
-As INT8 these are -1 and 0. 
-The highest byte tells us the sign of the whole word, 
+As the lower four bits already correct, we need to fill the empty high bits with the input's sign bit. 
 
-TOREVIEW1: INT8 spans -128..127. Dividing by 128 puts negative values in [-1, 0) and non-negative values in [0, 1). Rounding down therefore gives exactly the -1 or 0 fill byte we need:
+For >>4 the table needs four copies of the sign bit; for >>8 it needs a whole byte, and larger shifts can need several bytes. Rather than a different mask for each count, can we generate one byte containing eight copies of the sign bit and let Task 3 select or scale it? That gives `11111111` for negative inputs and `00000000` otherwise.
+
+How do we get that byte without checking the sign on CPU? Read the highest input byte as INT8. Its sign bit is also the sign bit of the INT32 word. Our two fill bytes represent -1 and 0 in INT8, so we need every negative byte to become -1 and every non-negative byte to become 0.
+
+INT8 spans -128..127. Dividing by 128 puts negative values in [-1, 0) and non-negative values in [0, 1). Rounding down gives the fill byte:
 
 ```text
 negative high byte: -128..-1  -> floor(s/128) = -1
@@ -2892,6 +3039,7 @@ INT32 Task 3        <---------------- 96 channels ---------------->
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
 -  def conv_shl_subtask(self, weights:list[list[int]], out_addr:int, offset:int=0, shift:int=0, unsigned:bool=False, scratch_input:bool=False) -> None:
 +  def conv_shl_subtask(self, weights:list[list[int]], out_addr:int, offset:int=0, shift:int=0,
 +                       unsigned:bool=False, scratch_input:bool=False, channels:int=64) -> None:
@@ -2911,35 +3059,51 @@ Add the sign task before building the final weights. Whole-byte signed shifts al
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
--  def conv_shr(self, raw:bytes, amount:int) -> bytes:
-+  def conv_shr(self, raw:bytes, amount:int, signed:bool=False) -> bytes:
 @@
--    if residual == 0:
-+    if residual == 0 and not signed:
-@@
+-  def conv_shift(self, op:Ops, raw:bytes, amount:int) -> bytes:
++  def conv_shift(self, op:Ops, raw:bytes, amount:int, signed:bool=False) -> bytes:
+     assert op in (Ops.SHL, Ops.SHR)
+     left = op is Ops.SHL
++    signed = signed and not left
+     output_addr = self.dev.output_mem.dma_addr
+     # One initial upload; original bytes stay in lanes 0..3 of the scratch input.
+     to_mv(self.dev.input_buf, 128)[:] = raw+bytes(128-len(raw))
+     residual, displacement = amount%8, amount//8
+-    if residual == 0: # Shifts by 0, 8, 16 or 24 bits: only whole-byte routing, no carry calculation.
++    if residual == 0 and not signed: # Shifts by 0, 8, 16 or 24 bits: only whole-byte routing, no carry calculation.
+       # Whole-byte shift: one convolution selects bytes and inserts zeros.
+       self.conv_shl_subtask([[int(j==(i-displacement if left else i+displacement)) for j in range(4)] for i in range(4)], output_addr)
      else:
--      # Task 1: correction for the next byte's low bits, shifted left by 8-r.
--      self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
--                         self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
--      # Task 2: unsigned current byte shifted right by r, rounded down exactly.
+-      k = 8-residual if left else residual
+-      # Task 1: the NPU writes q copies at scratch offsets 16, 20 and 24.
+-      qweights = [[2*int(j==i%4) for j in range(4)] for i in range(12)]
+-      self.conv_shl_subtask(qweights, self.dev.input_mem.dma_addr+16, offset=-1 if k == 1 else 1, shift=k+1)
+-      
+-      # Task 2: the NPU writes unsigned carry at scratch offset 48.
 -      self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
--                         self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
--      weights = [[0]*64 for _ in range(4)]
+-                         self.dev.input_mem.dma_addr+48, offset=256-(2**k-1), shift=k+1, unsigned=True)
 +      if residual:
-+        # Only partial-byte shifts need q and carry; whole-byte shifts skip these tasks.
-+        self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
-+                           self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
++        k = 8-residual if left else residual
++        # Task 1: the NPU writes q copies at scratch offsets 16, 20 and 24.
++        qweights = [[2*int(j==i%4) for j in range(4)] for i in range(12)]
++        self.conv_shl_subtask(qweights, self.dev.input_mem.dma_addr+16, offset=-1 if k == 1 else 1, shift=k+1)
++        # Task 2: the NPU writes unsigned carry at scratch offset 48.
 +        self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
-+                           self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
++                           self.dev.input_mem.dma_addr+48, offset=256-(2**k-1), shift=k+1, unsigned=True)
 +      if signed:
-+        # Read byte 3 and write four copies of floor(signed_byte3/128), either -1 or 0.
++        # Read byte 3 and write four copies of its sign, -1 or 0.
 +        self.conv_shl_subtask([[0, 0, 0, 2] for _ in range(4)], self.dev.input_mem.dma_addr+80, offset=-127, shift=8)
-+      # Include sign at offset 80 in the final convolution's input channels.
 +      channels = 96 if signed else 64
+       # Task 3: select s, q and the preceding carry, then write INT8 (table steps 3.1–3.3).
+-      weights = [[0]*64 for _ in range(4)]
 +      weights = [[0]*channels for _ in range(4)]
+       for i in range(4):
+         if left:
+           # Select the source byte; negative j leaves a zero output row.
 ```
 
-TOREVIEW1: We have prepared the sign byte. Next wire it into Task 3's weights, as planned: use it for a missing whole byte, or scale it for the missing bits of the top byte:
+We have prepared the sign byte. 
+Next wire it into Task 3's weights, as planned: use it for a missing whole byte, or scale it for the missing bits of the top byte:
 
 | Output case            | Old unsigned weights   | Signed weights                  |
 | ---------------------- | ---------------------- | ------------------------------- |
@@ -2952,39 +3116,43 @@ For residual 1, the last row needs weight +128. Use sign copies at 80 and 81 wit
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-   def conv_shr(self, raw:bytes, amount:int, signed:bool=False) -> bytes:
 @@
+   def conv_shift(self, op:Ops, raw:bytes, amount:int, signed:bool=False) -> bytes:
+@@
+           continue
+         # Output byte i gets source byte j and incoming bits from j+1.
          j = i+displacement
 -        if j >= 4: continue
 +        if j >= 4:
-+          # j is outside the four-byte input; signed SHR fills with the sign byte.
 +          if signed: weights[i][80] = 1
 +          continue
 +        if residual == 0:
-+          # No remaining bit shift: copy the selected whole byte directly.
 +          weights[i][j] = 1
 +          continue
          weights[i][48+j] = 1
+         if j < 3:
+           if residual == 1:
 @@
+             # Two q copies let INT8 weights supply -256*q.
              weights[i][j+1] = 2**(8-residual)
              weights[i][17+j] = weights[i][21+j] = -128
+-      self.conv_shl_subtask(weights, output_addr, scratch_input=True)
 +        elif signed:
 +          # +128 does not fit an INT8 weight; use two copies of sign.
 +          if residual == 1: weights[i][80] = weights[i][81] = 64
 +          else: weights[i][80] = 2**(8-residual)
-@@
--      self.conv_shl_subtask(weights, output_addr, scratch_input=True)
 +      self.conv_shl_subtask(weights, output_addr, scratch_input=True, channels=channels)
+     # The four output bytes are already in UINT32 order. No packing/rearrangement.
+     return bytes(to_mv(self.dev.output_buf, 4))
 ```
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u32_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
-     conv = self.conv_shl if op is Ops.SHL else self.conv_shr
--    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0])))[0] for x in a]
-+    kwargs = {"signed": dtype == dtypes.int} if op is Ops.SHR else {}
-+    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0]), **kwargs))[0] for x in a]
+-    return [struct.unpack(fmt, self.conv_shift(op, struct.pack(fmt, x), int(b[0])))[0] for x in a]
++    return [struct.unpack(fmt, self.conv_shift(op, struct.pack(fmt, x), int(b[0]), signed=dtype == dtypes.int))[0] for x in a]
 ```
 
 Now test signed SHR separately:
@@ -3001,7 +3169,3 @@ OK
 ```
 
 Both tests passed. The convolution selects and combines the bytes; OUT_CVT_SHIFT does the rounded right shift. Python packs the input and reads the result, not rearranges the result bytes.
-
-The helpers reconstructed from these diffs also passed 512 UINT32 and 512 INT32 SHR cases across counts 0..31, plus 56 SHL cases. This check reused the runtime's device allocation and EMIT, but used the blog's register builder, submit and convolution helpers.
-
-This helper accepts one uniform count in 0..31 per call. With NOOPT=1, the test's per-element counts reach it one lane at a time and pass. A single call containing different counts still raises; this is not optimized vector-count support.
