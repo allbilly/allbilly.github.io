@@ -1,28 +1,20 @@
 # Remaining ops
 
-TOREVIEW1: For each new op, first run its existing test at the current tutorial stage, without advertising the new op or installing its matcher. Let tinygrad try its existing lowering, then inspect TRACE for the first missing primitive or wrong result. Not every op has a decomposition. Fix what the test exposes before choosing custom registers or a LUT.
-
-Pre-change runs not recorded yet are marked pending below. Existing implementation diffs and later test results are retained for comparison, not as evidence that the built-in path failed.
-
-For the math checks, `TRANSCENDENTAL=2` forces the common decompositions even though the current renderer advertises the ops. It also lowers dependent math ops and reuses current support for their primitives, so these diagnostics are not reconstructed tutorial baselines.
-
-The fresh serial diagnostic used:
-
-```bash
-$ TRANSCENDENTAL=2 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q --tb=short \
-    test/backend/test_ops.py::TestOps::test_sin \
-    test/backend/test_ops.py::TestOps::test_exp2 \
-    test/backend/test_ops.py::TestOps::test_log2 \
-    test/backend/test_ops.py::TestOps::test_sqrt
-```
-
-SIN failed and EXP2 passed. LOG2 hit the 120-second timeout in ioctl; the process exited with signal 11 while dumping the traceback, so SQRT was not reached. There was no completed pytest summary. SIN was then rerun alone; its failure is recorded in that section.
-
 ## Ops.AND
 
-Next we will do Ops.AND.
+Next we will do Ops.AND. And lets try to run it directly
 
-TOREVIEW1: Before adding the bool matcher below, run `TestOps.test_and` with the current tutorial state and inspect TRACE. The isolated run recorded below already includes that matcher, so it is not the pre-change baseline. Record the first unsupported UOp before choosing a replacement; do not assume tinygrad has a general AND decomposition.
+TOREVIEW1: With the later integer AND dispatch and bool AND matcher disabled in memory, the existing test stops here:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_and
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.int
+Ran 1 test in 0.316s
+FAILED (errors=1)
+```
+
+This is a disabled-feature probe of the current runtime, not a full replay of every earlier diff. No runtime or test files were changed.
 
 | a     | b     | FP16 a * b | AND   |
 | ----- | ----- | ---------: | ----- |
@@ -58,18 +50,64 @@ Ran 1 test in 0.058s
 FAILED (errors=1)
 ```
 
-Lets us comment each test case to see which caused the err.
-TOREVIEW1: Ran the existing cases separately. The current backend already supports integer AND, so this probe disabled that later dispatch in memory to reproduce this step. No test files were changed.
+Lets us comment each test case to see which caused the error.
 
 ```text
 ten & ten: PASS
 ten & 0x1337: ROCKCHIP NPU does not support Ops.AND with dtypes.int
-0x1337 & ten: ROCKCHIP NPU does not support Ops.AND with dtypes.int
-(ten & 12) & ten: ROCKCHIP NPU does not support Ops.AND with dtypes.int
-ten0 & ten1 (four bool pairs): PASS
+```
+INT16 can hold every input in this case, including `0x1337 = 4919`, but CAST does not implement the missing bitwise AND. We would still need an INT16 AND algorithm. FP16 is lossy here: 4919 rounds to 4920, changing its low bits (`1 & 4919 = 1`, but `1 & 4920 = 0`). MUL only implements AND for 0/1 bool inputs, not these integers.
+
+TOREVIEW1: Lets try the INT16 CAST before rejecting it:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   comparison_matcher = PatternMatcher([
++    # Try narrower integer operands; this changes their dtype, not the AND operation.
++    (UPat(Ops.AND, dtypes.int32, name="u"),
++     lambda u: u.src[0].cast(dtypes.int16).alu(Ops.AND, u.src[1].cast(dtypes.int16)).cast(dtypes.int32)),
 ```
 
-The isolated bool case issued 12 NPU CAST calls and 4 NPU MUL calls, three CASTs and one MUL per pair.
+With the later integer AND helper disabled in memory, the existing test gives:
+
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
+Ran 1 test in 0.166s
+FAILED (errors=1)
+```
+
+Now try FP16 instead:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   comparison_matcher = PatternMatcher([
+@@
+-     lambda u: u.src[0].cast(dtypes.int16).alu(Ops.AND, u.src[1].cast(dtypes.int16)).cast(dtypes.int32)),
++     lambda u: u.src[0].cast(dtypes.half).alu(Ops.AND, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
+```
+
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.half
+Ran 1 test in 0.175s
+FAILED (errors=1)
+```
+
+These ran `TestOps.test_and` with NOOPT=1, FORWARD_ONLY=1 and DEFAULT_FLOAT=HALF, using the current runtime's CAST support. They test the proposed matcher, not a full reconstruction of this tutorial stage. Neither supplies a bitwise AND implementation.
+
+Remove the unsuccessful rule before continuing:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   comparison_matcher = PatternMatcher([
+-    # Try narrower integer operands; this changes their dtype, not the AND operation.
+-    (UPat(Ops.AND, dtypes.int32, name="u"),
+-     lambda u: u.src[0].cast(dtypes.half).alu(Ops.AND, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
+```
+
+TOREVIEW1: We are back at the original INT32 AND gate. The new errors above follow explicit matcher diffs; no gate was released. An assertion from the later runtime's input packing is not a result of these tutorial steps.
 
 ```python
 data = [[1,-8,1],[32,1,6]]
@@ -78,14 +116,6 @@ ten = Tensor(data, dtype=dtypes.int32)
 helper_test_op([], lambda: tor&tor, lambda: ten&ten, forward_only=True)
 helper_test_op([], lambda: tor&0x1337, lambda: ten&0x1337, forward_only=True)
 ```
-
-Why didnt `ten & ten` fail first? `Ops.AND` belongs to `GroupOp.Idempotent`, and `tinygrad/uop/symbolic.py` has this rule:
-
-```python
-(UPat(GroupOp.Idempotent, src=(UPat.var("x"), UPat.var("x"))), lambda x: x),
-```
-
-So `ten & ten` becomes `ten`, with no AND to execute. The next expression, `ten & 0x1337`, still needs INT32 AND. The full test stops there; running the later bool case separately confirms our matcher works for all four pairs.
 
 MUL is not bitwise AND for whole integers: `2 * 3 = 6`, but `2 & 3 = 2`. We need another decomposition.
 
@@ -163,7 +193,7 @@ First extend our shared convolution helper. SHR already added a selectable chann
 +                    unsigned:bool=False, scratch_input:bool=False, channels:int=64, input_addr:int|None=None, relux:bool=False) -> None:
 @@
 +    if input_addr is not None: self.npu_regs.append(E(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_addr))
-+    # Clamp integer index-t+1 to 0/1; plain ReLU would leave values above 1 and spoil the lookup sum.
++    # Tasks 5–12: turn each digit-pair threshold index-t+1 into the 0/1 step used by Task 13's lookup sum.
 +    if relux:
 +      self.npu_regs += [
 +        E(rk.DPU, rk.REG_DPU_BN_CFG, (1 << rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT) |
@@ -172,7 +202,7 @@ First extend our shared convolution helper. SHR already added a selectable chann
 +      ]
      self.submit(cna=True)
 ```
-TOREVIEW1: Added the comment explaining why the lookup steps need ReLU-X, not plain ReLU.
+TOREVIEW1: This is plan step 3, the eight threshold convolutions (Tasks 5–12). Only these calls enable relux; Task 13 combines their step masks with the table-difference weights.
 
 Keep the scratch layout explicit before writing the tasks:
 
@@ -192,7 +222,6 @@ Each step group uses 15 lanes; the last lane stays zero. The two constant 1 byte
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def conv_and_word(self, raw:bytes) -> bytes:
 +    assert len(raw) == 8
 +    scratch = bytearray(640)
@@ -242,7 +271,6 @@ The wrapper only packs the original words and reads the result. Unlike signed SH
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_u32_and(self, a:list, b:list, dtype:DType) -> list:
 +    assert len(a) == len(b)
 +    fmt = "<I" if dtype == dtypes.uint else "<i"
@@ -266,6 +294,7 @@ Composite helpers now dispatch before the ordinary EW gate; otherwise `CMP` woul
 +           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0, Ops.SHR: 0, Ops.AND: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
@@ -301,13 +330,19 @@ The two AND helpers extracted from these diffs also passed the same test in 20.7
 
 ## Ops.XOR
 
-TOREVIEW1: First run this at the tutorial state, before the new diffs below. Run the existing lowering before adding the bool CMPNE matcher or extending the integer lookup.
-
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_xor
 ```
+TOREVIEW1: The disabled-feature probe removed the later integer XOR dispatch and bool XOR matcher in memory, keeping other current runtime support. It ran the existing test with fail-fast and no TRACE; this is not a full tutorial reconstruction:
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.XOR with dtypes.int
+Ran 1 test in 0.160s
+FAILED (errors=1)
+```
+
+
+The probe establishes this missing path, not an accuracy failure in a built-in decomposition.
 
 Next Ops.XOR. For bools, XOR means the two inputs are different, so reuse CMPNE:
 
@@ -353,6 +388,7 @@ Rename the helper now that it handles two operations:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
 -  def conv_and_word(self, raw:bytes) -> bytes:
 -    assert len(raw) == 8
 +  def conv_bitwise_word(self, op:Ops, raw:bytes) -> bytes:
@@ -367,6 +403,7 @@ Pass the operation through the wrapper. Input/output packing stays unchanged:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
 -  def run_u32_and(self, a:list, b:list, dtype:DType) -> list:
 +  def run_u32_bitwise(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
@@ -382,6 +419,7 @@ Then advertise XOR and extend dispatch:
 +           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0, Ops.SHR: 0, Ops.AND: CMP, Ops.XOR: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -          elif u.op is Ops.AND and u.dtype in (dtypes.int, dtypes.uint):
@@ -413,8 +451,16 @@ TOREVIEW1: First run this at the tutorial state, before the new diffs below. Che
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_trunc
 ```
+TOREVIEW1: The disabled-feature probe removed the later TRUNC matcher in memory, keeping other current runtime support. It ran the existing test with fail-fast and no TRACE; this is not a full tutorial reconstruction:
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.TRUNC with dtypes.half
+Ran 1 test in 0.229s
+FAILED (errors=1)
+```
+
+
+The probe establishes this missing path, not an accuracy failure in a built-in decomposition.
 
 Next Ops.TRUNC. Does the CVT right shift help here? Not directly: `2.9 >> 1` would scale the number, while TRUNC needs 2. We need to remove the fraction towards zero.
 
@@ -462,6 +508,7 @@ FLOOR selects algorithm 7, CEIL selects 8. Other operations keep their ops_map v
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
                        input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 @@
@@ -473,6 +520,7 @@ These are unary operations. Disable the unused operand DMA and use an immediate 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
                        input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 @@
@@ -533,13 +581,19 @@ The earlier combined regression run gave `Ran 12 tests in 25.069s`, `OK`, with t
 
 ## Ops.OR
 
-TOREVIEW1: First run this at the tutorial state, before the new diffs below. Keep the bool OR support already introduced; test the integer cases before extending the lookup.
-
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_or
 ```
+TOREVIEW1: The disabled-feature probe removed the later integer OR dispatch (the earlier bool OR matcher stays enabled) in memory, keeping other current runtime support. It ran the existing test with fail-fast and no TRACE; this is not a full tutorial reconstruction:
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.OR with dtypes.int
+Ran 1 test in 0.163s
+FAILED (errors=1)
+```
+
+
+The probe establishes this missing path, not an accuracy failure in a built-in decomposition.
 
 Next extend Ops.OR to INT32/UINT32. We already split and rejoin the digits for AND/XOR. OR changes which of the two bits are kept, not their positions, so only the two-bit table should change:
 
@@ -593,14 +647,21 @@ Four additional INT32/UINT32 Tensor checks passed (144 lanes), including broadca
 
 For Ops.MULACC, which is `a*b+c`. We can try normal MUL then ADD? 
 
-TOREVIEW1: First run the existing direct-UOp test before advertising MULACC:
-
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q -rs \
     test/backend/test_uops.py::TestFloatUOps::test_mulacc
 ```
+TOREVIEW1: The disabled-feature probe removed the later MULACC dispatch in memory, keeping other current runtime support. It ran the existing test with fail-fast and no TRACE; this is not a full tutorial reconstruction:
 
-Record whether it runs, fails or skips at this stage. A skip is not a decomposition pass. The separate MUL→ADD idea below is a candidate, not evidence that tinygrad lowers a direct MULACC that way. This pre-change baseline is still pending.
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.MULACC with dtypes.half
+Ran 1 test in 0.057s
+FAILED (errors=1)
+```
+
+
+
+The probe uses the current test's ROCKCHIP allowance, which is discussed later in this section; an earlier test version may skip instead. A skip is not a pass. The separate MUL→ADD idea below is a candidate, not evidence that tinygrad lowers a direct MULACC that way.
 
 MULACC should round the combined result once; our two FP16 tasks would round the product first.
 
@@ -671,7 +732,6 @@ The stride fields start at bit 4: `1 << ...__SHIFT` writes a 16-byte stride. Shi
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def mulacc_stage(self, algo:int, lhs:int, rhs:int, out:int, precision:int=5, output:int=5,
 +                   shift:int=0, binary:bool=False, mul:bool=False, bs_mul:int|None=None) -> None:
 +    # Private FP32/INT32 stages: precision 2 = FP16, 4 = INT32, 5 = FP32; algo -1 bypasses EW.
@@ -691,6 +751,7 @@ Select input/output precision. Keep the converter scale at 1; only the final FP1
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def mulacc_stage(self, algo:int, lhs:int, rhs:int, out:int, precision:int=5, output:int=5,
                     shift:int=0, binary:bool=False, mul:bool=False, bs_mul:int|None=None) -> None:
 @@
@@ -713,6 +774,7 @@ Now set the output layout. One stride unit is 16 bytes. FP32 has four lanes per 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def mulacc_stage(self, algo:int, lhs:int, rhs:int, out:int, precision:int=5, output:int=5,
                     shift:int=0, binary:bool=False, mul:bool=False, bs_mul:int|None=None) -> None:
 @@
@@ -733,6 +795,7 @@ Configure the input streams for the same precision. Disable BRDMA/NRDMA by defau
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def mulacc_stage(self, algo:int, lhs:int, rhs:int, out:int, precision:int=5, output:int=5,
                     shift:int=0, binary:bool=False, mul:bool=False, bs_mul:int|None=None) -> None:
 @@
@@ -762,6 +825,7 @@ The product task alone enables BS operand DMA. Point BRDMA at b, keep BS ALU/ReL
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def mulacc_stage(self, algo:int, lhs:int, rhs:int, out:int, precision:int=5, output:int=5,
                     shift:int=0, binary:bool=False, mul:bool=False, bs_mul:int|None=None) -> None:
 @@
@@ -796,7 +860,6 @@ The finite/nonzero error check disables the correction for infinities and NaNs. 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_mulacc(self, a:list, b:list, c:list) -> list:
 +    assert len(a) == len(b) == len(c)
 +    base = self.dev.input_mem.dma_addr
@@ -827,6 +890,7 @@ Now calculate p and c in FP32, then TwoSum. Each calc call writes a new scratch 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_mulacc(self, a:list, b:list, c:list) -> list:
 @@
        def imul(x:int, y:int) -> int: return calc(0, x, y, 4, 4, mul=True)
@@ -851,6 +915,7 @@ For signed INT32, the converter uses `round_away((x-int(x>0))/2)` to obtain floo
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_mulacc(self, a:list, b:list, c:list) -> list:
 @@
        v = calc(4, total, product)
@@ -866,6 +931,7 @@ If error and total have opposite signs, decrement the encoding; otherwise increm
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_mulacc(self, a:list, b:list, c:list) -> list:
 @@
        half = calc(4, total, ilt(zero, total), 4, 4, shift=1)
@@ -881,6 +947,7 @@ Finally restore negative zero when both product and addend were -0. Convert the 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_mulacc(self, a:list, b:list, c:list) -> list:
 @@
        direction = isub(one, imul(opposite, two))
@@ -906,6 +973,7 @@ Now advertise MULACC and dispatch its three inputs. tinygrad also fuses integer 
 +           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
            elif u.op in (Ops.AND, Ops.XOR, Ops.OR) and u.dtype in (dtypes.int, dtypes.uint):
@@ -914,6 +982,7 @@ Now advertise MULACC and dispatch its three inputs. tinygrad also fuses integer 
 +            values[u] = self.run_mulacc(*src_values)
 @@
  class RockchipRenderer(Renderer):
+@@
    comparison_matcher = PatternMatcher([
 +    # Global MUL+ADD fusion also creates integer MULACC; keep the existing non-FP16 paths.
 +    (UPat(Ops.MULACC, name="u"),
@@ -1009,19 +1078,27 @@ $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q
 This test now passes on ROCKCHIP, not skips. It checks both buffer inputs and constants; the larger correction probes above still cover rounding and special values. This is separate from test_ops.test_mulacc_with_zero_strides, whose dtype mismatch remains.
 
 
-## Ops.CDIV and Ops.CMOD
-
-TOREVIEW1: First run this at the tutorial state, before the new diffs below. Inspect the division UOps first. Constant-divisor rewrites may already use shifts; they do not establish support for variable divisors.
+## Ops.CDIV
+TOREVIEW1: Start with division; CMOD has its own section below.
 
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_div_int
 ```
+TOREVIEW1: The disabled-feature probe removed the later integer division/remainder dispatch in memory, keeping other current runtime support. It ran the existing test with fail-fast and no TRACE; this is not a full tutorial reconstruction:
 
-Then run `TestOps.test_fmod` separately for CMOD; inspect its UOps rather than assuming it takes the same path as division.
+```text
+NotImplementedError: ROCKCHIP NPU does not support Ops.CMOD with dtypes.int
+Ran 1 test in 0.178s
+FAILED (errors=1)
+```
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
 
-Next CDIV and CMOD. We already have TRUNC, so first check the obvious candidate, FDIV → TRUNC:
+
+`test_div_int` includes floor division too. Its first unsupported UOp was CMOD, so it does not isolate CDIV. The direct `TestNonFloatUOps.test_div_int32` check below does.
+
+The probe establishes this missing path, not an accuracy failure in a built-in decomposition.
+
+For CDIV, we already have TRUNC, so first check the obvious candidate, FDIV → TRUNC:
 
 ```text
 4094 / 3 = 1364.666...
@@ -1035,13 +1112,19 @@ The quotient must stay exact, so narrowing these integers to FP16 is not enough.
 
 ## Ops.BITCAST
 
-TOREVIEW1: First run this at the tutorial state, before the new diffs below. Check the existing storage path first. BITCAST may need storage handling rather than arithmetic decomposition.
-
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_bitcast
 ```
+TOREVIEW1: The current-runtime run, without TRACE, failed in the Torch reference before reaching Rockchip:
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+```text
+RuntimeError: self.size(-1) must be divisible by 2 to view Half as Int (different element sizes), but got 3
+Ran 1 test in 0.016s
+FAILED (errors=1)
+```
+
+
+The first case views a (3,3) HALF tensor as INT32. Two half elements make one INT32, but its last dimension is odd. This result says nothing about NPU BITCAST. The payload-preservation checks below address a different question; do not describe this reference failure as a backend limitation.
 
 BITCAST keeps the same bytes and changes their dtype. In this interpreter the host copies storage; it does not calculate a converted value or submit a fake identity operation.
 
@@ -1117,6 +1200,7 @@ Pack arithmetic inputs with raw16 rather than converting them back to Python flo
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
 @@
 -      packed = struct.pack("<8h" if op is Ops.SHL or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
@@ -1131,6 +1215,7 @@ Copy each completed output before reusing the output buffer. This keeps a result
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
 @@
 -      fmt = "16?" if dtype == dtypes.bool else "16b" if dtype == dtypes.int8 else "8h" if dtype == dtypes.int16 else "8e"
@@ -1145,6 +1230,7 @@ The existing guards inspect values rather than their bytes. Decode there, withou
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
 @@
 -      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
@@ -1159,12 +1245,13 @@ The existing guards inspect values rather than their bytes. Decode there, withou
 -      if byte_output and any(x not in (0.0, 1.0) for x in a):
 +      if byte_output and any(scalar16(x) not in (0.0, 1.0) for x in a):
 ```
-TOREVIEW1: Added comments explaining why the guards and shift-count lookup need decoded scalars.
+TOREVIEW1: SHL already works; BITCAST changes what its inputs look like. LOAD and the output loop above now return typed memoryviews instead of Python numbers. The old SHL count check and `powers[shift]` lookup need integers, so decode b before using them. RECIPROCAL's sign guard and CAST's 0/1 guard need numbers for the same reason. The SHL formula and NPU registers are unchanged.
 
 Bool-to-half is a special case: a bool occupies one byte, but our multiplier takes INT16 0/1 lanes. Read the bool value before packing that input. The remaining Python CAST fallback also needs a scalar:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -            values[u] = self.run_npu(Ops.CAST, src_values[0], dtype=u.dtype)
@@ -1189,6 +1276,7 @@ A memoryview containing zero is still a non-empty Python object. Control-flow an
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -            if values[u.src[2]][0]: i = self.uop_to_index[u.src[1]]
@@ -1205,6 +1293,7 @@ Likewise an INDEX needs an integer offset:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -            for m,o in zip(src_values[0], src_values[1]): ret.append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
@@ -1219,19 +1308,19 @@ Apply the storage change once to the shared shift wrapper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u32_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
      assert op in (Ops.SHL, Ops.SHR)
 +    b = list(map(scalar16, b))
 @@
 -    fmt = "<I" if dtype == dtypes.uint else "<i"
-     conv = self.conv_shl if op is Ops.SHL else self.conv_shr
-@@
--    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0]), **kwargs))[0] for x in a]
-+    return [typed_view(conv(bytes(raw16(x, dtype)), int(b[0]), **kwargs), dtype) for x in a]
+-    return [struct.unpack(fmt, self.conv_shift(op, struct.pack(fmt, x), int(b[0]), signed=dtype == dtypes.int))[0] for x in a]
++    return [typed_view(self.conv_shift(op, bytes(raw16(x, dtype)), int(b[0]), signed=dtype == dtypes.int), dtype) for x in a]
 ```
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u32_bitwise(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
 -    fmt = "<I" if dtype == dtypes.uint else "<i"
@@ -1247,6 +1336,7 @@ MULACC keeps its arithmetic unchanged as well. Copy the original FP16 bytes in a
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_mulacc(self, a:list, b:list, c:list) -> list:
 @@
 -        to_mv(self.dev.input_buf+i*64, 16)[:] = struct.pack("<8e", *(values[start:start+8] + [0.0]*(8-count)))
@@ -1258,9 +1348,19 @@ MULACC keeps its arithmetic unchanged as well. Copy the original FP16 bytes in a
 
 The bit-pattern checks passed all 65,536 FP16 encodings, all 65,536 BF16 encodings, and selected FP32/FP64 zeros, infinities and NaN payloads. The existing test_bitcast passed with its default FP32 inputs.
 
-## Ops.CDIV and Ops.CMOD: exact integer arithmetic
+## Ops.CDIV: exact integer arithmetic
 
-TOREVIEW1: Continue from the division baseline above. Only introduce the exact-integer helper for the missing operations observed there. The FDIV→TRUNC counterexample rules out that candidate, not every existing tinygrad rewrite.
+TOREVIEW1: There is no `TestOps.test_cdiv`; the existing direct test is `TestNonFloatUOps.test_div_int32`. With the later integer division dispatch disabled in memory, it stops on CDIV itself:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m unittest test.backend.test_uops.TestNonFloatUOps.test_div_int32
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.CDIV with dtypes.int
+Ran 1 test in 0.061s
+FAILED (errors=1)
+```
+
+This reuses current storage and other primitive support; it is a disabled-feature probe, not a full earlier-state replay. Implement the quotient path first, then enable CMOD in its separate section.
 
 Now the original bytes survive the interpreter. How can we divide without FP16 rounding? Reuse the base-256 representation from shifts: each byte is a limb in 0..255. A padded INT32 lane can hold a byte product and carry exactly.
 
@@ -1283,7 +1383,6 @@ These are private INT32 tasks through mulacc_stage, not FP16 casts. First add th
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 +    # Base-256 limbs keep every intermediate exact in the INT32 datapath, including UINT64 division.
 +    width = dtype.itemsize
@@ -1309,6 +1408,7 @@ Cache the constant lanes once per atom. calc submits an INT32 task and returns i
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
          to_mv(self.dev.input_buf+addr-base, 32)[:] = raw + bytes(32-len(raw))
@@ -1332,6 +1432,7 @@ For a 0/1 mask, selection is `no + (yes-no)*mask`. These are small integer limbs
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
        def mul(x:int, y:int) -> int: return calc(0, x, y, mul=True)
@@ -1345,6 +1446,7 @@ For `0x0100 - 0x0001`: low byte `0-1=-1` becomes 255 with borrow 1; high byte `1
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
        def select(mask:int, yes:int, no:int) -> int: return add(no, mul(sub(yes, no), mask))
@@ -1361,6 +1463,7 @@ Apply selection to each byte. Two's-complement negation is the same subtract hel
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
            out.append(add(value, mul(radix, borrow)))
@@ -1373,6 +1476,7 @@ Division will feed one bit at a time into a whole word. double computes `2*x+car
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
        def choose(mask:int, a:list[int], b:list[int]) -> list[int]: return [select(mask, x, y) for x,y in zip(a, b)]
@@ -1390,6 +1494,7 @@ All limb values are non-negative. Their sum is zero only when every limb is zero
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
            out.append(sub(value, mul(radix, carry)))
@@ -1404,6 +1509,7 @@ Next load the limbs and implement exact wrapping ADD/SUB/MUL, integer comparison
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
 +      # Only copy raw bytes into zero-padded INT32 lanes; all carries, signs and arithmetic are NPU operations.
@@ -1420,6 +1526,7 @@ WHERE uses the bool mask to select corresponding limbs. NEG, ADD and SUB reuse t
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
        a = operands[0]
@@ -1442,6 +1549,7 @@ The biased CVT shift extracts carry exactly. Products above the output width are
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
        elif op is Ops.ADD: out = subtract(a, negate(b))[0]
@@ -1460,6 +1568,7 @@ For comparisons, the highest byte tells us each sign. If signs differ, the negat
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
            carry = calc(4, add(total, total), const(255), shift=9)
@@ -1508,6 +1617,7 @@ Start with truncating division. Floor division's sign correction comes after thi
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
 +        else:
@@ -1522,6 +1632,7 @@ Feed the numerator from its highest byte and highest bit. Each iteration doubles
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
            # Restoring division: feed one numerator bit into the remainder, subtract if it fits.
@@ -1542,6 +1653,7 @@ Restore the signs after unsigned division. The quotient sign depends on both ope
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
                remainder = choose(take, candidate, remainder)
@@ -1565,6 +1677,7 @@ Subtract one from the quotient and add the original divisor to the remainder. Ke
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
            quotient = choose(valid, choose(different_sign, negate(quotient), quotient), [zero]*width)
@@ -1580,6 +1693,7 @@ Finally copy the low byte from each NPU-produced INT32 limb, lowest limb first. 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_integer(self, op:Ops, inputs:list[list], dtype:DType) -> list:
 @@
              remainder = subtract(remainder, negate(choose(correction, b, [zero]*width)))[0]
@@ -1595,6 +1709,7 @@ Remove the earlier lossy INT32 → FP16 → INT32 matchers for ADD/MUL and compa
 
 ```diff
  class RockchipRenderer(Renderer):
+@@
    comparison_matcher = PatternMatcher([
 @@
 -    # Lossy INT32 comparison: FP16 conversion can make distinct integers equal.
@@ -1610,6 +1725,7 @@ Remove INT32 from the less-than and WHERE patterns too. Otherwise those operatio
 
 ```diff
  class RockchipRenderer(Renderer):
+@@
    comparison_matcher = PatternMatcher([
 @@
 -    (UPat(Ops.CMPLT, src=(UPat(dtype=(dtypes.half, dtypes.weakfloat, dtypes.int32, dtypes.bool)),
@@ -1626,39 +1742,77 @@ Remove INT32 from the less-than and WHERE patterns too. Otherwise those operatio
       lambda u: RockchipRenderer._pm_lower_where(u)),
 ```
 
-Now enable CDIV/CMOD and the exact integer helper:
+Now enable CDIV and the exact integer helper. Keep CMOD gated until its own step:
 
 ```diff
  ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
 @@
 -           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP}
-+           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP, Ops.CDIV: CMP, Ops.CMOD: CMP}
++           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP, Ops.CDIV: CMP}
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -          if u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
 +          integer_dtype = src_dtypes[1] if u.op is Ops.WHERE else src_dtypes[0]
 +          if integer_dtype in dtypes.ints and u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.NEG, Ops.MAX, Ops.WHERE,
-+                                                      Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD, *GroupOp.Comparison):
++                                                      Ops.CDIV, Ops.FLOORDIV, *GroupOp.Comparison):
 +            values[u] = self.run_integer(u.op, src_values, integer_dtype)
 +          elif u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
 ```
 
 tinygrad already lowers FLOORDIV/FLOORMOD using CDIV/CMOD plus sign correction in codegen/decomp/op.py. We do not need to change that file. The direct helper also handles both, so we can check the formula independently.
 
-Start with truncating integer division:
+Check direct CDIV with `TestNonFloatUOps.test_div_int32`; `test_div_int` also needs CMOD, as the initial trace showed.
+
+The current-runtime check of direct CDIV passed; this is not a reconstruction of the helper from these diffs:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m unittest test.backend.test_uops.TestNonFloatUOps.test_div_int32
+
+Ran 1 test in 1.649s
+OK
+```
+
+## Ops.CMOD
+
+TOREVIEW1: CDIV returns the quotient, but its restoring-division loop also keeps the remainder. CMOD returns that remainder after restoring the numerator's sign. This is why the shared helper above contains both paths; CMOD does not need a second division algorithm.
+
+The direct remainder test with the later division/remainder dispatch disabled in memory stops here:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m unittest test.backend.test_uops.TestNonFloatUOps.test_mod_int32
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.CMOD with dtypes.int
+Ran 1 test in 0.062s
+FAILED (errors=1)
+```
+
+Enable the remaining path:
+
+```diff
+ ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
+@@
+-           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP, Ops.CDIV: CMP}
++           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP, Ops.CDIV: CMP, Ops.CMOD: CMP}
+@@
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+           if integer_dtype in dtypes.ints and u.op in (Ops.ADD, Ops.SUB, Ops.MUL, Ops.NEG, Ops.MAX, Ops.WHERE,
+-                                                      Ops.CDIV, Ops.FLOORDIV, *GroupOp.Comparison):
++                                                      Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD, *GroupOp.Comparison):
+```
+
+The saved combined-helper run now belongs here:
 
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_div_int
 
 test_div_int (__main__.TestOps.test_div_int) ... ok
-
 Ran 1 test in 3.505s
-
 OK
 ```
 
-Then check remainder and floor-modulo separately:
+Check remainder first, then floor-modulo separately:
 
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_fmod
@@ -1684,20 +1838,21 @@ The focused checks passed 88 subtests across signed and unsigned 8/16/32/64-bit 
 
 ## Ops.THREEFRY
 
-TOREVIEW1: Lets run the existing THREEFRY test first:
+TOREVIEW1: No THREEFRY entry is needed in ops_map: leaving it unsupported lets tinygrad expand it into simpler UOps. But those UOps still need working primitives. With the later 64-bit shift dispatch disabled in memory, the existing test fails at the split, before the rounds:
 
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q \
     test/device/test_rockchip_integer.py::TestRockchipInteger::test_threefry
 
-1 passed in 3.01s
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.ulong
+Ran 1 test in 0.180s
+FAILED (errors=1)
 ```
 
-This run checks five UINT64 counter/key pairs against CPU, including full-width values. It uses the current runtime, which already has the split/join helpers shown below; it is not a test of the earlier tutorial state.
 
-TOREVIEW1: Repeat this test at the pre-change tutorial state before adding the split/join diffs. Record the first unsupported UOp; the current-runtime pass alone does not establish which helper was missing then.
+This disabled-feature probe reuses the rest of the current runtime, including storage handling. It establishes the missing UINT64 SHR path, not a complete replay of the tutorial. The earlier current-runtime pass belongs after the helpers, not before them.
 
-Why does it pass without a THREEFRY entry in ops_map? Check what tinygrad already lowers. `codegen/decomp/op.py` supplies the rounds using wrapping ADD, shifts and XOR. We have those UINT32 operations now, so leave THREEFRY out of code_for_op and inspect what its split/join needs.
+Check what tinygrad already lowers. `codegen/decomp/op.py` supplies the rounds using wrapping ADD, shifts and XOR. We have those UINT32 operations now, so leave THREEFRY out of code_for_op and inspect what its split/join needs.
 
 One round mixes two UINT32 words:
 
@@ -1741,7 +1896,6 @@ For signed SHR, shift the high word arithmetically. At n>=32, only the high word
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_u64_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 +    counts = list(map(scalar16, b))
 +    if not counts or not all_same(counts) or not 0 <= counts[0] < 64:
@@ -1759,6 +1913,7 @@ First handle left shift. Below 32 bits, combine the shifted high word with the l
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u64_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
      def right(x:list, count:int, signed:bool=False) -> list:
@@ -1773,6 +1928,7 @@ For right shift, the direction is reversed. The high word supplies the low word'
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u64_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
        hi = self.run_u32_bitwise(Ops.OR, left(high, amount), right(low, 32-amount), dtypes.uint) if 0 < amount < 32 else \
@@ -1788,6 +1944,7 @@ Join the two completed four-byte results, low word first. The NPU has already mo
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_u64_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 @@
        lo = self.run_u32_bitwise(Ops.OR, right(low, amount), left(high, 32-amount), dtypes.uint) if 0 < amount < 32 else \
@@ -1799,7 +1956,6 @@ AND/OR/XOR can process each 32-bit chunk independently:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_integer_bitwise(self, op:Ops, a:list, b:list, dtype:DType) -> list:
 +    # Each 32-bit chunk is independent. Narrow integers use the low bytes of the same convolution.
 +    result = [bytearray() for _ in a]
@@ -1857,13 +2013,19 @@ Progress: **25 / 30** paths covered. Remaining: SQRT, EXP2, LOG2, POW and SIN. T
 
 ## Ops.SQRT
 
-TOREVIEW1: Try tinygrad's existing SQRT decomposition first:
+TOREVIEW1: `TRANSCENDENTAL=2` tells tinygrad to use its common math decompositions even when the renderer advertises a native handler. It also decomposes dependent math ops. At a genuinely earlier tutorial stage, leaving SQRT out of code_for_op selects that fallback without this override; here we use it to test the current runtime without its custom SQRT.
 
 ```bash
 $ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_sqrt
 ```
+TOREVIEW1: The separate forced-decomposition run, without TRACE, did not finish within 150 seconds. The diagnostic runner stopped it:
 
-The forced-decomposition batch did not reach this test. This baseline remains pending; the Newton probe below is a different candidate, not a test of tinygrad's SQRT lowering.
+```text
+TIMEOUT after 150s; no unittest result
+```
+
+
+This is a wall-time limit, not an observed wrong square root. Profile the decomposed path before blaming precision. The Newton probe below tests a separate candidate, not tinygrad's SQRT lowering.
 
 Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
 
@@ -1893,7 +2055,6 @@ Add the helper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_sqrt(self, a:list) -> list:
 +    # Search ordered positive FP16 encodings; half*half is exact in the BS FP32 output.
 +    base = self.dev.input_mem.dma_addr
@@ -1914,6 +2075,7 @@ Cache constants in the same scratch area. calc uses the private task builder fro
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
          if raw is not None: to_mv(self.dev.input_buf+addr-base, len(raw))[:] = raw
@@ -1932,6 +2094,7 @@ Use INT32 ADD/SUB/MUL and MIN+BINARY_EN for encoding arithmetic and selection. T
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
          self.mulacc_stage(algo, x, const(0) if y is None else y, out, precision, output, **kw)
@@ -1947,6 +2110,7 @@ The candidate encoding occupies a padded INT32 lane. half_bits copies its low tw
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
        def lt(x:int, y:int) -> int: return calc(1, x, y, binary=True)
@@ -1964,6 +2128,7 @@ Upload the original FP16 values and retain a second, padded copy of their encodi
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
          return alloc(read(out, 8)+read(out+16, 8))
@@ -1978,6 +2143,7 @@ Search the encoding interval. Each midpoint is rounded upward; if its square exc
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
        source_bits = alloc(b"".join(raw[i:i+2]+bytes(2) for i in range(0, 16, 2)))
@@ -1999,6 +2165,7 @@ Only these small gap operands are converted to half for BS MUL. The square and s
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
          above = lt(x, square(half_bits(mid)))
@@ -2018,6 +2185,7 @@ Compare x with the midpoint square. Below selects y, above selects z. At an exac
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
        cross = calc(-1, lower, precision=2, output=5, bs_mul=gap)
@@ -2032,6 +2200,7 @@ Handle special values with masks on the original encoding. Keep both zeros and +
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
        parity = sub(lo, mul(calc(4, lo, const(1), shift=1), const(2)))
@@ -2049,6 +2218,7 @@ Read the low two bytes of each selected encoding. The NPU has already chosen the
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_sqrt(self, a:list) -> list:
 @@
        valid = mul(sub(const(1), negative), mul(lt(const(0), magnitude), lt(magnitude, const(0x7c00))))
@@ -2092,13 +2262,18 @@ Progress: **26 / 30** paths covered. EXP2, LOG2, POW and SIN remain. The full te
 
 ## Ops.EXP2
 
-TOREVIEW1: Try tinygrad's existing EXP2 decomposition first:
-
 ```bash
 $ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
 ```
+TOREVIEW1: The fresh forced-decomposition run, without TRACE, passed:
 
-The fresh forced-decomposition batch passed test_exp2. Keep that path as the baseline. The custom helper below is an alternative to compare for accuracy and cost, not a required fix established by this test.
+```text
+test_exp2 (__main__.TestOps.test_exp2) ... ok
+Ran 1 test in 119.321s
+OK
+```
+
+TOREVIEW1: This passed on the current runtime, not the runtime built so far in this tutorial. A four-input EXP2 probe called run_half_compare 24 times, but we only introduce that helper later under POW. It also used Python CAST fallback for half → INT16 and INT16 → half, four lanes each. No run_math calls were made: tinygrad's decomposition really ran, but with later support and CPU conversions. We still need to run it at this tutorial step before calling it an NPU-only baseline. The custom helper below is an alternative to investigate, not a required fix established by this pass.
 
 Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
 
@@ -2123,7 +2298,6 @@ Start the shared helper with EXP2 only:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_math(self, op:Ops, a:list) -> list:
 +    assert op is Ops.EXP2
 +    base = self.dev.input_mem.dma_addr
@@ -2145,6 +2319,7 @@ Cache each constant in its requested format. calc defaults to FP32 arithmetic th
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          if raw is not None: to_mv(self.dev.input_buf+addr-base, len(raw))[:] = raw
@@ -2164,6 +2339,7 @@ The encoding calculations use INT32. exponent_scale multiplies n by 2²³, the F
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          self.mulacc_stage(algo, x, const(0) if y is None else y, out, precision, output, **kw)
@@ -2180,6 +2356,7 @@ BS reads four half multipliers from each 16-byte surface. Convert the reduced fr
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        def select(mask:int, yes:int, no:int) -> int: return add(no, mul(sub(yes, no), mask))
@@ -2189,7 +2366,8 @@ BS reads four half multipliers from each 16-byte surface. Convert the reduced fr
 +        return alloc(read(half, 8)+bytes(8)+read(half+16, 8))
 ```
 
-TOREVIEW1: Horner's method rewrites a polynomial as nested multiply-add steps. For example:
+Horner's method rewrites a polynomial as nested multiply-add steps. For example:
+TOREVIEW1: No precision failure in tinygrad's EXP2 decomposition has been established; its test passed. Horner is just how this alternative evaluates its polynomial without separately building every power of r. tinygrad also uses polynomial evaluation, so Horner itself is not a reason to replace the default path. Compare the coefficient choice, arithmetic precision, accuracy and task cost first.
 
 ```text
 c0 + c1*r + c2*r*r = (c2*r + c1)*r + c0
@@ -2199,6 +2377,7 @@ So we dont need to compute each power of r separately. Start at the highest coef
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          half = calc(-1, value, output=2)
@@ -2215,6 +2394,7 @@ Upload x and save its original encoding for special-value checks. Convert the nu
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
            value = calc(2, value, const(c, "f"))
@@ -2229,6 +2409,7 @@ Bound the working input to [-25, 16], then split it into integer n and fraction 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        bits = alloc(b"".join(raw[i:i+2]+bytes(2) for i in range(0, 16, 2)))
@@ -2246,6 +2427,7 @@ Convert the scaled FP32 answer to half only once. Keep its output encoding in IN
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        poly = polynomial(weights, coefficients)
@@ -2263,6 +2445,7 @@ Add one output bit for that input, using NPU integer comparisons. Then select ze
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        negative = lt(const(32767), bits)
@@ -2279,6 +2462,7 @@ NaN inputs stay NaN. Read the low two bytes of each selected encoding.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        underflow = mul(negative, lt(const(0x4e3f), magnitude))
@@ -2298,6 +2482,7 @@ Advertise EXP2 and dispatch its FP16 input:
 +           Ops.AND: CMP, Ops.XOR: CMP, Ops.OR: CMP, Ops.TRUNC: CMP, Ops.MULACC: CMP, Ops.CDIV: CMP, Ops.CMOD: CMP, Ops.SQRT: CMP, Ops.EXP2: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
            elif u.op is Ops.SQRT and u.dtype == dtypes.half:
@@ -2320,13 +2505,20 @@ The EXP2-only helper reconstructed from these diffs also passed all 65,536 half 
 
 ## Ops.LOG2
 
-TOREVIEW1: Try tinygrad's existing LOG2 decomposition first:
-
 ```bash
 $ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
 ```
+TOREVIEW1: This time the separate forced-decomposition run, without TRACE, finished and exceeded the test tolerance. Excerpt:
 
-The fresh forced-decomposition batch timed out here after 120 seconds in ioctl. We do not yet know whether the cause is task volume or a hardware-state problem. This does not establish a numeric error in tinygrad's LOG2 formula.
+```text
+ [10, 18]: -0.225830078125 (ACTUAL), -0.22607421875 (DESIRED)
+Max absolute difference among violations: 0.0007324
+Max relative difference among violations: 0.00156
+Ran 1 test in 126.416s
+FAILED (errors=1)
+```
+
+The earlier pytest batch stopped at its 120-second timeout; this standalone run was allowed 150 seconds. We now have an accuracy failure in the decomposed path on this backend, not just a timeout. Trace the intermediate operations or compare another backend before attributing it to the polynomial itself. This probe uses current primitive support, so it is not a promise that the earlier tutorial code reaches the same result.
 
 Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
 
@@ -2366,6 +2558,7 @@ Extract the exponent from the positive FP32 encoding, restore the mantissa, and 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        bits = alloc(b"".join(raw[i:i+2]+bytes(2) for i in range(0, 16, 2)))
@@ -2397,6 +2590,7 @@ The reduced fraction uses the same half-weight layout and Horner evaluator. LOG2
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        weights = half_weights(fraction)
@@ -2414,6 +2608,7 @@ Keep EXP2's masks in its branch. LOG2 selects +inf for +inf, NaN for negative in
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        negative = lt(const(32767), bits)
@@ -2449,6 +2644,7 @@ Enable LOG2:
 +           Ops.SQRT: CMP, Ops.EXP2: CMP, Ops.LOG2: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -          elif u.op is Ops.EXP2 and u.dtype == dtypes.half:
@@ -2470,21 +2666,18 @@ The EXP2+LOG2 stage passed all 65,536 LOG2 inputs and test_log2: `2 passed in 72
 
 ## Ops.SIN
 
-TOREVIEW1: Try tinygrad's existing SIN decomposition first:
-
 ```bash
 $ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_sin
 ```
+TOREVIEW1: The separate forced-decomposition run, without TRACE, gives:
 
-The separate rerun captured the first missing primitive:
-
-```bash
-$ TRANSCENDENTAL=2 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q -x --tb=short \
-    test/backend/test_ops.py::TestOps::test_sin
-
+```text
 NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.ushort
-1 failed in 3.63s
+Ran 1 test in 0.233s
+FAILED (errors=1)
 ```
+
+
 
 So first investigate UINT16 SHR support, then rerun the existing decomposition. We have not reached a sine accuracy failure; this does not justify replacing it with the custom polynomial or a LUT yet.
 
@@ -2523,6 +2716,7 @@ SIN also needs multipliers made from NPU-produced half encodings. Add word_weigh
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          half = calc(-1, value, output=2)
@@ -2545,6 +2739,7 @@ Reduce x by q*pi/2, using the split q and split constants. Then evaluate the sin
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        bits = alloc(b"".join(raw[i:i+2]+bytes(2) for i in range(0, 16, 2)))
@@ -2569,6 +2764,7 @@ Next evaluate sin(r) and cos(r), then restore the FP32 reduction residual e. Rou
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          for c in (1.5703125, 0.0004837512969970703125, math.pi/2-1.5703125-0.0004837512969970703125):
@@ -2596,6 +2792,7 @@ The odd-quadrant mask selects sine or cosine. A half multiplier with the selecte
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          sin_r = calc(2, sine, calc(-1, residual, bs_mul=half_weights(cosine)))
@@ -2614,6 +2811,7 @@ SIN has already produced scaled. Keep the EXP2/LOG2 polynomial path separate.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
          exponent = add(sub(exponent, const(127)), upper)
@@ -2643,6 +2841,7 @@ Correct those observed boundaries symmetrically by magnitude. Keep negative zero
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list) -> list:
 @@
        negative = lt(const(32767), bits)
@@ -2669,6 +2868,7 @@ Enable SIN:
 +           Ops.SQRT: CMP, Ops.EXP2: CMP, Ops.LOG2: CMP, Ops.SIN: CMP}
 @@
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
 -          elif u.op in (Ops.EXP2, Ops.LOG2) and u.dtype == dtypes.half:
@@ -2710,13 +2910,17 @@ Progress: **29 / 30** paths covered. POW remains, followed by the full test_ops.
 
 ## Ops.POW
 
-TOREVIEW1: First run this at the tutorial state, before the new diffs below. Keep POW unadvertised and use tinygrad's existing lowering. The small probe recorded below is evidence for its selection problem, not a full test_pow baseline.
-
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
 ```
+TOREVIEW1: The current-runtime run, without TRACE, did not finish within the diagnostic's 150-second limit:
 
-The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+```text
+TIMEOUT after 150s; no unittest result
+```
+
+
+This run includes the later LOG2/EXP2 and WHERE fixes, so it is not a pre-change baseline. It gives no new accuracy result. The small recorded probe below remains the evidence for the old WHERE problem; do not claim this timed-out test reproduced it.
 
 POW is already expanded by tinygrad's symbolic rewrite into LOG2, MUL, EXP2 and WHERE. Before adding a POW handler, try that existing path. The recorded small probe gave NaN even for 2^3 instead of 8.
 
@@ -2809,6 +3013,7 @@ Removing a sign bit uses two additions of 2³⁰. This avoids subtracting INT32_
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list, input_dtype:DType=dtypes.half, dtype:DType=dtypes.half) -> list:
 @@
        def mul(x:int, y:int) -> int: return calc(0, x, y, 4, 4, mul=True)
@@ -2831,6 +3036,7 @@ FP32 input is already in the word layout. Keep it there; half input still uses t
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list, input_dtype:DType=dtypes.half, dtype:DType=dtypes.half) -> list:
 @@
            value = calc(2, value, const(c, "f"))
@@ -2852,6 +3058,7 @@ LOG2's FP32 output must skip the final half conversion. Its sign/magnitude masks
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list, input_dtype:DType=dtypes.half, dtype:DType=dtypes.half) -> list:
 @@
          poly = polynomial(weights, coefficients)
@@ -2888,6 +3095,7 @@ Use the appropriate input encoding for the EXP2 correction and overflow boundari
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_math(self, op:Ops, a:list, input_dtype:DType=dtypes.half, dtype:DType=dtypes.half) -> list:
 @@
        elif op is Ops.EXP2:
@@ -2920,7 +3128,6 @@ Add the composed helper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_exp2_mul_log2(self, a:list, b:list) -> list:
 +    assert len(a) == len(b)
 +    logarithms = self.run_math(Ops.LOG2, a, dtype=dtypes.float)
@@ -2972,7 +3179,6 @@ FLOOR, CEIL, MIN and MAX run in FP32 here. Converting the resulting integer-valu
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_cast(self, a:list, src_dtype:DType, dtype:DType) -> list:
 +    assert src_dtype in (dtypes.half, dtypes.float, dtypes.int) and dtype in (dtypes.half, dtypes.float, dtypes.int)
 +    result:list = []
@@ -2988,6 +3194,7 @@ Convert the source to FP32 first. The precision number selects how to read the i
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_cast(self, a:list, src_dtype:DType, dtype:DType) -> list:
 @@
          bytes(src_dtype.itemsize*(8-count))
@@ -3001,6 +3208,7 @@ For an INT32 destination, calculate truncation in FP32 first. Algorithm 7 is FLO
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_cast(self, a:list, src_dtype:DType, dtype:DType) -> list:
 @@
        self.mulacc_stage(-1, base, base+64, base+128, precision=precision)
@@ -3018,6 +3226,7 @@ Now convert the integer-valued float to the requested output format. FP16 keeps 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_cast(self, a:list, src_dtype:DType, dtype:DType) -> list:
 @@
          self.mulacc_stage(0, base+192, base+320, base+384)
@@ -3033,6 +3242,7 @@ Route the matching UOps to this helper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
          elif u.op is Ops.CAST:
@@ -3063,7 +3273,6 @@ The final 0/1 mask goes through the NPU half-to-byte converter, so the result is
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
-@@
 +  def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 +    assert op in (Ops.CMPEQ, Ops.CMPNE, Ops.CMPLT) and len(a) == len(b)
 +    result:list = []
@@ -3082,6 +3291,7 @@ Build the comparisons with the private INT32 task helper. Each constant and resu
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 @@
          if raw is not None: to_mv(self.dev.input_buf+addr-base, len(raw))[:] = raw
@@ -3102,6 +3312,7 @@ Copy each half encoding into a zero-padded INT32 lane. Detect signs, remove the 
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 @@
        def lt(x:int, y:int) -> int: return calc(1, x, y, binary=True)
@@ -3119,6 +3330,7 @@ For CMPLT, different signs select the negative operand. If both inputs are negat
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 @@
        both_zero = sub(one, lt(zero, calc(2, ma, mb)))
@@ -3132,6 +3344,7 @@ For equality, neither encoding is less than the other, or both are zero. Clear e
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 @@
          less = select(calc(5, sub(sa, sb)), sa, select(sa, ba, ab))
@@ -3146,6 +3359,7 @@ The mask is INT32 0/1. Convert it to FP32, then FP16, and feed our existing byte
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def run_half_compare(self, op:Ops, a:list, b:list) -> list:
 @@
          mask = mul(valid, equal)
@@ -3166,6 +3380,7 @@ Route the matching UOps to this helper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
+@@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
            elif u.op is Ops.SQRT and u.dtype == dtypes.half:
