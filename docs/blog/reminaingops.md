@@ -1,20 +1,28 @@
 # Remaining ops
 
-TOREVIEW1: Continue after [Ops.SHR in the blog](ops_rockchip_blog.md#opsshr), with `run_u32_shift` and the channel-aware `conv_shl_subtask`. The raw-storage and 64-bit extensions are introduced below, not assumed at the start.
+TOREVIEW1: For each new op, first run its existing test at the current tutorial stage, without advertising the new op or installing its matcher. Let tinygrad try its existing lowering, then inspect TRACE for the first missing primitive or wrong result. Not every op has a decomposition. Fix what the test exposes before choosing custom registers or a LUT.
 
-The test outputs below are the recorded runs from these implementation steps, not new runs from this writing review. Where a probe found a limit, keep that result before the fix; a passing primitive test does not prove every dtype or composed expression works.
+Pre-change runs not recorded yet are marked pending below. Existing implementation diffs and later test results are retained for comparison, not as evidence that the built-in path failed.
 
-Commands using `test/device/test_rockchip_integer.py` or `~/npu/ops_reg/probe_*.py` refer to local verification files from those runs, not files supplied by the pinned tinygrad checkout. The diffs below do not create those probe files; the ordinary `test/backend/test_ops.py` commands remain the tutorial's checkpoints.
+For the math checks, `TRANSCENDENTAL=2` forces the common decompositions even though the current renderer advertises the ops. It also lowers dependent math ops and reuses current support for their primitives, so these diagnostics are not reconstructed tutorial baselines.
+
+The fresh serial diagnostic used:
+
+```bash
+$ TRANSCENDENTAL=2 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q --tb=short \
+    test/backend/test_ops.py::TestOps::test_sin \
+    test/backend/test_ops.py::TestOps::test_exp2 \
+    test/backend/test_ops.py::TestOps::test_log2 \
+    test/backend/test_ops.py::TestOps::test_sqrt
+```
+
+SIN failed and EXP2 passed. LOG2 hit the 120-second timeout in ioctl; the process exited with signal 11 while dumping the traceback, so SQRT was not reached. There was no completed pytest summary. SIN was then rerun alone; its failure is recorded in that section.
 
 ## Ops.AND
 
 Next we will do Ops.AND.
 
-For bool inputs, AND is true only for 1 and 1. Our CAST gives FP16 0/1, so multiplying the two masks is a candidate:
-
-```text
-a, b → CAST(half) → MUL → CAST(bool)
-```
+TOREVIEW1: Before adding the bool matcher below, run `TestOps.test_and` with the current tutorial state and inspect TRACE. The isolated run recorded below already includes that matcher, so it is not the pre-change baseline. Record the first unsupported UOp before choosing a replacement; do not assume tinygrad has a general AND decomposition.
 
 | a     | b     | FP16 a * b | AND   |
 | ----- | ----- | ---------: | ----- |
@@ -23,11 +31,13 @@ a, b → CAST(half) → MUL → CAST(bool)
 | True  | False |          0 | False |
 | True  | True  |          1 | True  |
 
-1. CAST each bool to FP16 0 or 1 on the NPU.
-2. MUL gives 1 only when both inputs are 1.
-3. The result is already a 0/1 mask, so our NPU CAST can write it as a bool byte.
+For bool inputs, we can just cast both input into FP16 and MUL them.
 
-Put this in comparison_matcher, after the general rewrites, so CAST(bool) stays a CAST:
+```text
+a, b → CAST(half) → MUL → CAST(bool)
+```
+
+Lets add a pattern matcher and see if this approach works out
 
 ```diff
  class RockchipRenderer(Renderer):
@@ -37,8 +47,6 @@ Put this in comparison_matcher, after the general rewrites, so CAST(bool) stays 
 +    (UPat(Ops.AND, dtypes.bool, name="u"),
 +     lambda u: u.src[0].cast(dtypes.half).alu(Ops.MUL, u.src[1].cast(dtypes.half)).cast(dtypes.bool)),
 ```
-
-All four bool pairs passed. But running `test_and` at this stage reaches INT32 input:
 
 ```bash
 $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_and
@@ -50,7 +58,36 @@ Ran 1 test in 0.058s
 FAILED (errors=1)
 ```
 
-The failing expression is `ten & 0x1337`. MUL is not bitwise AND for whole integers: `2 * 3 = 6`, but `2 & 3 = 2`. We need another decomposition.
+Lets us comment each test case to see which caused the err.
+TOREVIEW1: Ran the existing cases separately. The current backend already supports integer AND, so this probe disabled that later dispatch in memory to reproduce this step. No test files were changed.
+
+```text
+ten & ten: PASS
+ten & 0x1337: ROCKCHIP NPU does not support Ops.AND with dtypes.int
+0x1337 & ten: ROCKCHIP NPU does not support Ops.AND with dtypes.int
+(ten & 12) & ten: ROCKCHIP NPU does not support Ops.AND with dtypes.int
+ten0 & ten1 (four bool pairs): PASS
+```
+
+The isolated bool case issued 12 NPU CAST calls and 4 NPU MUL calls, three CASTs and one MUL per pair.
+
+```python
+data = [[1,-8,1],[32,1,6]]
+tor = torch.tensor(data, dtype=torch.int)
+ten = Tensor(data, dtype=dtypes.int32)
+helper_test_op([], lambda: tor&tor, lambda: ten&ten, forward_only=True)
+helper_test_op([], lambda: tor&0x1337, lambda: ten&0x1337, forward_only=True)
+```
+
+Why didnt `ten & ten` fail first? `Ops.AND` belongs to `GroupOp.Idempotent`, and `tinygrad/uop/symbolic.py` has this rule:
+
+```python
+(UPat(GroupOp.Idempotent, src=(UPat.var("x"), UPat.var("x"))), lambda x: x),
+```
+
+So `ten & ten` becomes `ten`, with no AND to execute. The next expression, `ten & 0x1337`, still needs INT32 AND. The full test stops there; running the later bool case separately confirms our matcher works for all four pairs.
+
+MUL is not bitwise AND for whole integers: `2 * 3 = 6`, but `2 & 3 = 2`. We need another decomposition.
 
 How small should each piece be? One byte has 256 values, so a pair would need 65,536 table entries. A two-bit digit has only four values, giving 16 pairs. Lets split each byte into four base-4 digits and reuse SHR's exact floor conversion to extract them. No 32-bit-plane array is needed.
 
@@ -126,6 +163,7 @@ First extend our shared convolution helper. SHR already added a selectable chann
 +                    unsigned:bool=False, scratch_input:bool=False, channels:int=64, input_addr:int|None=None, relux:bool=False) -> None:
 @@
 +    if input_addr is not None: self.npu_regs.append(E(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_addr))
++    # Clamp integer index-t+1 to 0/1; plain ReLU would leave values above 1 and spoil the lookup sum.
 +    if relux:
 +      self.npu_regs += [
 +        E(rk.DPU, rk.REG_DPU_BN_CFG, (1 << rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT) |
@@ -134,6 +172,7 @@ First extend our shared convolution helper. SHR already added a selectable chann
 +      ]
      self.submit(cna=True)
 ```
+TOREVIEW1: Added the comment explaining why the lookup steps need ReLU-X, not plain ReLU.
 
 Keep the scratch layout explicit before writing the tasks:
 
@@ -216,7 +255,7 @@ The wrapper only packs the original words and reads the result. Unlike signed SH
 
 Advertise AND as a composite operation, not an EW algorithm number. Bool inputs still use the matcher; INT32/UINT32 use the convolution helper:
 
-TOREVIEW1: Composite helpers now dispatch before the ordinary EW gate; otherwise `CMP` would reject AND before its helper runs.
+Composite helpers now dispatch before the ordinary EW gate; otherwise `CMP` would reject AND before its helper runs.
 
 ```diff
 -CMP = 9  # Internal multi-stage comparison marker, not an EW algorithm.
@@ -261,6 +300,14 @@ OK
 The two AND helpers extracted from these diffs also passed the same test in 20.790s. The test covers INT32 inputs; the four bool pairs were checked separately. XOR is next.
 
 ## Ops.XOR
+
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Run the existing lowering before adding the bool CMPNE matcher or extending the integer lookup.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_xor
+```
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
 
 Next Ops.XOR. For bools, XOR means the two inputs are different, so reuse CMPNE:
 
@@ -360,6 +407,14 @@ The helper diffs also passed 196 INT32/UINT32 AND/XOR pairs, including negative 
 Progress: **17 / 30** paths covered. AND/XOR cover bool and INT32/UINT32 here, not every integer width.
 
 ## Ops.TRUNC
+
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Check whether TRUNC remains in the UOps before selecting native FLOOR/CEIL.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_trunc
+```
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
 
 Next Ops.TRUNC. Does the CVT right shift help here? Not directly: `2.9 >> 1` would scale the number, while TRUNC needs 2. We need to remove the fraction towards zero.
 
@@ -478,6 +533,14 @@ The earlier combined regression run gave `Ran 12 tests in 25.069s`, `OK`, with t
 
 ## Ops.OR
 
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Keep the bool OR support already introduced; test the integer cases before extending the lookup.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_or
+```
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+
 Next extend Ops.OR to INT32/UINT32. We already split and rejoin the digits for AND/XOR. OR changes which of the two bits are kept, not their positions, so only the two-bit table should change:
 
 | a   |  b=0 |  b=1 |  b=2 |  b=3 |
@@ -528,7 +591,18 @@ Four additional INT32/UINT32 Tensor checks passed (144 lanes), including broadca
 
 ## Ops.MULACC
 
-Next investigate Ops.MULACC, `a*b+c`. Why not just issue MUL then ADD? MULACC should round the combined result once; our two FP16 tasks would round the product first.
+For Ops.MULACC, which is `a*b+c`. We can try normal MUL then ADD? 
+
+TOREVIEW1: First run the existing direct-UOp test before advertising MULACC:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q -rs \
+    test/backend/test_uops.py::TestFloatUOps::test_mulacc
+```
+
+Record whether it runs, fails or skips at this stage. A skip is not a decomposition pass. The separate MUL→ADD idea below is a candidate, not evidence that tinygrad lowers a direct MULACC that way. This pre-change baseline is still pending.
+
+MULACC should round the combined result once; our two FP16 tasks would round the product first.
 
 BS MUL followed by EW ADD looks promising. BRDMA can supply b and ERDMA can supply c, keeping the product FP32 until the output converter. Lets check ordinary values, overflow cancellation, halfway rounding and signed zero. The recorded native-task probe gave:
 
@@ -937,6 +1011,16 @@ This test now passes on ROCKCHIP, not skips. It checks both buffer inputs and co
 
 ## Ops.CDIV and Ops.CMOD
 
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Inspect the division UOps first. Constant-divisor rewrites may already use shifts; they do not establish support for variable divisors.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_div_int
+```
+
+Then run `TestOps.test_fmod` separately for CMOD; inspect its UOps rather than assuming it takes the same path as division.
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
+
 Next CDIV and CMOD. We already have TRUNC, so first check the obvious candidate, FDIV → TRUNC:
 
 ```text
@@ -950,6 +1034,14 @@ Both inputs fit FP16 exactly. This is quotient rounding, not just an input CAST 
 The quotient must stay exact, so narrowing these integers to FP16 is not enough. Before implementing integer arithmetic, we need to keep their original bytes through LOAD, BITCAST and STORE.
 
 ## Ops.BITCAST
+
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Check the existing storage path first. BITCAST may need storage handling rather than arithmetic decomposition.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_bitcast
+```
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
 
 BITCAST keeps the same bytes and changes their dtype. In this interpreter the host copies storage; it does not calculate a converted value or submit a fake identity operation.
 
@@ -1056,15 +1148,18 @@ The existing guards inspect values rather than their bytes. Decode there, withou
    def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
 @@
 -      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in a):
++      # Decode each typed view for the numeric guard; keep the original input bytes for the NPU.
 +      if any(x == -math.inf or (x == 0 and math.copysign(1.0, x) < 0) for x in map(scalar16, a)):
 @@
      if op is Ops.SHL:
        assert b is not None
++      # Decode shift counts once into an indexable list for the uniform-count check and multiplier lookup.
 +      b = list(map(scalar16, b))
 @@
 -      if byte_output and any(x not in (0.0, 1.0) for x in a):
 +      if byte_output and any(scalar16(x) not in (0.0, 1.0) for x in a):
 ```
+TOREVIEW1: Added comments explaining why the guards and shift-count lookup need decoded scalars.
 
 Bool-to-half is a special case: a bool occupies one byte, but our multiplier takes INT16 0/1 lanes. Read the bool value before packing that input. The remaining Python CAST fallback also needs a scalar:
 
@@ -1120,7 +1215,7 @@ Likewise an INDEX needs an integer offset:
 
 The convolution wrappers only copy original/final storage. Change their packing boundary too; the register sequences stay the same:
 
-TOREVIEW1: Apply the storage change once to the shared shift wrapper:
+Apply the storage change once to the shared shift wrapper:
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -1164,6 +1259,8 @@ MULACC keeps its arithmetic unchanged as well. Copy the original FP16 bytes in a
 The bit-pattern checks passed all 65,536 FP16 encodings, all 65,536 BF16 encodings, and selected FP32/FP64 zeros, infinities and NaN payloads. The existing test_bitcast passed with its default FP32 inputs.
 
 ## Ops.CDIV and Ops.CMOD: exact integer arithmetic
+
+TOREVIEW1: Continue from the division baseline above. Only introduce the exact-integer helper for the missing operations observed there. The FDIV→TRUNC counterexample rules out that candidate, not every existing tinygrad rewrite.
 
 Now the original bytes survive the interpreter. How can we divide without FP16 rounding? Reuse the base-256 representation from shifts: each byte is a limb in 0..255. A padded INT32 lane can hold a byte product and carry exactly.
 
@@ -1587,7 +1684,20 @@ The focused checks passed 88 subtests across signed and unsigned 8/16/32/64-bit 
 
 ## Ops.THREEFRY
 
-Next THREEFRY. Before adding another register mode, check what tinygrad already lowers. `codegen/decomp/op.py` supplies the rounds using wrapping ADD, shifts and XOR. We have those UINT32 operations now, so leave THREEFRY out of code_for_op and inspect what its split/join needs.
+TOREVIEW1: Lets run the existing THREEFRY test first:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q \
+    test/device/test_rockchip_integer.py::TestRockchipInteger::test_threefry
+
+1 passed in 3.01s
+```
+
+This run checks five UINT64 counter/key pairs against CPU, including full-width values. It uses the current runtime, which already has the split/join helpers shown below; it is not a test of the earlier tutorial state.
+
+TOREVIEW1: Repeat this test at the pre-change tutorial state before adding the split/join diffs. Record the first unsupported UOp; the current-runtime pass alone does not establish which helper was missing then.
+
+Why does it pass without a THREEFRY entry in ops_map? Check what tinygrad already lowers. `codegen/decomp/op.py` supplies the rounds using wrapping ADD, shifts and XOR. We have those UINT32 operations now, so leave THREEFRY out of code_for_op and inspect what its split/join needs.
 
 One round mixes two UINT32 words:
 
@@ -1746,6 +1856,16 @@ The raw-storage check round-trips half and wider encodings without unpacking/rep
 Progress: **25 / 30** paths covered. Remaining: SQRT, EXP2, LOG2, POW and SIN. This is not every dtype or edge case, and the full test_ops.py sweep is still pending.
 
 ## Ops.SQRT
+
+TOREVIEW1: Try tinygrad's existing SQRT decomposition first:
+
+```bash
+$ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_sqrt
+```
+
+The forced-decomposition batch did not reach this test. This baseline remains pending; the Newton probe below is a different candidate, not a test of tinygrad's SQRT lowering.
+
+Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
 
 The 1500 branch uses 14 FP16 Newton steps. Repeating a rounded step may stop changing the answer before it reaches the correctly rounded root. Lets check that before copying the approach.
 
@@ -1972,6 +2092,16 @@ Progress: **26 / 30** paths covered. EXP2, LOG2, POW and SIN remain. The full te
 
 ## Ops.EXP2
 
+TOREVIEW1: Try tinygrad's existing EXP2 decomposition first:
+
+```bash
+$ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
+```
+
+The fresh forced-decomposition batch passed test_exp2. Keep that path as the baseline. The custom helper below is an alternative to compare for accuracy and cost, not a required fix established by this test.
+
+Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
+
 Next Ops.EXP2. A polynomial over the whole half range would be awkward. Split x into an integer n and a small fraction r instead: the exponent bits can supply 2^n, leaving only 2^r to approximate.
 
 Use the FP32 stages from MULACC to avoid rounding every polynomial step to half. The recorded BS layout probe found that an FP32 main input needs four half multipliers at offset 0 and four at offset 16; a contiguous eight-half pack only produced the first four lanes.
@@ -2059,7 +2189,13 @@ BS reads four half multipliers from each 16-byte surface. Convert the reduced fr
 +        return alloc(read(half, 8)+bytes(8)+read(half+16, 8))
 ```
 
-Evaluate the polynomial with Horner's method: start at the highest coefficient, multiply by r, then add the next coefficient. Keep every accumulated result in FP32.
+TOREVIEW1: Horner's method rewrites a polynomial as nested multiply-add steps. For example:
+
+```text
+c0 + c1*r + c2*r*r = (c2*r + c1)*r + c0
+```
+
+So we dont need to compute each power of r separately. Start at the highest coefficient, multiply by r, then add the next coefficient. Repeat down to c0, keeping every accumulated result in FP32.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -2183,6 +2319,16 @@ OK
 The EXP2-only helper reconstructed from these diffs also passed all 65,536 half encodings and test_exp2: `2 passed in 54.35s`.
 
 ## Ops.LOG2
+
+TOREVIEW1: Try tinygrad's existing LOG2 decomposition first:
+
+```bash
+$ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+```
+
+The fresh forced-decomposition batch timed out here after 120 seconds in ioctl. We do not yet know whether the cause is task volume or a hardware-state problem. This does not establish a numeric error in tinygrad's LOG2 formula.
+
+Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
 
 Next add Ops.LOG2. We can reverse the exponent split: FP32 conversion normalizes half subnormals, so x becomes m*2^n with m in [1, 2). The exponent gives n exactly. Only log2(m) needs approximation.
 
@@ -2324,7 +2470,27 @@ The EXP2+LOG2 stage passed all 65,536 LOG2 inputs and test_log2: `2 passed in 72
 
 ## Ops.SIN
 
-Next add Ops.SIN. The 1500 branch clamps the input to ±10000, which changes larger finite half inputs. Can we reduce those angles instead of clamping them?
+TOREVIEW1: Try tinygrad's existing SIN decomposition first:
+
+```bash
+$ TRANSCENDENTAL=2 TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_sin
+```
+
+The separate rerun captured the first missing primitive:
+
+```bash
+$ TRANSCENDENTAL=2 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python -m pytest -n0 -q -x --tb=short \
+    test/backend/test_ops.py::TestOps::test_sin
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.ushort
+1 failed in 3.63s
+```
+
+So first investigate UINT16 SHR support, then rerun the existing decomposition. We have not reached a sine accuracy failure; this does not justify replacing it with the custom polynomial or a LUT yet.
+
+Inspect the result before using the custom candidate below. A missing primitive is not evidence that the decomposition is inaccurate.
+
+The custom candidate below uses range reduction and polynomials. The checked 1500 branch also uses a polynomial in `_dpu_sin`, not a LUT, and clamps input to ±10000. That clamp changes larger finite half inputs, but does not prove tinygrad's own decomposition needs replacing. Compare the baseline first; a LUT is another candidate to probe, not an approach already ruled out.
 
 Subtract the nearest multiple of pi/2. The remaining angle is small enough for sine/cosine polynomials; the multiple tells us the quadrant:
 
@@ -2543,6 +2709,14 @@ Each exhaustive check covers all 65,536 FP16 bit patterns. Non-NaN outputs match
 Progress: **29 / 30** paths covered. POW remains, followed by the full test_ops.py sweep. FP32 promotion and the composed log accuracy issue above are still open.
 
 ## Ops.POW
+
+TOREVIEW1: First run this at the tutorial state, before the new diffs below. Keep POW unadvertised and use tinygrad's existing lowering. The small probe recorded below is evidence for its selection problem, not a full test_pow baseline.
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
+```
+
+The pre-change result still needs recording. The implementation below remains a candidate until that run identifies what is missing; later passing results do not replace this baseline.
 
 POW is already expanded by tinygrad's symbolic rewrite into LOG2, MUL, EXP2 and WHERE. Before adding a POW handler, try that existing path. The recorded small probe gave NaN even for 2^3 instead of 8.
 

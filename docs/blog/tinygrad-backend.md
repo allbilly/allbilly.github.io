@@ -3,24 +3,25 @@ Last update: Sep 20 2026
 
 TLDR: This blog will mainly use DPU EW op for the 28 GroupOps.ALU, treat CMAC like tensor core for GEMM/CONV if the shape matches, otherwise will just use EW add/mul for GEMM. 
 
-| Section                                                   | What we add                               |
-| --------------------------------------------------------- | ----------------------------------------- |
-| [Ops.ADD](#opsadd)                                        | Runtime setup, buffers and NPU submission |
-| [Ops.MUL](#opsmul)                                        | Decode the elementwise registers          |
-| [Ops.SUB and Ops.NEG](#opssub-and-opsneg)                 | Subtraction and unary negation            |
-| [Ops.FDIV](#opsfdiv)                                      | Division                                  |
-| [Ops.RECIPROCAL](#opsreciprocal)                          | Reuse FDIV                                |
-| [Ops.MAX](#opsmax)                                        | Test maximum and inspect its UOps         |
-| [Ops.OR](#opsor)                                          | Lower bool OR with a pattern matcher      |
-| [Ops.CAST: bool to FP16](#opscast-bool-to-fp16)           | Convert the input masks                   |
-| [Ops.CMPNE](#opscmpne)                                    | Build the comparison formula              |
-| [Ops.CAST: FP16 mask to bool](#opscast-fp16-mask-to-bool) | Write bool bytes on the NPU               |
-| [Ops.CMPEQ](#opscmpeq)                                    | Equality and input dtype handling         |
-| [Ops.CMPLT](#opscmplt)                                    | Less-than and infinity handling           |
-| [Ops.WHERE](#opswhere)                                    | Select between two inputs                 |
-| [Ops.SHL](#opsshl)                                        | INT16 multiply, then UINT32 convolution   |
-| [Ops.SHR](#opsshr)                                        | Unsigned right shift, then signed fill    |
-TODO1: no need What we add
+| Section                                                   |
+| --------------------------------------------------------- |
+| [Ops.ADD](#opsadd)                                        |
+| [Ops.MUL](#opsmul)                                        |
+| [Ops.SUB and Ops.NEG](#opssub-and-opsneg)                 |
+| [Ops.FDIV](#opsfdiv)                                      |
+| [Ops.RECIPROCAL](#opsreciprocal)                          |
+| [Ops.MAX](#opsmax)                                        |
+| [Ops.OR](#opsor)                                          |
+| [Ops.CAST: bool to FP16](#opscast-bool-to-fp16)           |
+| [Ops.CMPNE](#opscmpne)                                    |
+| [Ops.CAST: FP16 mask to bool](#opscast-fp16-mask-to-bool) |
+| [Ops.CMPEQ](#opscmpeq)                                    |
+| [Ops.CMPLT](#opscmplt)                                    |
+| [Ops.WHERE](#opswhere)                                    |
+| [Ops.SHL](#opsshl)                                        |
+| [Ops.SHR](#opsshr)                                        |
+
+TOREVIEW1: Removed the “What we add” column.
 
 Tinygrad is a zero-dependency minmial codebase (25407 core lines @20260920) to do ML in python, those lines already included a PyTorch like frontend and kernel space GPU driver down to MMIO written in user space, so makes it the perfect place to support USB3 eGPU thats can drives a car (https://www.youtube.com/watch?v=nmTepfv3Itg) and add new accelorator support. 
 
@@ -2544,9 +2545,9 @@ OK
 ## Ops.SHR
 
 Next lets do Ops.SHR, we have hardware right shift as mentioned, so it should be much easier?
-Unfortunantely no, as we need to handle UINT32 input split each byte, shift and recombine it like Ops.SHL did. 
+OUT_CVT_SHIFT shifts each calculated lane, but it does not move bits between neighbouring bytes of a UINT32 word. We still need to shift and recombine the bytes like Ops.SHL did.
 
-Taks input as `0xABCD1234`, for `0xABCD1234 >> 4` 
+Take input as `0xABCD1234`, for `0xABCD1234 >> 4`
 
 ```text
 input:       [0x34, 0x12, 0xCD, 0xAB]
@@ -2666,6 +2667,8 @@ These fit INT8, so the output converter does not need to wrap an overflowing val
 
 Lets implement these three tasks with `conv_shl_subtask`. For a general count, `r = amount%8` and output byte i reads source byte `j = i + amount//8`. Multiples of 8 only need byte selection.
 
+For the remaining bits, SHL by r gets carry with a right shift of 8-r. SHR by r keeps the current byte shifted right by r, and moves the next byte's low bits left by 8-r. At r=4 both happen to use 4, which is why we could reuse the same numbers in the example.
+
 For r=2..7, the same formulas become:
 
 ```text
@@ -2681,7 +2684,7 @@ q        = floor(s/2) = round((2*s - 1)/4)
 incoming = -128*s + 256*q
 ```
 
-That explains the -1 bias for r=1 and the three q weights 127+127+2 below. Other counts use +1 and two weights -128-128. The q copies are still at 16/20/24 and carry at 48; `17+j` selects the next byte's q.
+That explains the -1 bias for r=1 and the three q weights 127+127+2 below. Other counts use +1 and two weights -128-128. The carry formula stays the same for r=1. The q copies are still at 16/20/24 and carry at 48; `17+j` selects the next byte's q.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -2773,7 +2776,9 @@ OK
 
 Good that test_rshift pased, what about test_rshift_signed
 
-```text
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_rshift_signed
+
 test_rshift_signed (test.backend.test_ops.TestOps.test_rshift_signed) ... ERROR
 
 NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.int
@@ -2800,7 +2805,9 @@ Lets allow INT32 at the gate
 
 TOREVIEW1: Run the same test again. The shared wrapper already packs INT32 with `i`, but the convolution still fills the upper bits with zero:
 
-```text
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_rshift_signed
+
 Exception: forward pass failed shape (2, 4):
 Arrays are not equal
 
@@ -2832,7 +2839,7 @@ The four mismatches are the four negative inputs. For example, `0xABCD1234` is n
 So how can we fill the upper bits with ones for negative INT32 inputs?
 First let us find a formula that returns the fill byte, 
 
-We need a byte of `0xFF` for negative inputs and `0x00` positive one. 
+We need a byte of `0xFF` for negative inputs and `0x00` for non-negative inputs.
 As INT8 these are -1 and 0. 
 The highest byte tells us the sign of the whole word, 
 
@@ -2855,14 +2862,24 @@ Probe this with the existing `conv_shl_subtask`, selecting byte 3 with weights `
 | ------------: | ---: | --: | --: | --: | --: | --: |
 |    NPU output |   -1 |  -1 |  -1 |   0 |   0 |   0 |
 
-Now we can use that sign byte in the final convolution:
+Now how much sign fill does the last partial byte need? Its original signed value is `u + 256*sign`, where u is the unsigned high byte and sign is -1 or 0. For r=1..7:
+
+```text
+floor((u + 256*sign) / 2**r)
+  = floor(u / 2**r) + 2**(8-r)*sign
+  = carry3 + 2**(8-r)*sign
+```
+
+So we can reuse carry3 and add the sign term in the final convolution:
 
 1. Read the highest input byte as INT8: `0xAB = -85`.
 2. Compute `sign = floor(-85/128) = -1` on the NPU. Non-negative bytes give 0.
 3. Treat the missing higher bytes as this sign byte, not zero.
 4. The last partial byte adds `2**(8-r)*sign`. Here `10 + 16*(-1) = -6 = 0xFA`.
 
-Save four sign copies at offset 80. The final convolution needs 96 channels to read them; UINT32 still uses 64. Add a channels argument to `conv_shl_subtask`, keeping 64 as the default so SHL and unsigned SHR are unchanged.
+Where should we save the sign copies? The carry task starts at offset 48 and writes 32 INT8 output lanes, even though we only use four. Its output occupies 48..79, so save sign after it at 80..83. Channels are padded in groups of 32, so the final convolution needs 96 channels to reach them. UINT32 still uses 64.
+
+Add a channels argument to `conv_shl_subtask`, keeping 64 as the default so SHL and unsigned SHR are unchanged.
 
 ```text
 scratch channels    0..31           32..63           64..95
