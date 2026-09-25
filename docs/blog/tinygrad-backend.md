@@ -3,6 +3,25 @@ Last update: Sep 20 2026
 
 TLDR: This blog will mainly use DPU EW op for the 28 GroupOps.ALU, treat CMAC like tensor core for GEMM/CONV if the shape matches, otherwise will just use EW add/mul for GEMM. 
 
+| Section                                                   | What we add                               |
+| --------------------------------------------------------- | ----------------------------------------- |
+| [Ops.ADD](#opsadd)                                        | Runtime setup, buffers and NPU submission |
+| [Ops.MUL](#opsmul)                                        | Decode the elementwise registers          |
+| [Ops.SUB and Ops.NEG](#opssub-and-opsneg)                 | Subtraction and unary negation            |
+| [Ops.FDIV](#opsfdiv)                                      | Division                                  |
+| [Ops.RECIPROCAL](#opsreciprocal)                          | Reuse FDIV                                |
+| [Ops.MAX](#opsmax)                                        | Test maximum and inspect its UOps         |
+| [Ops.OR](#opsor)                                          | Lower bool OR with a pattern matcher      |
+| [Ops.CAST: bool to FP16](#opscast-bool-to-fp16)           | Convert the input masks                   |
+| [Ops.CMPNE](#opscmpne)                                    | Build the comparison formula              |
+| [Ops.CAST: FP16 mask to bool](#opscast-fp16-mask-to-bool) | Write bool bytes on the NPU               |
+| [Ops.CMPEQ](#opscmpeq)                                    | Equality and input dtype handling         |
+| [Ops.CMPLT](#opscmplt)                                    | Less-than and infinity handling           |
+| [Ops.WHERE](#opswhere)                                    | Select between two inputs                 |
+| [Ops.SHL](#opsshl)                                        | INT16 multiply, then UINT32 convolution   |
+| [Ops.SHR](#opsshr)                                        | Unsigned right shift, then signed fill    |
+TODO1: no need What we add
+
 Tinygrad is a zero-dependency minmial codebase (25407 core lines @20260920) to do ML in python, those lines already included a PyTorch like frontend and kernel space GPU driver down to MMIO written in user space, so makes it the perfect place to support USB3 eGPU thats can drives a car (https://www.youtube.com/watch?v=nmTepfv3Itg) and add new accelorator support. 
 
 "Your accelerator of choice only needs to support a total of ~25 low level ops."
@@ -15,11 +34,12 @@ We will
 - Part 4: Fail case fix by Pattern Matcher
 - Part 5: Add tests cases and Emulator for CI
 - Part 5: Issues to be solved before a PR
-- Part 6: Repeat 1 - 5 on Apple ANE
 
 U can follow among if u own an OrangePi 5 running the Orange pi Ubuntu 22.02 image.
 
 ## Part 1: modify ops_python.py as starting point to understand the NPU and implements the 25 Ops
+
+## Ops.ADD
 
 This approach was inspired by liej6799 (https://github.com/liej6799/tinygrad/blob/3588-new/tinygrad/runtime/ops_rockchip.py) who made the simplest ADD works on tinygrad while I was struggling how to port the registers and Ops I reversed (https://github.com/allbilly/npu/blob/master/include/rknnops.h) to tinygrad.
 
@@ -415,6 +435,8 @@ Great now all kernels are on ROCKCHIP and we shd uncomment the remaining cases i
 3. [(45,68), (45,68)]  : ROCKCHIP only kernels
 4. [(), ()]            : showed a CPU kernel just like (2)
 
+## Ops.MUL
+
 We passed test_add on NPU, next for MUL. To add NPU MUL support, we shdnt rely on the hardcoded hex blob any more.
 I wrote a decode script(https://github.com/allbilly/npu/blob/master/ops_reg/dump.py) to decode the RKNN weight BO, why weight u might ask, because RKNN put weight and regcmd in the same BO.
 You can use it with RKNN gdb here(https://github.com/allbilly/npu/blob/master/ops_reg/run.sh) and here(https://github.com/allbilly/npu/blob/master/ops_reg/test.gdb)
@@ -769,6 +791,8 @@ OK
 
 CPU kernel was observed when running test_mul [(), ()], with same reason mentioend in test_add
 
+## Ops.SUB and Ops.NEG
+
 next we do test_sub and test_neg, 
 test_sub is simply add Ops.SUB: 4 to ops_map, while Ops.NEG is an unary Ops, so we set Ops.NEG as default 0 and need some fix to expect single input here
 
@@ -852,6 +876,8 @@ and we already got NEG/ADD/MUL/SUB running,
 | `GroupOp.Ternary`    | —                   | `MULACC`, `WHERE`                    |
 | `Elementwise` extras | —                   | `CAST`, `BITCAST`                    |
 | **Total**            | **4 / 30**          | **26 / 30**                          |                                                                                                                                       |                                                                                                                            |
+## Ops.FDIV
+
 Just like what we did on Ops.SUB and Ops.NEG, we will expand the coverage to ops_map to see what all those DPU_EW_ALU_ALGO bring us
 
 ```diff
@@ -874,6 +900,8 @@ $ DEBUG=5 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/bac
 
 Ops.FDIV is an easy win and passed test_div, note that the NPU edge case handling is non-standard, 
 e.g.`+0 / -2` returns `+0` and `-0 / -2` returns `-0`, which is opposite of IEEE division, comparison still pass but keep this in mind, we might need to handle them with pattern matcher later. 
+
+## Ops.RECIPROCAL
 
 How about RECIPROCAL? We can do `RECIP = 1 / x` with FDIV
 
@@ -914,6 +942,8 @@ $ DEBUG=5 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/bac
 Ran 1 test in 1.322s
 OK
 ```
+
+## Ops.MAX
 
 Ops.MAX is different though, we didnt pass test_maximum (not using test_max here, its for reduction)
 
@@ -958,6 +988,8 @@ OR using VIZ=1
 $ VIZ=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_maximum
 ```
 ![alt text](image-1.png)
+
+## Ops.OR
 
 We found tinygrad rewrite Ops.MAX(dtypes.bool) into Ops.OR(dtypes.bool) for bool input, which we were only allowing dtypes.half before.
 The solution is Pattern Matcher, its rewrite the UOps tree according to a predefined rule.
@@ -1009,6 +1041,8 @@ ERROR
 NotImplementedError: ROCKCHIP NPU bool-to-half CAST is not implemented
 ```
 
+## Ops.CAST: bool to FP16
+
 As expected, NPU Ops.CAST NotImplementedError raised
 Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16)
 
@@ -1053,6 +1087,8 @@ NotImplementedError: ROCKCHIP NPU does not support Ops.CMPNE with dtypes.bool
 Ran 1 test in 0.223s
 FAILED (errors=1)
 ```
+
+## Ops.CMPNE
 
 Great, we have bool-to-FP16 Ops.CAST working on NPU already, but Ops.CMPNE still raises NotImplementedError.
 It is just the last step in our pattern matcher cast fp16 back to bool usig x != 0.0,
@@ -1289,6 +1325,8 @@ Ran 1 test in 0.135s
 OK
 ```
 
+## Ops.CAST: FP16 mask to bool
+
 test_maximum passed with our Ops.CMPNE implementation, but we got a warning of Ops.CAST emulated in python, we need to implement Ops.CAST on NPU as well.
 We can set input as fp16 and output as int8 to convert dtypes.half to dtypes.bool, the registers sequence extract from allbilly/rk3588 elementwise.py already contain int16 mode support and we just need to enable it.
 
@@ -1428,6 +1466,8 @@ NotImplementedError: ROCKCHIP NPU does not support Ops.XOR with dtypes.bool
 ```
 
 We saw NotImplementedError for Ops.XOR with dtypes.bool, Ops.XOR isnt on our TODO list so we will have a look later.
+## Ops.CMPEQ
+
 Now lets run test_cmp_eq first before adding the pattern matcher
 
 ```bash
@@ -1609,6 +1649,8 @@ Cool! test_cmp_eq all passed. We actually forgot to run test for Ops.CMPNE befor
 
 TODO: Ops.WHERE, Ops.CMPLT
 
+## Ops.CMPLT
+
 Next we will implement Ops.CMPLT first with the formula
 ```
 Ops.CMPLT(A, B) = RELU(((B-A)-ε)*2*inf)
@@ -1736,6 +1778,8 @@ Quick progress recap
 | `Elementwise` extras | `CAST` (bool → FP16, mask → bool)     | `BITCAST`                                      |
 | **Total**            | **12 / 30**                           | **18 / 30**                                    |
 
+## Ops.WHERE
+
 Next we will do Ops.WHERE, WHERE is mostly handled on hardware with `a×x + b×(1-x)` and with a spreadsheet, we can implement it ourself even official RKNN has no NPU WHERE/IF support.
 
 ```
@@ -1821,6 +1865,8 @@ OK
 ```
 
 ALL test cases in test_where passed!
+## Ops.SHL
+
 Next we will do Ops.SHL with `x << n → MUL(x, 2^n)`
 
 first extend ops_map
@@ -2494,3 +2540,451 @@ Ran 1 test in 0.289s
 
 OK
 ```
+
+## Ops.SHR
+
+Next lets do Ops.SHR, we have hardware right shift as mentioned, so it should be much easier?
+Unfortunantely no, as we need to handle UINT32 input split each byte, shift and recombine it like Ops.SHL did. 
+
+Taks input as `0xABCD1234`, for `0xABCD1234 >> 4` 
+
+```text
+input:       [0x34, 0x12, 0xCD, 0xAB]
+each >> 4:   [0x03, 0x01, 0x0C, 0x0A]
+incoming:    [0x20, 0xD0, 0xB0, 0x00]
+             ------------------------
+result:      [0x23, 0xD1, 0xBC, 0x0A] = 0x0ABCD123
+```
+
+We already calculated these pieces in SHL. `carry = floor(u/16)` is now the current byte's result, while `16*s - 256*q` supplies the incoming bits from the next higher byte.
+
+Heres the plan with the same three tasks
+
+|     Task | Stage            | Op / formula                                        | Dtype         |   Byte 0 |   Byte 1 |   Byte 2 |   Byte 3 |
+| -------: | ---------------- | --------------------------------------------------- | ------------- | -------: | -------: | -------: | -------: |
+|    Input | Original input   | `0xABCD1234`, lowest byte first                     | UINT32        |   `0x34` |   `0x12` |   `0xCD` |   `0xAB` |
+|      1.1 | CNA read         | `DATA_SIGN=1`: read the same raw bytes as signed    | INT8          |       52 |       18 |      -51 |      -85 |
+|      1.2 | CONV/CVT         | compute `q = floor((s+8)/16)`                       | INT8          |        3 |        1 |       -3 |       -5 |
+|      2.1 | CNA read         | `DATA_SIGN=0`: reread the same bytes as unsigned    | UINT8         |       52 |       18 |      205 |      171 |
+|      2.2 | CNA CVT          | subtract `128` so the values fit signed INT8        | INT8          |      -76 |     -110 |       77 |       43 |
+|      2.3 | CONV/CVT         | compute `carry = floor(u/16)`                       | INT8          |        3 |        1 |       12 |       10 |
+|      3.1 | CONV             | `16*s - 256*q` per source byte                      | accumulator   |       64 |       32 |      -48 |      -80 |
+|      3.2 | CONV weights     | select that result from next byte; top gets zero    | accumulator   |       32 |      -48 |      -80 |        0 |
+|      3.3 | Output           | incoming bits + current byte's carry                | INT8          |       35 |      -47 |      -68 |       10 |
+|   Output | Stored result    | reinterpret the four output bytes as UINT32         | UINT32        |   `0x23` |   `0xD1` |   `0xBC` |   `0x0A` |
+
+Task 1. Reuse the signed-byte correction `q` from SHL. 
+This lets Task 3 form the incoming bits as an INT8 value without overflowing.
+
+Task 1.1. Read the original bytes as signed INT8, just like SHL:
+
+```text
+on memory: [0x34, 0x12, 0xCD, 0xAB]
+INT8 s:    [  52,   18,  -51,  -85]
+```
+
+The input is still UINT32. Reading its bytes as INT8 here does not mean we are implementing signed right shift.
+
+Task 1.2. Why do we still need the SHL correction `q`? For `>> 4`, the next byte's lower 4 bits must move left into the current byte's upper half. For example, Byte 2 supplies `0xD0` to Byte 1:
+
+```text
+Byte 2:          0xCD = 1100 1101
+incoming bits:          1101 0000 = 0xD0 = -48 in INT8
+
+s = -51
+q = floor((s + 8)/16) = -3
+16*s - 256*q = -816 + 768 = -48
+```
+
+So Task 1 prepares `q`, and Task 3 will combine it with `s`. Reuse the same CONV weight 2, output offset 1 and output shift 5:
+
+```text
+q = round((2*s + 1)/32) = floor((s + 8)/16)
+
+INT8 s:    [     52,      18,      -51,      -85]
+2*s + 1:   [    105,      37,     -101,     -169]
+/ 32:      [3.28125, 1.15625, -3.15625, -5.28125]
+rounded q: [      3,       1,       -3,       -5]
+```
+
+Keep the q copies at scratch offsets 16, 20 and 24 as in SHL. 
+For this shift, Task 3 uses two copies with weights -128 and -128 to form `-256*q`.
+
+Task 2. Reuse the unsigned read and biased output right shift to get `floor(u/16)`. 
+The CNA converter still subtracts 128, and the output offset compensates for it, just like SHL.
+
+Task 2.1. Read the same bytes as UINT8 with `DATA_SIGN=0`. We need `0xCD >> 4 = 12`, not the signed result `-51 >> 4 = -4`:
+
+```text
+on memory: [0x34, 0x12, 0xCD, 0xAB]
+UINT8 u:   [  52,   18,  205,  171]
+u >> 4:    [   3,    1,   12,   10]
+```
+
+Task 2.2. The convolution still calculates with signed INT8, so the CNA converter subtracts 128:
+
+```text
+UINT8 u:   [ 52,   18, 205, 171]
+u - 128:   [-76, -110,  77,  43]
+```
+
+This subtraction happens while reading the input, not in a separate `Ops.SUB` task. We compensate for it in the output offset.
+
+Task 2.3. Reuse CONV weight 2, output offset 241 and output shift 5 from SHL:
+
+```text
+carry = floor(u/16)
+      = round((2*u - 15)/32)
+      = round((2*(u - 128) + 241)/32)
+
+u - 128:       [     -76,     -110,      77,       43]
+2*(u-128):     [    -152,     -220,     154,       86]
++ 241:         [      89,       21,     395,      327]
+/ 32:          [2.78125,  0.65625, 12.34375, 10.21875]
+rounded carry: [       3,        1,      12,       10]
+```
+
+The output shift rounds, but the bias makes it give exactly `floor(u/16)`. Multiplying by 2 keeps the numerator odd, so there are no 0.5 rounding ties.
+
+Task 3. Change which byte each convolution output selects.
+SHL combined the current shifted byte with the previous byte's carry; 
+SHR combines the next byte's shifted bits with the current byte's carry. 
+
+Task 3.1. Reuse the SHL correction `16*s - 256*q` to get each source byte's low four bits in the upper half of an INT8 byte.
+
+Task 3.2. The convolution weights now select that value from the next higher byte, not the current byte. This changes the direction of bit movement; no Python lane rearrangement is needed.
+
+Task 3.3. Add the current byte's carry in the same convolution:
+
+```text
+out[0] =  3 + (16*18  - 256*1)  =  35 = 0x23
+out[1] =  1 + (16*-51 - 256*-3) = -47 = 0xD1
+out[2] = 12 + (16*-85 - 256*-5) = -68 = 0xBC
+out[3] = 10 + 0                =  10 = 0x0A
+```
+These fit INT8, so the output converter does not need to wrap an overflowing value. The four stored bytes already give `0x0ABCD123`.
+
+Lets implement these three tasks with `conv_shl_subtask`. For a general count, `r = amount%8` and output byte i reads source byte `j = i + amount//8`. Multiples of 8 only need byte selection.
+
+For r=2..7, the same formulas become:
+
+```text
+q        = round((2*s + 1) / 2**(r+1))
+incoming = 2**(8-r)*s - 256*q
+carry    = round((2*(u-128) + 256-(2**r-1)) / 2**(r+1))
+```
+
+What about r=1? The incoming bit needs weight +128, which does not fit INT8. Use -128 instead: an odd byte should supply `0x80 = -128`, and an even byte should supply 0. Since `s - 2*floor(s/2)` is its low bit:
+
+```text
+q        = floor(s/2) = round((2*s - 1)/4)
+incoming = -128*s + 256*q
+```
+
+That explains the -1 bias for r=1 and the three q weights 127+127+2 below. Other counts use +1 and two weights -128-128. The q copies are still at 16/20/24 and carry at 48; `17+j` selects the next byte's q.
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
++  def conv_shr(self, raw:bytes, amount:int) -> bytes:
++    output_addr = self.dev.output_mem.dma_addr
++    to_mv(self.dev.input_buf, 128)[:] = raw+bytes(128-len(raw))
++    # displacement selects whole bytes; residual is the remaining 0..7 bits.
++    residual, displacement = amount%8, amount//8
++    if residual == 0:
++      # Whole-byte shift: select higher bytes and leave missing bytes zero.
++      self.conv_shl_subtask([[int(j==i+displacement) for j in range(4)] for i in range(4)], output_addr)
++    else:
++      # Task 1: correction for the next byte's low bits, shifted left by 8-r.
++      self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
++                         self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
++      # Task 2: unsigned current byte shifted right by r, rounded down exactly.
++      self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
++                         self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
++      weights = [[0]*64 for _ in range(4)]
++      for i in range(4):
++        # Output byte i gets source byte j and incoming bits from j+1.
++        j = i+displacement
++        if j >= 4: continue
++        weights[i][48+j] = 1
++        if j < 3:
++          if residual == 1:
++            # +128 cannot be an INT8 weight: use -128*s + (127+127+2)*q.
++            weights[i][j+1] = -128
++            weights[i][17+j], weights[i][21+j], weights[i][25+j] = 127, 127, 2
++          else:
++            # Two q copies let INT8 weights supply -256*q.
++            weights[i][j+1] = 2**(8-residual)
++            weights[i][17+j] = weights[i][21+j] = -128
++      # Task 3: current carry plus incoming bits, already in output byte order.
++      self.conv_shl_subtask(weights, output_addr, scratch_input=True)
++    return bytes(to_mv(self.dev.output_buf, 4))
+```
+
+TOREVIEW1: Reuse SHL's packing loop. Rename it to `run_u32_shift` and select the convolution with op; input and output packing stay unchanged.
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+-  def run_u32_shl(self, a:list, b:list, dtype:DType) -> list:
++  def run_u32_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
++    assert op in (Ops.SHL, Ops.SHR)
+     if not b or not all_same(b) or not 0 <= b[0] <= 31:
+-      raise NotImplementedError("ROCKCHIP UINT32 SHL requires one uniform shift count in 0..31")
++      raise NotImplementedError("ROCKCHIP 32-bit shift requires one uniform shift count in 0..31")
+     fmt = "<I" if dtype == dtypes.uint else "<i"
+-    return [struct.unpack(fmt, self.conv_shl(struct.pack(fmt, x), int(b[0])))[0] for x in a]
++    conv = self.conv_shl if op is Ops.SHL else self.conv_shr
++    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0])))[0] for x in a]
+```
+
+Add SHR to ops_map, allow UINT32 SHR at the gate, then dispatch it:
+
+```diff
+ ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
+-           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0}
++           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0, Ops.SHR: 0}
+@@
+ class RockchipProgram(Program['RockchipDevice']):
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+           if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
+-             u.dtype not in ((dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
++             u.dtype not in ((dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else
++                             (dtypes.uint,) if u.op is Ops.SHR else (dtypes.half,)):
+             raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
+           elif u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
+-            values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
++            values[u] = self.run_u32_shift(Ops.SHL, src_values[0], src_values[1], u.dtype)
++          elif u.op is Ops.SHR and u.dtype == dtypes.uint:
++            values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
+```
+
+Run the unsigned case first:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_rshift
+
+test_rshift (__main__.TestOps.test_rshift) ... ok
+
+Ran 1 test in 0.260s
+
+OK
+```
+
+Good that test_rshift pased, what about test_rshift_signed
+
+```text
+test_rshift_signed (test.backend.test_ops.TestOps.test_rshift_signed) ... ERROR
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.int
+
+Ran 1 test in 0.166s
+
+FAILED (errors=1)
+```
+
+Lets allow INT32 at the gate
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
+-                             (dtypes.uint,) if u.op is Ops.SHR else (dtypes.half,)):
++                             (dtypes.int, dtypes.uint) if u.op is Ops.SHR else (dtypes.half,)):
+@@
+-          elif u.op is Ops.SHR and u.dtype == dtypes.uint:
++          elif u.op is Ops.SHR and u.dtype in (dtypes.int, dtypes.uint):
+             values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
+```
+
+TOREVIEW1: Run the same test again. The shared wrapper already packs INT32 with `i`, but the convolution still fills the upper bits with zero:
+
+```text
+Exception: forward pass failed shape (2, 4):
+Arrays are not equal
+
+Mismatched elements: 4 / 8 (50%)
+Mismatch at indices:
+ [0, 0]: 1073741823 (ACTUAL), -1 (DESIRED)
+ [0, 1]: 1073741823 (ACTUAL), -1 (DESIRED)
+ [1, 1]: 536870912 (ACTUAL), -536870912 (DESIRED)
+ [1, 3]: 1073741823 (ACTUAL), -1 (DESIRED)
+
+Ran 1 test in 0.170s
+
+FAILED (errors=1)
+```
+
+So why half of the result got mismatch?
+The four mismatches are the four negative inputs. For example, `0xABCD1234` is negative as INT32 because its highest bit is 1:
+
+| Stage                   | UINT32 >> 4   | INT32 >> 4         |
+| ----------------------- | ------------- | ------------------ |
+| Input bytes             | `34 12 CD AB` | `34 12 CD AB`      |
+| Top byte in binary      | `1010 1011`   | `1010 1011`        |
+| Keep its upper 4 bits   | `____ 1010`   | `____ 1010`        |
+| Fill the empty 4 bits   | zeros: `0000` | sign bit 1: `1111` |
+| Combined top byte       | `0000 1010`   | `1111 1010`        |
+| Top byte after shifting | `0A`          | `FA`               |
+| Result bytes            | `23 D1 BC 0A` | `23 D1 BC FA`      |
+
+So how can we fill the upper bits with ones for negative INT32 inputs?
+First let us find a formula that returns the fill byte, 
+
+We need a byte of `0xFF` for negative inputs and `0x00` positive one. 
+As INT8 these are -1 and 0. 
+The highest byte tells us the sign of the whole word, 
+
+TOREVIEW1: INT8 spans -128..127. Dividing by 128 puts negative values in [-1, 0) and non-negative values in [0, 1). Rounding down therefore gives exactly the -1 or 0 fill byte we need:
+
+```text
+negative high byte: -128..-1  -> floor(s/128) = -1
+other high byte:       0..127 -> floor(s/128) =  0
+```
+
+Our biased CVT already gives floor division. With divisor 128, use CONV weight 2, output offset `-(128-1) = -127` and output shift 8:
+
+```text
+sign = round((2*s - 127)/256) = floor(s/128)
+```
+
+Probe this with the existing `conv_shl_subtask`, selecting byte 3 with weights `[0, 0, 0, 2]`. All 256 signed-byte inputs passed; some results were:
+
+| Signed byte s | -128 | -85 |  -1 |   0 |   1 | 127 |
+| ------------: | ---: | --: | --: | --: | --: | --: |
+|    NPU output |   -1 |  -1 |  -1 |   0 |   0 |   0 |
+
+Now we can use that sign byte in the final convolution:
+
+1. Read the highest input byte as INT8: `0xAB = -85`.
+2. Compute `sign = floor(-85/128) = -1` on the NPU. Non-negative bytes give 0.
+3. Treat the missing higher bytes as this sign byte, not zero.
+4. The last partial byte adds `2**(8-r)*sign`. Here `10 + 16*(-1) = -6 = 0xFA`.
+
+Save four sign copies at offset 80. The final convolution needs 96 channels to read them; UINT32 still uses 64. Add a channels argument to `conv_shl_subtask`, keeping 64 as the default so SHL and unsigned SHR are unchanged.
+
+```text
+scratch channels    0..31           32..63           64..95
+                    s + q copies   carry at 48     sign copies at 80..83
+UINT32 Task 3       <--------- 64 channels -------->
+INT32 Task 3        <---------------- 96 channels ---------------->
+
+0xABCD1234 >>4:     out[3] = carry3 + 16*sign = 10 + 16*(-1) = -6 = 0xFA
+```
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+-  def conv_shl_subtask(self, weights:list[list[int]], out_addr:int, offset:int=0, shift:int=0, unsigned:bool=False, scratch_input:bool=False) -> None:
++  def conv_shl_subtask(self, weights:list[list[int]], out_addr:int, offset:int=0, shift:int=0,
++                       unsigned:bool=False, scratch_input:bool=False, channels:int=64) -> None:
+     E = self.EMIT
+@@
+-    # Defaults select signed input and the four-byte layout; scratch_input=True selects 64 scratch channels.
++    # Defaults select signed input and the four-byte layout; scratch_input=True selects channels scratch lanes.
+@@
+-    k = 64 if scratch_input else 32 # Tasks 1/2 use 32 lanes; task 3 uses 64 scratch lanes for s, q and carry.
++    k = channels if scratch_input else 32 # SHL/UINT32 SHR use 64 scratch lanes; signed SHR needs 96 including sign.
+@@
+-    # Task 3 reads 64 signed scratch channels instead of the initial 32.
++    # Task 3 reads signed scratch channels instead of the initial 32.
+```
+
+Add the sign task before building the final weights. Whole-byte signed shifts also need this task, but do not need q or carry:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+-  def conv_shr(self, raw:bytes, amount:int) -> bytes:
++  def conv_shr(self, raw:bytes, amount:int, signed:bool=False) -> bytes:
+@@
+-    if residual == 0:
++    if residual == 0 and not signed:
+@@
+     else:
+-      # Task 1: correction for the next byte's low bits, shifted left by 8-r.
+-      self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
+-                         self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
+-      # Task 2: unsigned current byte shifted right by r, rounded down exactly.
+-      self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
+-                         self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
+-      weights = [[0]*64 for _ in range(4)]
++      if residual:
++        # Only partial-byte shifts need q and carry; whole-byte shifts skip these tasks.
++        self.conv_shl_subtask([[2*int(j==i%4) for j in range(4)] for i in range(12)],
++                           self.dev.input_mem.dma_addr+16, offset=-1 if residual == 1 else 1, shift=residual+1)
++        self.conv_shl_subtask([[2*int(j==i) for j in range(4)] for i in range(4)],
++                           self.dev.input_mem.dma_addr+48, offset=256-(2**residual-1), shift=residual+1, unsigned=True)
++      if signed:
++        # Read byte 3 and write four copies of floor(signed_byte3/128), either -1 or 0.
++        self.conv_shl_subtask([[0, 0, 0, 2] for _ in range(4)], self.dev.input_mem.dma_addr+80, offset=-127, shift=8)
++      # Include sign at offset 80 in the final convolution's input channels.
++      channels = 96 if signed else 64
++      weights = [[0]*channels for _ in range(4)]
+```
+
+TOREVIEW1: We have prepared the sign byte. Next wire it into Task 3's weights, as planned: use it for a missing whole byte, or scale it for the missing bits of the top byte:
+
+| Output case            | Old unsigned weights   | Signed weights                  |
+| ---------------------- | ---------------------- | ------------------------------- |
+| j >= 4: no source byte | all zero               | sign at 80 × 1                  |
+| j < 4, residual = 0    | select original byte j | same, no q/carry needed         |
+| j < 3, residual > 0    | carry j + incoming j+1 | same, next source byte exists   |
+| j = 3, residual > 0    | carry3 only            | carry3 + sign × 2**(8-residual) |
+
+For residual 1, the last row needs weight +128. Use sign copies at 80 and 81 with weights 64+64, because each weight must fit INT8.
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+   def conv_shr(self, raw:bytes, amount:int, signed:bool=False) -> bytes:
+@@
+         j = i+displacement
+-        if j >= 4: continue
++        if j >= 4:
++          # j is outside the four-byte input; signed SHR fills with the sign byte.
++          if signed: weights[i][80] = 1
++          continue
++        if residual == 0:
++          # No remaining bit shift: copy the selected whole byte directly.
++          weights[i][j] = 1
++          continue
+         weights[i][48+j] = 1
+@@
+             weights[i][j+1] = 2**(8-residual)
+             weights[i][17+j] = weights[i][21+j] = -128
++        elif signed:
++          # +128 does not fit an INT8 weight; use two copies of sign.
++          if residual == 1: weights[i][80] = weights[i][81] = 64
++          else: weights[i][80] = 2**(8-residual)
+@@
+-      self.conv_shl_subtask(weights, output_addr, scratch_input=True)
++      self.conv_shl_subtask(weights, output_addr, scratch_input=True, channels=channels)
+```
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+   def run_u32_shift(self, op:Ops, a:list, b:list, dtype:DType) -> list:
+@@
+     conv = self.conv_shl if op is Ops.SHL else self.conv_shr
+-    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0])))[0] for x in a]
++    kwargs = {"signed": dtype == dtypes.int} if op is Ops.SHR else {}
++    return [struct.unpack(fmt, conv(struct.pack(fmt, x), int(b[0]), **kwargs))[0] for x in a]
+```
+
+Now test signed SHR separately:
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_rshift_signed
+
+test_rshift_signed (__main__.TestOps.test_rshift_signed) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.301s
+
+OK
+```
+
+Both tests passed. The convolution selects and combines the bytes; OUT_CVT_SHIFT does the rounded right shift. Python packs the input and reads the result, not rearranges the result bytes.
+
+The helpers reconstructed from these diffs also passed 512 UINT32 and 512 INT32 SHR cases across counts 0..31, plus 56 SHL cases. This check reused the runtime's device allocation and EMIT, but used the blog's register builder, submit and convolution helpers.
+
+This helper accepts one uniform count in 0..31 per call. With NOOPT=1, the test's per-element counts reach it one lane at a time and pass. A single call containing different counts still raises; this is not optimized vector-count support.
