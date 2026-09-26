@@ -84,7 +84,7 @@ The sequential replay checks use Python 3.12.12, NumPy 2.5.3, CPU Torch 2.14.0, 
 This is because RockchipDevice was not found in our new ops_rockchip.py. Lets replace all "Python" with "Rockchip"
 
 ```diff
-+ops_map = {Ops.ADD: 2}
++supported_ops = {Ops.ADD}
 +
 -class PythonProgram(Program['PythonDevice']):
 -  def __init__(self, dev:'PythonDevice', obj:TinyELF):
@@ -107,7 +107,7 @@ This is because RockchipDevice was not found in our new ops_rockchip.py. Lets re
 -class PythonRenderer(Renderer):
 +class RockchipRenderer(Renderer):
 -  code_for_op = python_alu
-+  code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
++  code_for_op = dict.fromkeys(supported_ops)
 -  compiler = PythonCompiler()
 +  compiler = RockchipCompiler()
 
@@ -334,10 +334,10 @@ and then pack our inputs
 @@
    def __init__(self, dev:'RockchipDevice', obj:TinyELF):
      self.dev = dev
-+    self.ops_map = ops_map
++    self.supported_ops = supported_ops
 ```
 
-`self.ops_map` uses the shared module-level map introduced above. It currently contains only ADD, whose EW algorithm code is 2. At this step the runtime uses map membership to select the NPU execution path, and the renderer uses the same keys to select code-generation rewrites. The captured register sequence remains hardcoded for ADD.
+`self.supported_ops` uses the shared module-level set introduced above. It currently contains only ADD. At this step the runtime uses set membership to select the NPU execution path, and the renderer uses the same set to select code-generation rewrites. The captured register sequence remains hardcoded for ADD.
 
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
@@ -360,7 +360,7 @@ but exec_alu() is still doing the calculation on CPU and stores result to values
 ```diff
 -          values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
 +          if dtypes.is_float(u.dtype):
-+            if u.op not in self.ops_map or u.dtype != dtypes.half:
++            if u.op not in self.supported_ops or u.dtype != dtypes.half:
 +              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 +            values[u] = self.add(*src_values)
 +          else:
@@ -638,9 +638,16 @@ Now replace the hardcoded hex blob in npu_regs in RockchipProgram.
 Note that `elementwise.py` is desiged to be single python file so it uses hardcoded numeric shifts
 Here we use the `rk` shifts CONSTANT from autogen 
 
+supported_ops lists the UOps we accept. ew_alu_algo lists the hardware ALU selectors; having a selector in that table does not enable a new UOp. MUL uses the multiplier, so its ALU selector stays 0.
+
+The reference uses MUL by -1 for NEG. Probing EW selector 6 also negated finite values, signed zeros and infinities, so we use that native NEG mode here. It needs no immediate -1 register.
+
 ```diff
--ops_map = {Ops.ADD: 2}
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0}
+-supported_ops = {Ops.ADD}
++supported_ops = {Ops.ADD, Ops.MUL}
++
++ew_alu_algo = {"MAX": 0, "MIN": 1, "ADD": 2, "DIV": 3, "SUB": 4, "ABS": 5, "NEG": 6, "FLOOR": 7, "CEIL": 8}
++op_to_ew = {Ops.ADD: "ADD", Ops.SUB: "SUB", Ops.MAX: "MAX", Ops.FDIV: "DIV", Ops.NEG: "NEG"}
 +
 +def fp16(value:float) -> int: return int.from_bytes(struct.pack("<e", value), "little")
 @@
@@ -651,11 +658,18 @@ Here we use the `rk` shifts CONSTANT from autogen
 @@
 +    self.npu_regs:list[int] = []
 +
-+  def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
++  def build_registers(self, op:Ops, int16_mode:bool=False, arg:tuple[str, DType]|None=None, byte_output:bool=False,
 +                      input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 +    E = self.EMIT
-+    exp_shift = custom == "fp16_exponent_shift_minus(16)"
-+    assert custom is None or (op is Ops.CUSTOM and custom == "fp16_exponent_shift_minus(16)" and not int16_mode)
++    exp_shift = arg == ("fp16_exponent_shift_minus(16)", dtypes.half)
++    unary = op in GroupOp.Unary
++    # MUL uses the multiplier, so its ALU selector stays 0.
++    if op is Ops.CUSTOM:
++      alu_algo = ew_alu_algo.get(arg[0], 0)
++    else:
++      alu_algo = ew_alu_algo[op_to_ew[op]] if op in op_to_ew else 0
++    if op not in op_to_ew and op not in (Ops.MUL, Ops.NEG, Ops.CUSTOM):
++      raise NotImplementedError(f"ROCKCHIP requires lowering or a dedicated handler for {op}")
 +    pc_enable = 0x80 # E adds 1: operation-enable target 0x0081, distinct from rk.PC (PC register writes).
 +    precision = 1 if int16_mode else 2
      self.npu_regs = [
@@ -716,12 +730,12 @@ Here we use the `rk` shifts CONSTANT from autogen
 +        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) if exp_shift or byte_output else
 +        (1 << rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT) |
 +        (2 << rk.DPU_EW_CFG_EDATA_SIZE__SHIFT) |
-+        (self.ops_map[op] << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
++        (alu_algo << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT) |
-+        ((not int16_mode and op in (Ops.MUL, Ops.NEG, Ops.FDIV)) << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) |
++        ((not int16_mode and op in (Ops.MUL, Ops.FDIV)) << rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT) |
 +        (1 << rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT) |
-+        ((op is not Ops.NEG) << rk.DPU_EW_CFG_EW_OP_SRC__SHIFT) |
-+        ((op in (Ops.MUL, Ops.NEG)) << rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT)),
++        ((not unary) << rk.DPU_EW_CFG_EW_OP_SRC__SHIFT) |
++        ((op is Ops.MUL) << rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE, 1),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0),
 +      E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, (16 if exp_shift else 0) << rk.DPU_OUT_CVT_SHIFT_MINUS_EXP__SHIFT),
@@ -737,7 +751,7 @@ Here we use the `rk` shifts CONSTANT from autogen
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
 +        (1 << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT) |
 +        (2 << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT) |
-+        ((exp_shift or op is Ops.NEG) << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE__SHIFT)),
++        ((exp_shift or unary) << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE__SHIFT)),
 +      E(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, self.dev.output_mem.dma_addr if output_addr is None else output_addr),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, self.dev.input_mem.dma_addr if input_addr is None else input_addr),
 +      E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
@@ -759,9 +773,7 @@ Here we use the `rk` shifts CONSTANT from autogen
 +        E(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, (1 if byte_output else 2) << rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT),
 +        E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, 2 << rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__SHIFT),
 +      ]
-+    if op is Ops.NEG:
-+      self.npu_regs.append(E(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, fp16(-1.0)))
-+    else:
++    if not unary:
 +      self.npu_regs.append(E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
 +                            self.dev.weight_mem.dma_addr if weight_addr is None else weight_addr))
 +    self.npu_regs.append(E(pc_enable, rk.REG_PC_OPERATION_ENABLE,
@@ -774,7 +786,7 @@ Here we use the `rk` shifts CONSTANT from autogen
      result:list = []
 @@
            if dtypes.is_float(u.dtype):
-             if u.op not in self.ops_map or u.dtype != dtypes.half:
+             if u.op not in self.supported_ops or u.dtype != dtypes.half:
                raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 -            values[u] = self.add(*src_values)
 +            values[u] = self.alu(u.op, *src_values)
@@ -782,7 +794,7 @@ Here we use the `rk` shifts CONSTANT from autogen
              values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
 ```
 
-The decoded builder includes both operand routes. Binary ADD and MUL use `EW_OP_SRC=1` and read the second tensor through ERDMA. NEG uses the MUL datapath with `EW_OP_SRC=0`, reads FP16 `-1.0` from `EW_OP_VALUE_0`, and disables ERDMA. The FDIV converter settings are here too. Neither NEG nor FDIV is exposed in `ops_map` yet; this keeps the register setup together while the next step still tests only ADD and MUL.
+The decoded builder includes both operand routes. Binary ADD and MUL use `EW_OP_SRC=1` and read the second tensor through ERDMA. Native NEG uses `EW_OP_SRC=0` and disables ERDMA. The FDIV converter settings are here too. Neither NEG nor FDIV is exposed in `supported_ops` yet; this keeps the register setup together while the next step still tests only ADD and MUL.
 
 The builder also carries the example's `CAST_BOOL_HALF` INT16 mode and `CAST_HALF_BOOL` byte-output mode now, but does not expose those CASTs to tinygrad yet. Both paths explicitly initialize their register state. The optional DMA addresses keep the example's variable input/weight/output addresses; omitting them uses the device's default buffers. The exponent-shift mode multiplies by 1 and adjusts the exponent; its MUL inf input will be a separate UOp.
 
@@ -831,17 +843,20 @@ CPU kernel was observed when running test_mul [(), ()], with same reason mentioe
 ## Ops.SUB and Ops.NEG
 
 next we do test_sub and test_neg, 
-test_sub is simply add Ops.SUB: 4 to ops_map, while Ops.NEG is an unary Ops, so we set Ops.NEG as default 0 and need some fix to expect single input here
+test_sub is simply add Ops.SUB to supported_ops, while Ops.NEG is an unary Ops, so we use its native ALU mode and need some fix to expect single input here
 
 
 ```diff
--ops_map = {Ops.ADD: 2, Ops.MUL: 0}
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0}
+-supported_ops = {Ops.ADD, Ops.MUL}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG}
 @@
 -  def alu(self, op:Ops, a:list[float], b:list[float]) -> list[float]:
 +  def alu(self, op:Ops, a:list[float], b:list[float]|None=None) -> list[float]:
 -    assert b is not None and len(a) == len(b)
-+    assert (b is None and op is Ops.NEG) or (b is not None and len(a) == len(b))
++    if b is None:
++      assert op in GroupOp.Unary
++    else:
++      assert len(a) == len(b)
      self.build_registers(op)
 @@
 -      lanes, rhs = a[start:start+8], b[start:start+8]
@@ -913,13 +928,14 @@ and we already got NEG/ADD/MUL/SUB running,
 | `GroupOp.Ternary`    | —                   | `MULACC`, `WHERE`                    |
 | `Elementwise` extras | —                   | `CAST`, `BITCAST`                    |
 | **Total**            | **4 / 30**          | **26 / 30**                          |                                                                                                                                       |                                                                                                                            |
+
 ## Ops.FDIV
 
-Just like what we did on Ops.SUB and Ops.NEG, we will expand the coverage to ops_map to see what all those DPU_EW_ALU_ALGO bring us
+Just like what we did on Ops.SUB and Ops.NEG, we will expand the coverage in supported_ops to see what all those DPU_EW_ALU_ALGO bring us
 
 ```diff
--ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0}
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX:0 }
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV}
 ```
 
 ```bash
@@ -943,8 +959,8 @@ e.g.`+0 / -2` returns `+0` and `-0 / -2` returns `-0`, which is opposite of IEEE
 How about RECIPROCAL? We can do `RECIP = 1 / x` with FDIV
 
 ```diff
--ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX:0 }
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL}
 @@
 -import pickle, base64, itertools, time, sys, ctypes, os, mmap, struct
 +import pickle, base64, itertools, time, sys, ctypes, os, mmap, struct, math
@@ -958,12 +974,12 @@ How about RECIPROCAL? We can do `RECIP = 1 / x` with FDIV
 +      return self.run_npu(Ops.FDIV, [1.0] * len(a), a)
 @@
 -          if dtypes.is_float(u.dtype):
--            if u.op not in self.ops_map or u.dtype != dtypes.half:
+-            if u.op not in self.supported_ops or u.dtype != dtypes.half:
 -              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 -            values[u] = self.alu(u.op, *src_values)
 -          else:
 -            values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
-+          if u.op not in self.ops_map or u.dtype != dtypes.half:
++          if u.op not in self.supported_ops or u.dtype != dtypes.half:
 +            raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 +          values[u] = self.run_npu(u.op, *src_values)
 ```
@@ -1072,7 +1088,7 @@ We can add one to rewrite Ops.OR(dtypes.bool) into Ops.MAX(dtypes.half) in `Rock
 +from tinygrad.uop.ops import python_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
 @@
  class RockchipRenderer(Renderer):
-   code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
+   code_for_op = dict.fromkeys(supported_ops)
 +  extra_matcher = PatternMatcher([
 +    # Bool OR is MAX of the FP16 0/1 inputs.
 +    (UPat(Ops.OR, dtypes.bool, name="u"),
@@ -1121,9 +1137,15 @@ Lets implement the bool-to-half CAST on NPU with bool_mask * 0x3c00 (1.0 in fp16
 ```diff
    def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
 @@
--    assert (b is None and op is Ops.NEG) or (b is not None and len(a) == len(b))
+-    if b is None:
+-      assert op in GroupOp.Unary
+-    else:
+-      assert len(a) == len(b)
 -    self.build_registers(op)
-+    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
++    if b is None:
++      assert op in GroupOp.Unary | {Ops.CAST}
++    else:
++      assert len(a) == len(b)
 +    if op is Ops.CAST:
 +      # result = mask * fp16(1.0)
 +      self.build_registers(Ops.MUL, int16_mode=True)
@@ -1238,13 +1260,8 @@ Because we want to fuse multiple Ops into one task instead of issusing many task
 so lets implement Ops.CMPEQ in ops_rockchip.py and do Ops.CMPNE with `1 - CMPEQ(A, B)`
 
 ```diff
-+CMP = 9  # Internal multi-stage comparison marker, not an EW algorithm.
--ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3}
-+ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
-+           Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
-@@
-     assert custom is None or (op is Ops.CUSTOM and custom == "fp16_exponent_shift_minus(16)" and not int16_mode)
-+    assert op is Ops.CUSTOM or self.ops_map[op] != CMP, "comparisons must be lowered by the renderer"
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPNE}
 ```
 
 As test_maximum lowered Ops.CMPNE, we can implement it with Ops.CMPNE = 1 - Ops.CMPEQ and RELU in tinygrad can be done with MAX(x, 0).
@@ -1278,7 +1295,7 @@ Lets apply the CMPNE formula with a pattern matcher.
 +    mask = tag.alu(Ops.SUB, tag.const_like(1)).alu(Ops.MUL, tag.const_like(1024)).maximum(tag.const_like(0))
 +    return mask.const_like(1).alu(Ops.SUB, mask).cast(dtypes.bool)
 +
-   code_for_op = {op: python_alu.get(op, lambda: None) for op in ops_map}
+   code_for_op = dict.fromkeys(supported_ops)
    extra_matcher = PatternMatcher([
      # Bool OR is MAX of the FP16 0/1 inputs.
      (UPat(Ops.OR, dtypes.bool, name="u"),
@@ -1355,16 +1372,24 @@ FAILED (failures=1)
 Great, no more inifinte rewrite and we got our Ops.SUB and Ops.CUSTOM here. 
 And we need to handle Ops.CUSTOM for fp16_exponent_shift_minus which set the register DPU_OUT_CVT_SHIFT_MINUS_EXP.
 
+Pass u.arg unchanged through run_npu to build_registers; it already contains the mode and dtype.
+
 Relax the gate for Ops.CUSTOM
 ```diff
 -  def run_npu(self, op:Ops, a:list, b:list|None=None) -> list:
-+  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None) -> list:
++  def run_npu(self, op:Ops, a:list, b:list|None=None, arg:tuple[str, DType]|None=None) -> list:
 @@
--    assert (b is None and op in (Ops.NEG, Ops.CAST)) or (b is not None and len(a) == len(b))
-+    assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
+-    if b is None:
+-      assert op in GroupOp.Unary | {Ops.CAST}
+-    else:
+-      assert len(a) == len(b)
++    if b is None:
++      assert op in GroupOp.Unary | {Ops.CAST, Ops.CUSTOM}
++    else:
++      assert len(a) == len(b)
 @@
 -    else: self.build_registers(op)
-+    else: self.build_registers(op, custom=custom)
++    else: self.build_registers(op, arg=arg)
 @@
 +        elif u.op is Ops.CUSTOM:
 +          if u.arg == ("fp16_exponent_shift_minus(16)", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
@@ -1373,11 +1398,10 @@ Relax the gate for Ops.CUSTOM
 +              raise NotImplementedError("ROCKCHIP NPU FP16 comparisons do not support NaN or infinity")
 +          else:
 +            raise NotImplementedError(f"ROCKCHIP NPU does not support CUSTOM {u.arg}")
-+          values[u] = self.run_npu(Ops.CUSTOM, src_values[0], custom=u.arg[0])
++          values[u] = self.run_npu(Ops.CUSTOM, src_values[0], arg=u.arg)
          elif u.op in GroupOp.ALU:
 @@
--          if u.op not in self.ops_map or u.dtype != dtypes.half:
-+          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != dtypes.half:
+           if u.op not in self.supported_ops or u.dtype != dtypes.half:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 ```
 
@@ -1405,10 +1429,13 @@ We can set input as fp16 and output as int8 to convert dtypes.half to dtypes.boo
 
 ```diff
 @@
--  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None) -> list:
-+  def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
+-  def run_npu(self, op:Ops, a:list, b:list|None=None, arg:tuple[str, DType]|None=None) -> list:
++  def run_npu(self, op:Ops, a:list, b:list|None=None, arg:tuple[str, DType]|None=None, dtype:DType=dtypes.half) -> list:
 @@
-     assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
+     if b is None:
+       assert op in GroupOp.Unary | {Ops.CAST, Ops.CUSTOM}
+     else:
+       assert len(a) == len(b)
 +    byte_output = False
      if op is Ops.CAST:
 +      byte_output = dtype in (dtypes.int8, dtypes.bool)
@@ -1420,7 +1447,7 @@ We can set input as fp16 and output as int8 to convert dtypes.half to dtypes.boo
 +      self.build_registers(Ops.MUL, int16_mode=not byte_output, byte_output=byte_output)
 +      # Bool-to-half needs the FP16 1.0 bits as an INT16 multiplier; byte output uses this buffer for the second eight input lanes.
 +      if not byte_output: to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<H", fp16(1.0)) * 8
-     else: self.build_registers(op, custom=custom)
+     else: self.build_registers(op, arg=arg)
 ```
 
 Our previous Ops.CAST implements bool_to_fp16, now we are implmentig fp16_to_bool so we need to enable FP16 inputs (8e) packing for Ops.CAST and set both input and weight use the same packed.
@@ -1783,8 +1810,8 @@ But if the delta is exactly ε, a positive delta will become 0, so we MUL the de
 
 ```diff
 @@
--           Ops.CMPEQ: CMP, Ops.CMPNE: CMP}
-+           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPNE}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE}
 
 @@
  class RockchipRenderer(Renderer):
@@ -1823,11 +1850,11 @@ CMPLT(A, B) = RELUX1((2*(B-A) - ε)*inf) * CAST(CMPNE(A, B), half)
 We will create `Ops.CUSTOM` with `arg=("RELUX", dtypes.half)` with the RELUX register sequence
 
 ```diff
-   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
+   def build_registers(self, op:Ops, int16_mode:bool=False, arg:tuple[str, DType]|None=None, byte_output:bool=False,
                        input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
      E = self.EMIT
-+    if custom == "RELUX":
-+      self.build_registers(op, int16_mode, "fp16_exponent_shift_minus(16)", byte_output,
++    if arg == ("RELUX", dtypes.half):
++      self.build_registers(op, int16_mode, ("fp16_exponent_shift_minus(16)", dtypes.half), byte_output,
 +                           input_addr, weight_addr, output_addr)
 +      self.npu_regs += [
 +        E(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0),
@@ -1838,7 +1865,7 @@ We will create `Ops.CUSTOM` with `arg=("RELUX", dtypes.half)` with the RELUX reg
 +          int.from_bytes(struct.pack("<f", 1.0), "little") << rk.DPU_BN_RELUX_CMP_VALUE_BN_RELUX_CMP_DAT__SHIFT),
 +      ]
 +      return
-     exp_shift = custom == "fp16_exponent_shift_minus(16)"
+     exp_shift = arg == ("fp16_exponent_shift_minus(16)", dtypes.half)
 ```
 
 Allow in validation
@@ -1916,9 +1943,8 @@ Ops.WHERE(x, a, b) = a×x + b×(1-x)
 
 And implements Ops.WHERE in ops_rockchip.py
 ```diff
- ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
--           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP}
-+           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
 @@
  class RockchipRenderer(Renderer):
 +  @staticmethod
@@ -1977,19 +2003,21 @@ ALL test cases in test_where passed!
 
 Next we will do Ops.SHL with `x << n → MUL(x, 2^n)`
 
-first extend ops_map
+first extend supported_ops
 ```diff
- ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
--           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP}
-+           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
 ```
 
 prepare input and powers constant
 
 ```diff
-   def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
+   def run_npu(self, op:Ops, a:list, b:list|None=None, arg:tuple[str, DType]|None=None, dtype:DType=dtypes.half) -> list:
 @@
-     assert (b is None and op in (Ops.NEG, Ops.CAST, Ops.CUSTOM)) or (b is not None and len(a) == len(b))
+     if b is None:
+       assert op in GroupOp.Unary | {Ops.CAST, Ops.CUSTOM}
+     else:
+       assert len(a) == len(b)
 +    if op is Ops.SHL:
 +      assert b is not None
 +      if dtype != dtypes.int16 or not b or not all_same(b) or not 0 <= b[0] <= 14:
@@ -2003,10 +2031,10 @@ prepare input and powers constant
 
 Set Ops.SHL to build registers with Ops.MUL for `x << n → MUL(x, 2^n)` and set both input and output packing to int16 for Ops.SHL
 ```diff
-   def run_npu(self, op:Ops, a:list, b:list|None=None, custom:str|None=None, dtype:DType=dtypes.half) -> list:
+   def run_npu(self, op:Ops, a:list, b:list|None=None, arg:tuple[str, DType]|None=None, dtype:DType=dtypes.half) -> list:
 @@
 +    elif op is Ops.SHL: self.build_registers(Ops.MUL, int16_mode=True)
-     else: self.build_registers(op, custom=custom)
+     else: self.build_registers(op, arg=arg)
 @@
 -      # Only bool-to-half CAST uses 8h; byte_output CAST takes FP16 inputs (8e), like arithmetic.
 +      # SHL and bool-to-half CAST pack INT16 lanes (8h); other paths pack FP16 (8e).
@@ -2026,8 +2054,9 @@ Relax NPU gate for Ops.SHL
 ```diff
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
--          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != dtypes.half:
-+          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
+-          if u.op not in self.supported_ops or u.dtype != dtypes.half:
++          allowed_dtypes = (dtypes.int16,) if u.op is Ops.SHL else (dtypes.half,)
++          if u.op not in self.supported_ops or u.dtype not in allowed_dtypes:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 -          values[u] = self.run_npu(u.op, *src_values)
 +          values[u] = self.run_npu(u.op, *src_values, dtype=u.dtype)
@@ -2445,7 +2474,7 @@ We need to add CNA/CORE enable as we were working with DPU/RDMA only before .
 ```diff
  class RockchipProgram(Program['RockchipDevice']):
 @@
-   def build_registers(self, op:Ops, int16_mode:bool=False, custom:str|None=None, byte_output:bool=False,
+   def build_registers(self, op:Ops, int16_mode:bool=False, arg:tuple[str, DType]|None=None, byte_output:bool=False,
                        input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
 @@
 -    pc_enable = 0x80 # E adds 1: operation-enable target 0x0081, distinct from rk.PC (PC register writes).
@@ -2577,9 +2606,9 @@ Pack the original word and read the final four bytes;
 @@
          elif u.op in GroupOp.ALU:
 @@
--          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-+          if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
-+             u.dtype not in ((dtypes.int16, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
+-          allowed_dtypes = (dtypes.int16,) if u.op is Ops.SHL else (dtypes.half,)
++          allowed_dtypes = (dtypes.int16, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)
+           if u.op not in self.supported_ops or u.dtype not in allowed_dtypes:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 +          elif u.op is Ops.SHL and u.dtype == dtypes.uint:
 +            values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
@@ -2627,8 +2656,9 @@ Allow INT32 at the gate and use signed packing for its input/output.
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
--             u.dtype not in ((dtypes.int16, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
-+             u.dtype not in ((dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
+-          allowed_dtypes = (dtypes.int16, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)
++          allowed_dtypes = (dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)
+           if u.op not in self.supported_ops or u.dtype not in allowed_dtypes:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
 -          elif u.op is Ops.SHL and u.dtype == dtypes.uint:
 +          elif u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
@@ -2885,21 +2915,20 @@ Reuse SHL's packing loop. Rename it to `run_u32_shift` and select the convolutio
 +    return [struct.unpack(fmt, self.conv_shift(op, struct.pack(fmt, x), int(b[0])))[0] for x in a]
 ```
 
-Add SHR to ops_map, allow UINT32 SHR at the gate, then dispatch it:
+Add SHR to supported_ops, allow UINT32 SHR at the gate, then dispatch it:
 
 ```diff
- ops_map = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3,
--           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0}
-+           Ops.CMPEQ: CMP, Ops.CMPNE: CMP, Ops.CMPLT: CMP, Ops.WHERE: CMP, Ops.SHL: 0, Ops.SHR: 0}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
 @@
  class RockchipProgram(Program['RockchipDevice']):
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
-           if u.op not in self.ops_map or self.ops_map[u.op] == CMP or \
--             u.dtype not in ((dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)):
-+             u.dtype not in ((dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else
-+                             (dtypes.uint,) if u.op is Ops.SHR else (dtypes.half,)):
+-          allowed_dtypes = (dtypes.int16, dtypes.int, dtypes.uint) if u.op is Ops.SHL else (dtypes.half,)
++          allowed_dtypes = {Ops.SHL: (dtypes.int16, dtypes.int, dtypes.uint),
++                            Ops.SHR: (dtypes.uint,)}.get(u.op, (dtypes.half,))
+           if u.op not in self.supported_ops or u.dtype not in allowed_dtypes:
              raise NotImplementedError(f"ROCKCHIP NPU does not support {u.op} with {u.dtype}")
            elif u.op is Ops.SHL and u.dtype in (dtypes.int, dtypes.uint):
 -            values[u] = self.run_u32_shl(src_values[0], src_values[1], u.dtype)
@@ -2941,8 +2970,8 @@ Lets allow INT32 at the gate
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
--                             (dtypes.uint,) if u.op is Ops.SHR else (dtypes.half,)):
-+                             (dtypes.int, dtypes.uint) if u.op is Ops.SHR else (dtypes.half,)):
+-                            Ops.SHR: (dtypes.uint,)}.get(u.op, (dtypes.half,))
++                            Ops.SHR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
 @@
 -          elif u.op is Ops.SHR and u.dtype == dtypes.uint:
 +          elif u.op is Ops.SHR and u.dtype in (dtypes.int, dtypes.uint):
@@ -2975,7 +3004,7 @@ As `0xABCD1234` in INT32 is negative because its highest bit is 1:
 | Input bytes            | `34 12 CD AB`| `34 12 CD AB`     |
 | Top byte               | `AB`         | `AB`              |
 | In binary              | `1010 1011`  | `1010 1011`       |
-| Shift upper 4 bits down| `____ 1010` | `____ 1010`        |
+| Shift upper 4 bits down| `____ 1010`  | `____ 1010`       |
 | Fill the empty 4 bits  | zeros `0000` | sign bit 1 `1111` |
 | Top byte combined      | `0000 1010`  | `1111 1010`       |
 | Top byte in hex        | `0`   `A`    | `F`   `A`         |
@@ -3168,4 +3197,172 @@ Ran 1 test in 0.301s
 OK
 ```
 
-Both tests passed. The convolution selects and combines the bytes; OUT_CVT_SHIFT does the rounded right shift. Python packs the input and reads the result, not rearranges the result bytes.
+
+
+
+
+
+
+
+
+## Ops.TRUNC
+
+Ops.TRUNC rounds the fractions towards zero for floating point numbers
+e.g. 2.9 becomes 2.0 and -2.9 becomes -2.0. 
+
+Its a basic Ops that no decomposition to other supported Ops was found, 
+and RKNN did not implement TUNC so we need to implement it ourself.
+
+Reading the TRM, there are actually a lots of registers contain the name truncate, 
+and lets do a quick experiment with FP16 input [-2.9, -1.5, -0.9, -0.0, 0.0, 0.9, 1.5, 2.9]
+and expected result is [-2, -1, 0, -0, 0, 0, 1, 2]
+
+| Field / mode                      | Values tried | Observed result                                      |
+| --------------------------------- | ------------ | ---------------------------------------------------- |
+| EW_TRUNCATE, FP16                 | 1, 4, 10     | Negative lanes unchanged; positive lanes zero        |
+| EW_OP_CVT_SHIFT, FP16 (bypassed)  | 1, 4, 10     | Unchanged                                            |
+| EW_CVT_ROUND, FP16 (bypassed)     | 0, 1         | Unchanged                                            |
+| OUT_CVT_SHIFT, FP16               | 1, 4, 10     | Unchanged                                            |
+| CVT_ROUND, FP16                   | 0, 1         | Unchanged                                            |
+| CVT_TYPE, FP16                    | 0, 1         | Unchanged                                            |
+| EW_TRUNCATE_NEG, FP16             | 1, 4, 10     | Negative lanes changed to inf/NaN; not numeric TRUNC |
+| BS/BN MUL_SHIFT_VALUE and _NEG    | 1, 4, 10     | INT16 rounded right shift; FP16 did not give TRUNC   |
+| EW_TRUNCATE and _NEG, INT16       | 1, 4, 10     | Separate rounded right shifts for each sign          |
+| Enabled EW operand CVT, INT16     | 0, 1, 4      | Shifts the weight before MUL; rounding control works |
+| CNA CVT_TRUNCATE_0..3, byte input | 1, 2, 4      | Per-channel rounded right shifts                     |
+| CORE CLIP_TRUNCATE, integer CONV  | 1, 2, 4      | Right shift; rounding bit made no difference here    |
+| FP16 output converted to INT16    | Round 0, 1   | Rounded values, not towards zero                     |
+| MINUS_EXP, FP16                   | 1, 10        | Scales nonzero values; zero becomes inf or 128       |
+| MINUS_EXP, INT16                  | 1, 4, 10     | Unchanged                                            |
+
+Okay, none of the registers produced TRUNC directly. 
+But TRUNC is just simple math with formula `TRUNC(x) = MAX(FLOOR(x), MIN(CEIL(x), 0))`
+
+| Stage                   | -2.9 | -0.9 |  0.9 |  2.9 |
+| ----------------------- | ---: | ---: | ---: | ---: |
+| FLOOR(x)                |   -3 |   -1 |    0 |    2 |
+| CEIL(x)                 |   -2 |   -0 |    1 |    3 |
+| MIN(CEIL(x), 0)         |   -2 |   -0 |    0 |    0 |
+| MAX(FLOOR(x), previous) |   -2 |   -0 |    0 |    2 |
+
+So we already got max and min working, but what about floor and ceil?
+Turns out the EW ALU ALGO list contains FLOOR and CEIL
+
+| EW_ALU_ALGO | Operation | Where we use it                             |
+| ----------- | --------- | ------------------------------------------- |
+| 0           | MAX       | Existing FP16 MAX                           |
+| 1           | MIN       | Not used here; MIN is composed from NEG/MAX |
+| 2           | ADD       | Existing FP16 ADD                           |
+| 3           | FDIV      | Existing FP16 division                      |
+| 4           | SUB       | Existing FP16 subtraction                   |
+| 5           | ABS       | Not used here                               |
+| 6           | NEG       | Existing native FP16 NEG                    |
+| 7           | FLOOR     | Add below through Ops.CUSTOM                |
+| 8           | CEIL      | Add below through Ops.CUSTOM                |
+
+tinygrad got Tensor.floor() and Tensor.ceil() but has no Ops.FLOOR or Ops.CEIL
+and they got lowered into TRUNC and WHERE
+```
+b = TRUNC(x)
+
+floor(x) = WHERE(x < b, b - 1, b)
+ceil(x)  = WHERE(b < x, b + 1, b)
+```
+
+Here we need to implement Ops.CUSTOM to use the EW_ALGO floor and ceil
+so Ops.TRUNC can be lowered using pattern matcher into 
+`trunc(x) = max(floor(x), -max(-ceil(x), 0))` 
+
+We need to extend var unary first, because some register setup depends on it.
+
+```diff
+   def build_registers(self, op:Ops, int16_mode:bool=False, arg:tuple[str, DType]|None=None, byte_output:bool=False,
+                       input_addr:int|None=None, weight_addr:int|None=None, output_addr:int|None=None) -> None:
+@@
+-    unary = op in GroupOp.Unary
++    unary = op in GroupOp.Unary or arg in (("FLOOR", dtypes.half), ("CEIL", dtypes.half))
+@@
+         ((not unary) << rk.DPU_EW_CFG_EW_OP_SRC__SHIFT) |
+@@
+         ((exp_shift or unary) << rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE__SHIFT)),
+@@
+     if not unary:
+       self.npu_regs.append(E(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+                             self.dev.weight_mem.dma_addr if weight_addr is None else weight_addr))
+```
+
+```diff
+ class RockchipRenderer(Renderer):
++  @staticmethod
++  def _pm_lower_trunc(x:UOp) -> UOp:
++    # trunc(x) = max(floor(x), -max(-ceil(x), 0))
++    floor, ceil = (UOp(Ops.CUSTOM, src=(x,), arg=(mode, dtypes.half)) for mode in ("FLOOR", "CEIL"))
++    return floor.maximum(ceil.alu(Ops.NEG).maximum(x.const_like(0)).alu(Ops.NEG))
++
+@@
+   comparison_matcher = PatternMatcher([
++    # Round toward zero using native FP16 FLOOR/CEIL
++    (UPat(Ops.TRUNC, dtypes.half, src=(UPat.var("x", dtypes.half),)),
++     lambda x: RockchipRenderer._pm_lower_trunc(x)),
+```
+
+```diff
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC}
+```
+
+```diff
+   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+@@
++          # Only these unary CUSTOM modes with one FP16 input and FP16 output reach the NPU.
+-          elif u.arg == ("RELUX", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half]: pass
++          elif u.arg in (("RELUX", dtypes.half), ("FLOOR", dtypes.half), ("CEIL", dtypes.half)) and \
++              u.dtype == dtypes.half and src_dtypes == [dtypes.half]: pass
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_trunc
+
+test_trunc (__main__.TestOps.test_trunc) ... ok
+
+Ran 1 test in 1.174s
+
+OK
+```
+
+Good that we have test_trunc passed, lets check other trunc like variant as well
+
+| Test                             | Covers                                         | This pass |
+| -------------------------------- | ---------------------------------------------- | --------- |
+| test_trunc                       | Toward zero; scalar, tensor and boundary values| Forward   |
+| test_floor                       | Toward negative infinity                       | Forward   |
+| test_ceil                        | Toward positive infinity                       | Forward   |
+| test_round                       | Nearest integer, including halfway values      | Forward   |
+| test_round_quantization_gradient | Rounding inside a composed expression          | skipped   |
+
+```bash
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_floor
+Ran 1 test in 5.036s
+OK
+
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_ceil
+Ran 1 test in 4.746s
+OK
+
+$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_round
+Ran 1 test in 16.898s
+OK
+```
+
+| Group                | Implemented paths                 | Remaining                     |
+| -------------------- | --------------------------------- | ----------------------------- |
+| `GroupOp.Unary`      | `NEG`, `RECIPROCAL`, `TRUNC`        | `EXP2`, `LOG2`                |
+|                      |                                   | `SIN`, `SQRT`                 |
+| `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`                | `AND`, `CDIV`, `CMOD`         |
+|                      | `FDIV`, `MAX`                     | `FLOORDIV`, `FLOORMOD`        |
+|                      | `CMPEQ`, `CMPNE`, `CMPLT`          | `POW`, `THREEFRY`, `XOR`      |
+|                      | `OR` (bool), `SHL`, `SHR`          |                               |
+| `GroupOp.Ternary`    | `WHERE`                           | `MULACC`                      |
+| `Elementwise` extras | `CAST` (bool → FP16, mask → bool) | `BITCAST`                     |
+| **Total**            | **16 / 30**                       | **14 / 30**                   |
+
