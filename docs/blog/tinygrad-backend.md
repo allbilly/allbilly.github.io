@@ -20,6 +20,11 @@ TLDR: This blog will mainly use DPU EW op for the 28 GroupOps.ALU, treat CMAC li
 | [Ops.WHERE](#opswhere)                                    |
 | [Ops.SHL](#opsshl)                                        |
 | [Ops.SHR](#opsshr)                                        |
+| [Ops.TRUNC](#opstrunc)                                    |
+| [Ops.MULACC](#opsmulacc)                                  |
+| [Ops.POW](#opspow)                                        |
+| [Ops.EXP2](#opsexp2)                                      |
+| [Ops.LOG2](#opslog2)                                      |
 
 Tinygrad is a zero-dependency minmial codebase (25407 core lines @20260920) to do ML in python, those lines already included a PyTorch like frontend and kernel space GPU driver down to MMIO written in user space, so makes it the perfect place to support USB3 eGPU thats can drives a car (https://www.youtube.com/watch?v=nmTepfv3Itg) and add new accelorator support. 
 
@@ -3366,3 +3371,813 @@ OK
 | `Elementwise` extras | `CAST` (bool → FP16, mask → bool) | `BITCAST`                     |
 | **Total**            | **16 / 30**                       | **14 / 30**                   |
 
+
+## Ops.MULACC
+
+Ops.MULACC is `a*b+c`, which is optional for accelerator bring-up. 
+The backend could just use seperate MUL and ADD if rounding and precision not a consideration. 
+For example, NVIDIA's NV and CUDA backends `tinygrad/renderer/ptx.py`, floating-point MULACC emits `fma.rn`, while integer MULACC emits `mad.lo`
+
+```python
+Ops.MULACC: lambda d,a,b,c,dt,name: f"{'fma.rn' if dtypes.is_float(dt) else 'mad.lo'}.{name} {d}, {a}, {b}, {c};",
+```
+
+As we want to pass all test cases from test_ops.py so
+in this section we will not implement Ops.MULACC since its optional 
+and see if we can still passes test_mulacc_with_zero_strides
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+test_mulacc_with_zero_strides (__main__.TestOps.test_mulacc_with_zero_strides) ... ERROR
+
+Exception: forward pass failed shape (2, 4): dtype mismatch: tinygrad=float32 | torch=float16
+
+Ran 1 test in 0.165s
+
+FAILED (errors=1)
+```
+
+The same case actually failed on CPU as well with DEFAULT_FLOAT=HALF.
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=CPU python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+Exception: forward pass failed shape (2, 4): dtype mismatch: tinygrad=float32 | torch=float16
+Ran 1 test in 0.120s
+FAILED (errors=1)
+```
+
+Because the test input Tensor(1.0) stays weakfloat, and sum chooses FP32 accumulation and did not auto cast back to fp16. 
+So we shd respect the default_float here
+
+```diff
+ class TestOps(unittest.TestCase):
+@@
+   def test_mulacc_with_zero_strides(self):
+@@
+-      lambda: Tensor(1.0).reshape((1,1,1)).expand(2,4,3).mul(Tensor(1.0).reshape((1,1,1)).expand(2,4,3)).sum(-1),
++      lambda: Tensor(1.0, dtype=dtypes.default_float).reshape((1,1,1)).expand(2,4,3).mul(Tensor(1.0, dtype=dtypes.default_float).reshape((1,1,1)).expand(2,4,3)).sum(-1),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=CPU python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+Ran 1 test in 0.599s
+OK
+
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+0 Ops.PARAM dtypes.half
+1 Ops.PARAM dtypes.half
+2 Ops.PARAM dtypes.half
+3 Ops.BUFFER dtypes.float
+4 Ops.CONST dtypes.weakint
+5 Ops.CAST dtypes.int
+6 Ops.SPECIAL dtypes.int
+7 Ops.INDEX dtypes.half
+8 Ops.LOAD dtypes.half
+9 Ops.CONST dtypes.weakint
+10 Ops.CAST dtypes.int
+11 Ops.INDEX dtypes.float
+12 Ops.CONST dtypes.weakfloat
+13 Ops.CAST dtypes.float
+14 Ops.CONST dtypes.weakint
+15 Ops.CAST dtypes.int
+16 Ops.STORE dtypes.void
+17 Ops.RANGE dtypes.int
+18 Ops.SHL dtypes.int
+19 Ops.CAST dtypes.half
+20 Ops.CAST dtypes.half
+21 Ops.ADD dtypes.half
+22 Ops.CAST dtypes.int
+23 Ops.INDEX dtypes.half
+24 Ops.LOAD dtypes.half
+25 Ops.AFTER dtypes.float
+26 Ops.INDEX dtypes.float
+27 Ops.LOAD dtypes.float
+28 Ops.MUL dtypes.half None [[1.0], [1.0]] [dtypes.half, dtypes.half]
+29 Ops.CAST dtypes.float dtypes.float [[1.0]] [dtypes.half]
+30 Ops.ADD dtypes.float None [[0.0], [1.0]] [dtypes.float, dtypes.float]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.ADD with dtypes.float
+Ran 1 test in 0.267s
+FAILED (errors=1)
+```
+
+Okay with default float respected and passed on CPU, we got NotImplementedError for Ops.ADD with dtypes.float. 
+The test inputs are FP16, we saw dtypes.float from .sum(-1) in the test case
+because tinygrad's sum uses FP32 accumulation by default as show in `tinygrad/dtype.py`
+
+```python
+def sum_acc_dtype(dt:DType):
+  # default acc dtype for sum
+  if dtypes.is_unsigned(dt): return least_upper_dtype(dt, dtypes.uint)
+  if dtypes.is_int(dt) or dt == dtypes.bool: return least_upper_dtype(dt, dtypes.int)
+  return least_upper_dtype(dt, to_dtype(getenv("SUM_DTYPE", "float32")))
+```
+
+So lets run again with ENV SUM_DTYPE=HALF
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF SUM_DTYPE=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+26 Ops.ADD dtypes.half None [[0.0], [1.0]] [dtypes.half, dtypes.half]
+26 Ops.ADD dtypes.half None [[1.0], [1.0]] [dtypes.half, dtypes.half]
+...
+15 Ops.RANGE dtypes.int (0, AxisType.REDUCE) [[2]] [dtypes.int]
+16 Ops.INDEX dtypes.half
+17 Ops.LOAD dtypes.half
+18 Ops.MUL dtypes.int None [[0], [3]] [dtypes.int, dtypes.int]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.MUL with dtypes.int
+Ran 1 test in 0.712s
+FAILED (errors=1)
+```
+
+So we passed and moved to the third case, dot(), now stops at integer MUL.
+How about we cast int32 input to int16 with a pattern matcher?
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+-    # Experimental: FP16 arithmetic is not exact for arbitrary INT32 values.
+-    (UPat((Ops.MUL, Ops.ADD), dtypes.int32, name="u"),
+-     lambda u: u.src[0].cast(dtypes.half).alu(u.op, u.src[1].cast(dtypes.half)).cast(dtypes.int32)),
++    # Experimental: narrow integer arithmetic; operands and results must fit INT16.
++    (UPat((Ops.MUL, Ops.ADD), (dtypes.int32, dtypes.weakint), name="u"),
++     lambda u: u.src[0].cast(dtypes.int16).alu(u.op, u.src[1].cast(dtypes.int16)).cast(u.dtype)),
+```
+
+Enable INT16 MUL/ADD in the register builder, packing and dtype gate as well:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+     elif op is Ops.SHL: self.build_registers(Ops.MUL, int16_mode=True)
++    elif dtype == dtypes.int16 and op in (Ops.MUL, Ops.ADD): self.build_registers(op, int16_mode=True)
+     else: self.build_registers(op, arg=arg)
+@@
+-      packed = struct.pack("<8h" if op is Ops.SHL or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
++      packed = struct.pack("<8h" if dtype == dtypes.int16 or (op is Ops.CAST and not byte_output) else "<8e", *(lanes + [0] * (8-len(lanes))))
+@@
+-        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8h" if op is Ops.SHL else "<8e", *(rhs + [0] * (8-len(rhs))))
++        to_mv(self.dev.weight_buf, 16)[:] = struct.pack("<8h" if dtype == dtypes.int16 else "<8e", *(rhs + [0] * (8-len(rhs))))
+@@
+           allowed_dtypes = {Ops.SHL: (dtypes.int16, dtypes.int, dtypes.uint),
++                            Ops.MUL: (dtypes.half, dtypes.int16), Ops.ADD: (dtypes.half, dtypes.int16),
+                             Ops.SHR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF SUM_DTYPE=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_mulacc_with_zero_strides
+
+20 Ops.MUL dtypes.short None [[0], [3]] [dtypes.short, dtypes.short]
+24 Ops.ADD dtypes.short None [[0], [0]] [dtypes.short, dtypes.short]
+...
+20 Ops.MUL dtypes.short None [[1], [3]] [dtypes.short, dtypes.short]
+24 Ops.ADD dtypes.short None [[2], [3]] [dtypes.short, dtypes.short]
+
+Ran 1 test in 0.368s
+OK
+```
+
+| Group                | Covered                           | Remaining              | Optional native op      |
+|----------------------|-----------------------------------|------------------------|-------------------------|
+| `GroupOp.Unary`      | `NEG`, `RECIPROCAL`, `TRUNC`      | `EXP2`, `LOG2`         | —                       |
+|                      |                                   | `SIN`, `SQRT`          |                         |
+| `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`               | `AND`, `CDIV`, `CMOD`  | `THREEFRY` (not tested) |
+|                      | `FDIV`, `MAX`                     | `FLOORDIV`, `FLOORMOD` |                         |
+|                      | `CMPEQ`, `CMPNE`, `CMPLT`         | `POW`, `XOR`           |                         |
+|                      | `OR` (bool), `SHL`, `SHR`         |                        |                         |
+| `GroupOp.Ternary`    | `WHERE`                           | —                      | `MULACC` (test passed)  |
+| `Elementwise` extras | `CAST` (bool → FP16, mask → bool) | `BITCAST`              | —                       |
+| **Total**            | **16**                            | **12**                 | **2**                   |
+
+## Ops.THREEFRY
+
+Ops.THREEFRY is also optional Ops for new accelerator bring up 
+and related test cases are in test_randomness.py instead of test_ops.py
+As our blog target is to pass all test_ops.py only, we will not implement Ops.THREEFRY in this blog. 
+
+## Ops.POW
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
+
+79 Ops.MUL dtypes.half None [[28.359375], [1.3330078125]] [dtypes.half, dtypes.half]
+80 Ops.BITCAST dtypes.short dtypes.short [[37.8125]] [dtypes.half]
+81 Ops.SHR dtypes.short None [[20666], [10]] [dtypes.short, dtypes.short]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.short
+Ran 1 test in 5.203s
+FAILED (errors=1)
+```
+
+Lets add dtypes.short to SHR
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+-                            Ops.SHR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
++                            Ops.SHR: (dtypes.int16, dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
+@@
+-          elif u.op is Ops.SHR and u.dtype in (dtypes.int, dtypes.uint):
+-            values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
++          elif u.op is Ops.SHR and u.dtype in (dtypes.int16, dtypes.int, dtypes.uint):
++            values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], dtypes.int if u.dtype == dtypes.int16 else u.dtype)
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
+
+80 Ops.BITCAST dtypes.short dtypes.short [[37.8125]] [dtypes.half]
+81 Ops.SHR dtypes.short None [[20666], [10]] [dtypes.short, dtypes.short]
+82 Ops.AND dtypes.short None [[20], [31]] [dtypes.short, dtypes.short]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
+Ran 1 test in 5.570s
+FAILED (errors=1)
+```
+
+What about use NOOPT=0?
+```bash
+$ TRACE=1 NOOPT=0 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
+
+114 Ops.BITCAST dtypes.short dtypes.short [[37.125, 38.3125, 36.4375]] [dtypes.half]
+115 Ops.SHR dtypes.short None [[20644, 20682, 20622], [10, 10, 10]] [dtypes.short, dtypes.short]
+116 Ops.AND dtypes.short None [[20, 20, 20], [31, 31, 31]] [dtypes.short, dtypes.short]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
+Ran 1 test in 3.813s
+FAILED (errors=1)
+```
+
+We need EXp2 and LOG2 first
+
+## Ops.EXP2
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
+
+120 Ops.SHR dtypes.short None [[0], [1]] [dtypes.short, dtypes.short]
+121 Ops.ADD dtypes.short None [[0], [15]] [dtypes.short, dtypes.short]
+122 Ops.SHL dtypes.short None [[15], [10]] [dtypes.short, dtypes.short]
+123 Ops.BITCAST dtypes.half dtypes.half [[15360]] [dtypes.short]
+124 Ops.SUB dtypes.short None [[0], [0]] [dtypes.short, dtypes.short]
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.SUB with dtypes.short
+Ran 1 test in 0.258s
+FAILED (errors=1)
+```
+
+INT16 SUB can use the same packing as ADD and MUL. Enable its integer register mode and dtype gate:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+-    elif dtype == dtypes.int16 and op in (Ops.MUL, Ops.ADD): self.build_registers(op, int16_mode=True)
++    elif dtype == dtypes.int16 and op in (Ops.MUL, Ops.ADD, Ops.SUB): self.build_registers(op, int16_mode=True)
+@@
+                             Ops.MUL: (dtypes.half, dtypes.int16), Ops.ADD: (dtypes.half, dtypes.int16),
++                            Ops.SUB: (dtypes.half, dtypes.int16),
+                             Ops.SHR: (dtypes.int16, dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
+
+124 Ops.SUB dtypes.short None [[2], [1]] [dtypes.short, dtypes.short]
+125 Ops.ADD dtypes.short None [[1], [15]] [dtypes.short, dtypes.short]
+126 Ops.SHL dtypes.short None [[16], [10]] [dtypes.short, dtypes.short]
+127 Ops.BITCAST dtypes.half dtypes.half [[16384]] [dtypes.short]
+...
+189 Ops.MUL dtypes.half None [[inf], [0.0]] [dtypes.half, dtypes.half]
+190 Ops.SUB dtypes.half None [[1.0], [0.0]] [dtypes.half, dtypes.half]
+191 Ops.MUL dtypes.half None [[1.279296875], [1.0]] [dtypes.half, dtypes.half]
+192 Ops.ADD dtypes.half None [[nan], [1.279296875]] [dtypes.half, dtypes.half]
+...
+AssertionError:
+Not equal to tolerance rtol=0.001, atol=1e-06
+nan location mismatch:
+ ACTUAL: array([[nan, nan, nan, ..., nan, nan, nan],
+       [nan, nan, nan, ..., nan, nan, nan],
+       [nan, nan, nan, ..., nan, nan, nan],...
+ DESIRED: array([[1.145 , 1.816 , 1.33  , ..., 1.543 , 0.3667, 0.4312],
+       [0.695 , 2.436 , 0.3274, ..., 0.577 , 1.559 , 0.5586],
+       [1.387 , 0.821 , 0.364 , ..., 0.419 , 3.428 , 1.942 ],...
+
+Ran 1 test in 56.345s
+FAILED (errors=1)
+```
+
+Our arithmetic WHERE multiplies the unused infinity branch by 0, producing NaN. We need to skip that multiplication, not just zero its input. ReLU followed by MUL would still evaluate 0 * inf/NaN.
+
+TOREVIEW1: Looking at rockchip-2608-ew, its leaky-ReLU setup enables EW_MUL_PRELU on the MUL path. PReLU multiplies only on one side of zero, so could it bypass the unused operand? We need to check how this hardware treats zero and NaN/inf first.
+
+The NPU probe showed PReLU(+0, inf/NaN) returns +0, while PReLU(-0, inf/NaN) produces NaN. With -1 as the first input, it multiplies and returns the negative of the other operand.
+
+That gives us a selection formula: use -1 for the selected branch and +0 for the unused branch, then negate the result. Call this EXP2_SELECT:
+
+```text
+yes = PReLU(0 - mask, a)
+no  = PReLU(mask - 1, b)
+selected = -(yes + no) + 0
+```
+
+| mask | 0 - mask | mask - 1 | yes | no | selected |
+|-----:|---------:|---------:|-----|----|----------|
+| 0    | +0       | -1       | +0  | -b | b        |
+| 1    | -1       | +0       | -a  | +0 | a        |
+
+The sign of zero matters here: SUB(0, mask) gives +0 when mask is 0, but NEG(mask) gives -0, which still multiplies in this PReLU mode. Keep the SUB by expanding this formula after simplification.
+
+The final +0 fixes a zero result to +0. EXP2 never returns -0, but general WHERE must preserve it, so keep this formula scoped to EXP2_SELECT.
+
+We can implement PReLU with Ops.CUSTOM(args="PRELU") reusing most reg sequence from Ops.MUL
+and set DPU_EW_CFG_EW_MUL_PRELU
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+     E = self.EMIT
++    if arg == ("PRELU", dtypes.half): op = Ops.MUL
+     if arg == ("RELUX", dtypes.half):
+@@
+         (2 << rk.DPU_EW_CFG_EDATA_SIZE__SHIFT) |
++        ((arg == ("PRELU", dtypes.half)) << rk.DPU_EW_CFG_EW_MUL_PRELU__SHIFT) |
+         (alu_algo << rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT) |
+```
+
+Old Ops.CUSTOM path is unary, for PRELU we would need both operand
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+         elif u.op is Ops.CUSTOM:
+-          if u.arg == ("fp16_exponent_shift_minus(16)", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
++          if u.arg == ("PRELU", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half]*2: pass
++          elif u.arg == ("fp16_exponent_shift_minus(16)", dtypes.half) and u.dtype == dtypes.half and src_dtypes == [dtypes.half] * 3:
+@@
+-          values[u] = self.run_npu(Ops.CUSTOM, src_values[0], arg=u.arg)
++          values[u] = self.run_npu(Ops.CUSTOM, src_values[0], src_values[1] if u.arg == ("PRELU", dtypes.half) else None, arg=u.arg)
+```
+
+We use the two matchers at different stages:
+- extra_matcher marks EXP2's selections early
+- comparison_matcher expands them late, so simplification cannot change the +0 that PReLU needs into -0.
+
+```diff
+@@
+ from tinygrad.renderer import Renderer
++from tinygrad.codegen.decomp.transcendental import xexp2
+@@
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2}
+```
+
+Write the PReLU selection formula from the table:
+
+```diff
+ class RockchipRenderer(Renderer):
++  @staticmethod
++  def _pm_exp2_select(mask:UOp, a:UOp, b:UOp) -> UOp:
++    mask = mask.cast(dtypes.half)
++    # SUB creates +0 for the unselected arm; NEG would create -0 and multiply NaN.
++    yes = UOp(Ops.CUSTOM, src=(mask.const_like(0).alu(Ops.SUB, mask), a), arg=("PRELU", dtypes.half))
++    no = UOp(Ops.CUSTOM, src=(mask.alu(Ops.SUB, mask.const_like(1)), b), arg=("PRELU", dtypes.half))
++    return yes.alu(Ops.ADD, no).alu(Ops.NEG).alu(Ops.ADD, mask.const_like(0))
++
+```
+
+```diff
+ class RockchipRenderer(Renderer):
++  @staticmethod
++  def _pm_exp2(x:UOp) -> UOp:
++    # Retain tinygrad's decomposition, but keep its selections away from arithmetic WHERE.
++    return graph_rewrite(xexp2(x), PatternMatcher([
++      (UPat(Ops.WHERE, dtypes.half, name="u"),
++       lambda u: UOp(Ops.CUSTOM, src=u.src, arg=("EXP2_SELECT", dtypes.half))),
++    ]))
++
+```
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   extra_matcher = PatternMatcher([
++    # Keep native EXP2 arithmetic, replacing only its selections.
++    (UPat(Ops.EXP2, dtypes.half, src=(UPat.var("x", dtypes.half),)), lambda x: RockchipRenderer._pm_exp2(x)),
+@@
+   comparison_matcher = PatternMatcher([
++    # render() expands EXP2_SELECT into PReLU late, preserving SUB(0, mask)'s +0 bypass input.
++    (UPat(Ops.CUSTOM, arg=("EXP2_SELECT", dtypes.half), src=(UPat.var("m"), UPat.var("a"), UPat.var("b"))),
++     lambda m,a,b: RockchipRenderer._pm_exp2_select(m, a, b)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
+
+22 Ops.NEG dtypes.half None [[nan]] [dtypes.half]
+23 Ops.ADD dtypes.half None [[nan], [nan]] [dtypes.half, dtypes.half]
+24 Ops.MUL dtypes.half None [[nan], [inf]] [dtypes.half, dtypes.half]
+25 Ops.CUSTOM dtypes.half ('fp16_exponent_shift_minus(16)', dtypes.half) [[nan], [nan], [nan]] [dtypes.half, dtypes.half, dtypes.half]
+
+NotImplementedError: ROCKCHIP NPU FP16 comparisons do not support NaN inputs
+
+Ran 1 test in 63.605s
+
+FAILED (errors=1)
+```
+
+We now reached the second case in test_exp2, [inf, -inf, nan]
+where we failed at Ops.CUSTOM(args="fp16_exponent_shift_minus") which appears here because xexp2 includes CMPNE(x, x) to detect NaN,
+and our previous CMPNE implementation lowered into fp16_exponent_shift_minus 
+
+its like
+1. xexp2 uses CMPNE(x, x) to detect NaN.
+2. Our matcher expands it into the comparison formula, but the exponent-shift CUSTOM rejects the original NaN input.
+3. Removing the check is not enough: x - x gives NaN for both NaN and infinity, so we lose the distinction.
+
+so we need a seperate isnan path without x-x so the steps becomes
+1. xexp2 still emits CMPNE(x, x).
+2. A dedicated matcher catches it before the general comparison matcher.
+
+Now we know we need a NPU isnan comparsion, its actuall very doable given we hv implemented CMPEQ/CMPNE
+Remember CMPEQ stages are `a, b → SUB → MUL inf → exponent shift -16 → SUB 1 → MUL 1024 → MAX 0 → CAST(bool)`
+
+| Stage                  | a=1, b=3 | a=2, b=2       | a=3, b=1 |
+|------------------------|---------:|---------------:|---------:|
+| SUB: a - b             |       -2 |              0 |        2 |
+| MUL inf                |     -inf |            NaN |      inf |
+| Exponent shift -16     |       -1 | 1.0009765625   |        1 |
+| SUB 1                  |       -2 | 0.0009765625   |        0 |
+| MUL 1024               |    -2048 |              1 |        0 |
+| MAX 0                  |        0 |              1 |        0 |
+| CAST(bool)             |    False |           True |    False |
+
+With a little tweaking we can make it into isnan
+
+| Stage              | Finite x              | -inf  | +inf  | NaN, either sign |
+|--------------------|-----------------------|-------|-------|------------------|
+| MUL 1              | x                     | -inf  | inf   | positive NaN     |
+| MAX 32768          | 32768 … 65504         | 32768 | inf   | positive NaN     |
+| Exponent shift -16 | 0.5 … 0.99951171875   | 0.5   | 1     | 1.0009765625     |
+| SUB 1              | -0.5 … -0.00048828125 | -0.5  | 0     | 0.0009765625     |
+| MAX 0              | 0                     | 0     | 0     | 0.0009765625     |
+| MUL 1024           | 0                     | 0     | 0     | 1                |
+| CAST(bool)         | False                 | False | False | True             |
+
+```
+x → MUL 1 → MAX 32768 → CUSTOM fp16_exponent_shift_minus(16) → SUB 1 → MAX 0 → MUL 1024 → CAST(bool)
+```
+
+Add this _pm_isnan before the general comparison matcher. Keep it in the late matcher so MUL(x, 1) is not simplified away:
+
+TODO1: dontuse canonicalizes, use other word
+```diff
+ class RockchipRenderer(Renderer):
+@@
++  @staticmethod
++  def _pm_isnan(x:UOp) -> UOp:
++    # MUL canonicalizes negative NaNs before MAX; keep finite inputs in the safe exponent range.
++    bounded = x.alu(Ops.MUL, x.const_like(1)).maximum(x.const_like(32768))
++    tag = UOp(Ops.CUSTOM, src=(bounded,), arg=("fp16_exponent_shift_minus(16)", dtypes.half))
++    return tag.alu(Ops.SUB, tag.const_like(1)).maximum(tag.const_like(0)).alu(Ops.MUL, tag.const_like(1024)).cast(dtypes.bool)
++
+   @staticmethod
+   def _pm_lower_compare(u:UOp) -> UOp:
+@@
+   comparison_matcher = PatternMatcher([
++    # x != x detects NaN, including either NaN sign; emit after arithmetic simplification.
++    (UPat(Ops.CMPNE, src=(UPat.var("x", dtypes.half), UPat.var("x", dtypes.half))),
++     lambda x: RockchipRenderer._pm_isnan(x)),
+```
+
+This exponent shift takes one input, unlike the earlier comparison CUSTOM with two extra operands for validation. Allow the unary form without removing that comparison check:
+
+```diff
+ class RockchipProgram(Program['RockchipDevice']):
+@@
+-          elif u.arg in (("RELUX", dtypes.half), ("FLOOR", dtypes.half), ("CEIL", dtypes.half)) and \
++          elif u.arg in (("RELUX", dtypes.half), ("FLOOR", dtypes.half), ("CEIL", dtypes.half),
++                         ("fp16_exponent_shift_minus(16)", dtypes.half)) and \
+               u.dtype == dtypes.half and src_dtypes == [dtypes.half]: pass
+```
+
+EXP2 also compares its input against infinity and range limits. Instead of teaching every comparison about NaN here, replace NaN with 0 before the decomposition, then select NaN back into the final result:
+
+```text
+nan_mask = isnan(x)
+safe = select(nan_mask, 0, x)
+result = select(nan_mask, NaN, tinygrad_exp2(safe))
+```
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   def _pm_exp2(x:UOp) -> UOp:
++    isnan = UOp(Ops.CUSTOM, src=(x,), arg=("EXP2_ISNAN", dtypes.bool))
++    safe = UOp(Ops.CUSTOM, src=(isnan, x.const_like(0), x), arg=("EXP2_SELECT", dtypes.half))
+     # Retain tinygrad's decomposition, but keep its selections away from arithmetic WHERE.
+-    return graph_rewrite(xexp2(x), PatternMatcher([
++    result = graph_rewrite(xexp2(safe), PatternMatcher([
+       (UPat(Ops.WHERE, dtypes.half, name="u"),
+        lambda u: UOp(Ops.CUSTOM, src=u.src, arg=("EXP2_SELECT", dtypes.half))),
+     ]))
++    return UOp(Ops.CUSTOM, src=(isnan, x.const_like(math.nan), result), arg=("EXP2_SELECT", dtypes.half))
+@@
+   comparison_matcher = PatternMatcher([
++    # Expand the detector late so its MUL(x, 1) survives simplification.
++    (UPat(Ops.CUSTOM, arg=("EXP2_ISNAN", dtypes.bool), src=(UPat.var("x"),)), lambda x: RockchipRenderer._pm_isnan(x)),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_exp2
+
+237 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[-1.0], [nan]] [dtypes.half, dtypes.half]
+238 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[0.0], [1.0]] [dtypes.half, dtypes.half]
+239 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
+240 Ops.NEG dtypes.half None [[nan]] [dtypes.half]
+241 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
+242 Ops.STORE dtypes.void ... [nan]
+
+Ran 1 test in 73.940s
+
+OK
+```
+
+| Group                | Done                         | Remaining / pending    | Optional native op      |
+|----------------------|------------------------------|------------------------|-------------------------|
+| `GroupOp.Unary`      | `NEG`, `RECIPROCAL`, `TRUNC` |                        | —                       |
+|                      | `EXP2`                       | `LOG2`, `SIN`, `SQRT`  |                         |
+| `GroupOp.Binary`     | `ADD`, `MUL`, `SUB`          | `AND`, `CDIV`, `CMOD`  | `THREEFRY` (not tested) |
+|                      | `FDIV`, `MAX`                | `FLOORDIV`, `FLOORMOD` |                         |
+|                      | `CMPEQ`, `CMPNE`, `CMPLT`    | `POW`, `XOR`           |                         |
+|                      | `OR` (bool), `SHL`, `SHR`    |                        |                         |
+| `GroupOp.Ternary`    | `WHERE`                      | —                      | `MULACC` (test passed)  |
+| `Elementwise` extras | `CAST` (bool ↔ FP16 mask)    | `BITCAST`              | —                       |
+| **Total**            | **17**                       | **11**                 | **2**                   |
+
+## Ops.LOG2
+
+Start from the reviewed EXP2 section in blog.md. Try tinygrad's LOG2 decomposition before adding a new implementation:
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+
+NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
+Ran 1 test in 0.178s
+FAILED (errors=1)
+```
+
+The missing AND comes from ilogb2k, which extracts the FP16 exponent with `(bits >> 10) & 31`. This is not general bitwise AND: the constant 31 keeps just the low five bits.
+
+Our signed SHR rounds down, so SHR by 5 gives the number of complete groups of 32. Multiply back by 32 and subtract to keep the remainder:
+
+```text
+x & 31 = x - floor(x / 32) * 32
+       = x - (x >> 5) * 32
+```
+
+| x  | x >> 5 | Multiply by 32 | Subtract | x & 31 |
+|---:|-------:|---------------:|---------:|-------:|
+| 20 | 0      | 0              | 20       | 20     |
+| 35 | 1      | 32             | 3        | 3      |
+| -1 | -1     | -32            | 31       | 31     |
+
+For INT16, the rounded-down multiple of 32 remains in range, and the result is 0..31. Add only this constant-mask rule; it does not advertise general AND support:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   comparison_matcher = PatternMatcher([
++    # Native LOG2 extracts five exponent bits; signed floor division gives the exact low-bit remainder.
++    (UPat(Ops.AND, dtypes.int16, src=[UPat.var("x", dtypes.int16), UPat(Ops.CAST, dtypes.int16, src=(UPat.const(31),))]),
++     lambda x: x.alu(Ops.SUB, x.alu(Ops.SHR, x.const_like(5)).alu(Ops.MUL, x.const_like(32)))),
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+
+161 Ops.CAST dtypes.half dtypes.half [[True]] [dtypes.bool]
+162 Ops.MUL dtypes.half None [[-1.490234375], [1.0]] [dtypes.half, dtypes.half]
+163 Ops.SUB dtypes.half None [[1.0], [1.0]] [dtypes.half, dtypes.half]
+164 Ops.MUL dtypes.half None [[inf], [0.0]] [dtypes.half, dtypes.half]
+165 Ops.ADD dtypes.half None [[-1.490234375], [nan]] [dtypes.half, dtypes.half]
+...
+nan location mismatch:
+ACTUAL: array([[nan, nan, nan, ...], ...])
+DESIRED: array([[-2.355, -0.2162, -1.282, ...], ...])
+Ran 1 test in 52.324s
+FAILED (errors=1)
+```
+UOp 164 multiplies the unused inf branch by 0, then UOp 165 adds that NaN to the finite result. This is the same arithmetic-WHERE problem found in EXP2. The trace and arrays are excerpts.
+
+### Reuse the EXP2 selection fix
+
+We already tested PReLU selection and the NaN detector in EXP2. Reuse them here, with a separate LOG2_SELECT marker so ordinary WHERE stays unchanged:
+
+1. Detect NaN before running the native comparisons.
+2. Replace NaN with 1, a safe LOG2 input whose result is 0.
+3. Keep tinygrad's LOG2 arithmetic, replacing its WHERE nodes with PReLU selection.
+4. Restore NaN at the end.
+
+```text
+nan_mask = isnan(x)
+safe = select(nan_mask, 1, x)
+result = select(nan_mask, NaN, tinygrad_log2(safe))
+```
+
+| Original x | Working input | Final result       |
+|------------|---------------|--------------------|
+| Positive   | x             | Native LOG2 result |
+| +0 or -0   | x             | -inf               |
+| Negative   | x             | NaN                |
+| +inf       | x             | +inf               |
+| NaN        | 1             | Restore NaN        |
+
+PReLU selection preserves negative results. Its zero normalization is also suitable here: log2(1) is +0, and either input zero gives -inf.
+
+Import xlog2 and advertise LOG2 so our matcher can intercept it before automatic decomposition:
+
+```diff
+@@
+-from tinygrad.codegen.decomp.transcendental import xexp2
++from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
+@@
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2}
+```
+
+Rename the selector now that both ops use it, including EXP2's existing caller:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+-  def _pm_exp2_select(mask:UOp, a:UOp, b:UOp) -> UOp:
++  def _pm_float_select(mask:UOp, a:UOp, b:UOp) -> UOp:
+@@
+-     lambda m,a,b: RockchipRenderer._pm_exp2_select(m, a, b)),
++     lambda m,a,b: RockchipRenderer._pm_float_select(m, a, b)),
+```
+
+Wrap the native formula with the input and output selections above:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
++  @staticmethod
++  def _pm_log2(x:UOp) -> UOp:
++    isnan = UOp(Ops.CUSTOM, src=(x,), arg=("LOG2_ISNAN", dtypes.bool))
++    safe = UOp(Ops.CUSTOM, src=(isnan, x.const_like(1), x), arg=("LOG2_SELECT", dtypes.half))
++    result = graph_rewrite(xlog2(safe), PatternMatcher([
++      (UPat(Ops.WHERE, dtypes.half, name="u"),
++       lambda u: UOp(Ops.CUSTOM, src=u.src, arg=("LOG2_SELECT", dtypes.half))),
++    ]))
++    return UOp(Ops.CUSTOM, src=(isnan, x.const_like(math.nan), result), arg=("LOG2_SELECT", dtypes.half))
++
+   @staticmethod
+   def _pm_isnan(x:UOp) -> UOp:
+```
+
+As in EXP2, mark the selections early and expand them late. No new register mode is needed:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   extra_matcher = PatternMatcher([
++    # Keep LOG2's native polynomial, with NaN-safe input and PReLU selections.
++    (UPat(Ops.LOG2, dtypes.half, src=(UPat.var("x", dtypes.half),)), lambda x: RockchipRenderer._pm_log2(x)),
+@@
+   comparison_matcher = PatternMatcher([
++    # LOG2 shares the verified NaN detector and float selector, not ordinary arithmetic WHERE.
++    (UPat(Ops.CUSTOM, arg=("LOG2_ISNAN", dtypes.bool), src=(UPat.var("x"),)), lambda x: RockchipRenderer._pm_isnan(x)),
++    (UPat(Ops.CUSTOM, arg=("LOG2_SELECT", dtypes.half), src=(UPat.var("m"), UPat.var("a"), UPat.var("b"))),
++     lambda m,a,b: RockchipRenderer._pm_float_select(m, a, b)),
+```
+
+Rerun after adding LOG2_SELECT. PReLU removes the NaN contamination, but the native polynomial still misses the tolerance:
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+
+Mismatched elements: 32 / 2925 (1.09%)
+ [0, 17]: 0.4111328125 (ACTUAL), 0.41162109375 (DESIRED)
+ [2, 44]: 0.232177734375 (ACTUAL), 0.232421875 (DESIRED)
+Max relative difference among violations: 0.00167
+Ran 1 test in 65.724s
+FAILED (errors=1)
+```
+
+### Reduce the FP16 rounding error
+
+The NaN mismatch is gone, but 32 finite results miss the tolerance. This run does not isolate which arithmetic stage causes the error, so it is not enough to blame FDIV alone.
+
+The 1500 branch's _dpu_log2 uses range reduction and an atanh polynomial, not a LUT; it also uses division. Try a division-free candidate instead, keeping tinygrad's exponent helpers:
+
+```text
+x = m * 2^e
+log2(x) = e + log2(m)
+r = m - 1
+log2(m) ≈ r * (1 - r/2 + r²/3 - ... - r¹⁵/16) / ln(2)
+```
+
+For example, 6 = 0.75 * 2^3, so log2(6) = 3 + log2(0.75). We only approximate the part near 1:
+
+| Stage               | x = 6       | x = 2^-24            |
+|---------------------|-------------|----------------------|
+| Normalize subnormal | a = 6       | a = x * 1024 = 2^-14 |
+| Exponent of a*sqrt2 | e = 3       | e = -14              |
+| m = a * 2^-e        | 0.75        | 1                    |
+| r = m - 1           | -0.25       | 0                    |
+| Correct exponent    | 3           | -14 - 10 = -24       |
+| e + polynomial(r)   | About 2.585 | -24                  |
+
+1. Clamp the working input to the positive finite FP16 range. Keep the original input for the final special-value selections.
+2. Multiply subnormals by 1024 and subtract 10 from the final exponent.
+3. Extract the exponent of a * sqrt(2). This keeps m near 1. At the largest inputs that multiplication can overflow to infinity; its exponent field gives 16, still leaving a valid m between about 0.707 and 1.
+4. Evaluate the polynomial in FP16, then add the exponent. No FDIV is needed.
+5. Select -inf for zero, NaN for negative inputs and +inf for +inf. The outer NaN mask still restores NaN inputs.
+
+A simulation rounding every MUL and ADD to FP16 compared these coefficients:
+
+| Candidate                                     | Failures / 31,743 positive finite encodings |
+|-----------------------------------------------|---------------------------------------------|
+| 16-term Taylor coefficients rounded to FP16   | 1                                           |
+| Move coefficient[1] one FP16 step toward zero | 0                                           |
+
+coefficient[1] changes from -0.72119140625 to -0.720703125. It multiplies r inside the parentheses, or r² in the complete formula. The check uses rtol=0.001, atol=1e-6. This is a rounding simulation, not an exhaustive NPU test; verify the candidate on hardware next.
+
+```diff
+@@
+-from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
++from tinygrad.codegen.decomp.transcendental import xexp2, xlog2, ilogb2k, ldexp3k
+```
+
+Build the reduced polynomial and restore the special values:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
++  @staticmethod
++  def _pm_log2_polynomial(x:UOp) -> UOp:
++    # Bound only the working input; restore domain and infinity results below.
++    bounded = x.maximum(x.const_like(2**-24)).alu(Ops.NEG).maximum(x.const_like(-65504)).alu(Ops.NEG)
++    denormal = bounded < bounded.const_like(2**-14)
++    a = denormal.where(bounded * 1024, bounded)
++    exponent = ilogb2k(a * math.sqrt(2)).cast(dtypes.half)
++    r = ldexp3k(a, exponent.alu(Ops.NEG)) - 1
++    exponent = denormal.where(exponent - 10, exponent)
++    coefficients = [(-1)**k / ((k+1)*math.log(2)) for k in range(16)]
++    # One FP16 step toward zero removes the remaining error in the all-positive-half simulation.
++    coefficients[1] = -0.720703125
++    polynomial = r.const_like(coefficients[-1])
++    for coefficient in reversed(coefficients[:-1]): polynomial = polynomial * r + coefficient
++    result = exponent + r * polynomial
++    result = x.ne(0).where(result, x.const_like(-math.inf))
++    result = (x < 0).where(x.const_like(math.nan), result)
++    return x.ne(math.inf).where(result, x.const_like(math.inf))
++
+   @staticmethod
+   def _pm_log2(x:UOp) -> UOp:
+```
+
+Use it inside the same NaN-safe wrapper, keeping the PReLU selections:
+
+```diff
+ class RockchipRenderer(Renderer):
+@@
+   @staticmethod
+   def _pm_log2(x:UOp) -> UOp:
+@@
+-    result = graph_rewrite(xlog2(safe), PatternMatcher([
++    result = graph_rewrite(RockchipRenderer._pm_log2_polynomial(safe), PatternMatcher([
+@@
+-    # Keep LOG2's native polynomial, with NaN-safe input and PReLU selections.
++    # LOG2 uses a division-free reduced polynomial, with NaN-safe input and PReLU selections.
+```
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+
+229 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[-1.0], [nan]] [dtypes.half, dtypes.half]
+230 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[0.0], [0.0]] [dtypes.half, dtypes.half]
+231 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
+232 Ops.NEG dtypes.half None [[nan]] [dtypes.half]
+233 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
+234 Ops.STORE dtypes.void ... [nan]
+
+Ran 1 test in 62.695s
+
+OK
+```
+
+The reconstructed checkpoint passes test_log2, including the finite tensor, [inf, -inf, nan], and scalar cases. The trace is shortened to the final NaN lane. Existing CAST/BITCAST handling is unchanged; this does not remove every interpreter fallback.
+
+Do not count the whole LOG2 family as covered yet. Scaling this rounded FP16 result for test_log and test_log10 failed the live trial with 32 and 13 mismatches respectively. The live backend already has a wider scaled-log implementation; preserving that path is separate from the FP16 polynomial introduced here. The blog still needs that accuracy step before claiming those variants pass.
+
+| Test                               | Status at this tutorial step                 |
+|------------------------------------|----------------------------------------------|
+| test_log2                          | Passed                                       |
+| test_log, test_log10               | Scaled-log accuracy still needs its own step |
+| test_exp2_log2_zero_times_negative | Combined path still needs testing here       |
+
+Do not use the later live backend's wider LOG2 implementation as evidence for these diffs. The next accuracy step must start from this checkpoint too.
