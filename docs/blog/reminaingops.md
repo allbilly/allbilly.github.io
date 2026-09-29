@@ -1,347 +1,145 @@
-# Remaining ops
+# Remaining work after the blog
 
-Start with the smaller changes, then build the helpers needed by the later ops. This order starts from the completed SHL/SHR sections in blog.md:
+Continue from [the reviewed blog](ops_rockchip_blog.md), including BITCAST and WMMA. Do not reapply TRUNC, EXP2, LOG2, POW, SQRT, SIN, boolean AND/XOR, division/remainder or the numeric CAST pairs already introduced there.
 
-Accuracy first: skip cases already known to reach the 30-second limit. Keep their recorded timeouts as unresolved, not passes, and do not rerun them or add performance fixes in this pass. Existing setup diffs remain where later code depends on them.
+The blog introduces paths for 28 entries in its inventory. That is not 28 fully passing op families: integer widths, FP32 arithmetic and composed functions still have failures. MULACC can lower to MUL+ADD; THREEFRY stays with tinygrad's decomposition. Neither needs advertising merely to fill a progress table.
 
-| Order | Ops / support                         | Prerequisite                                      |
-| ----- | ------------------------------------- | ------------------------------------------------- |
-| 1     | TRUNC                                 | Existing unary EW setup                           |
-| 2     | AND → XOR → OR                        | Convolution shifts and shared digit tables        |
-| 3     | BITCAST → MULACC                      | Raw storage, then private FP32/INT32 stages       |
-| 4     | CDIV → CMOD; floor division/remainder | Exact integer limbs and sign correction           |
-| 5     | THREEFRY                              | Integer arithmetic, bitwise ops and shifts        |
-| 6     | Shared comparisons and WHERE          | Raw encodings and integer selection               |
-| 7     | Half FDIV fixes; scratch reuse        | Sign handling and stable result storage           |
-| 8     | FP32 ADD/SUB/NEG → MUL → FDIV         | Private stages, then exact significand arithmetic |
-| 9     | FP32 comparisons; WHERE; numeric CAST | Raw encodings, word selection and converters      |
-| 10    | SQRT → EXP2 → LOG2 → SIN → POW        | Shared arithmetic, comparisons and conversions    |
-| 11    | Full-suite sweep and remaining limits | All preceding implementations                     |
+The [candidate diffs below](#candidate-diffs-and-historical-evidence) are historical references, not patches to apply in order. The current backend does not contain their raw16/scalar16/typed_view storage helpers or mulacc_stage builder. Any candidate using them needs an explicit dependency review and fresh diffs first.
 
-## Ops.LOG2
+## Already covered in the blog
 
-Start from the reviewed EXP2 section in blog.md. Try tinygrad's LOG2 decomposition before adding a new implementation:
+| Area              | Keep the reviewed implementation         | Remaining work                             |
+| ----------------- | ---------------------------------------- | ------------------------------------------ |
+| Boolean logic     | AND / OR / XOR matchers                  | Integer bitwise operations                 |
+| SHL / SHR         | Convolution-based 32-bit paths           | Other widths and per-lane counts           |
+| TRUNC             | FLOOR / CEIL-based lowering              | Related rounding variants                  |
+| EXP2 / LOG2 / POW | Decomposition and FLOAT_SELECT fixes     | Scaled logs and composed-function accuracy |
+| CDIV / CMOD       | Tested conversion-based path             | Full-width precision, if required          |
+| SQRT              | Selective wider-intermediate formula     | RSQRT and other variants                   |
+| SIN               | Compensated range reduction              | Finite inputs beyond the ±10000 clamp      |
+| CAST              | Pairs explicitly introduced in the blog  | Other pairs and interpreter fallbacks      |
+| BITCAST           | Contiguous device-copy path              | Strided/other graphs and surrounding ops   |
+| WMMA              | Small CNA/CORE tile with BS accumulation | More shapes and optimized matmul variants  |
 
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+This replaces the old “start from POW, 20 paths” checkpoint. The older host-memoryview BITCAST and exact-root SQRT search are alternatives, not missing steps to reintroduce.
 
-NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
-Ran 1 test in 0.178s
-FAILED (errors=1)
-```
+## Work order
 
-The missing AND comes from ilogb2k, which extracts the FP16 exponent with `(bits >> 10) & 31`. This is not general bitwise AND: the constant 31 keeps just the low five bits.
+The initial frozen sweep found FP32 ADD as the first blocker in 104 methods and FP32 MUL in 42. These are first failures, not guaranteed passes after a fix. Start with a small FP32 accumulation consumer rather than another large math implementation.
 
-Our signed SHR rounds down, so SHR by 5 gives the number of complete groups of 32. Multiply back by 32 and subtract to keep the remainder:
+| Order | Work                              | Reason / prerequisite                         |
+| ----: | --------------------------------- | --------------------------------------------- |
+| 1     | FP32 ADD, SUB and NEG             | Reduction accumulation; small isolated target |
+| 2     | Integer AND, XOR and OR           | Extend boolean coverage using SHL/SHR         |
+| 3     | Wider CAST and exact integer work | Only where the next trace requires them       |
+| 4     | FP32 MUL and FDIV                 | Wider composed expressions                    |
+| 5     | Comparison and WHERE variants     | Special values and output dtype preservation  |
+| 6     | Composed-function accuracy        | Reuse the verified primitives above           |
+| 7     | Batching and larger hardware work | Revisit timeouts separately from accuracy     |
 
-```text
-x & 31 = x - floor(x / 32) * 32
-       = x - (x >> 5) * 32
-```
+This is a work order, not a claim that the archived diffs implement each checkpoint. If a trace exposes a prerequisite, introduce and verify it before its consumer. Do not import all historical helpers in advance.
 
-| x  | x >> 5 | Multiply by 32 | Subtract | x & 31 |
-|---:|-------:|---------------:|---------:|-------:|
-| 20 | 0      | 0              | 20       | 20     |
-| 35 | 1      | 32             | 3        | 3      |
-| -1 | -1     | -32            | 31       | 31     |
+## 1. FP32 accumulation
 
-For INT16, the rounded-down multiple of 32 remains in range, and the result is 0..31. Add only this constant-mask rule; it does not advertise general AND support:
+FP16 input does not imply FP16 arithmetic throughout the graph. A reduction can multiply FP16 inputs, cast the product to FP32, then accumulate with FP32 ADD. The pre-WMMA small-GEMM trace in the blog shows that failure.
 
-```diff
- class RockchipRenderer(Renderer):
-@@
-   comparison_matcher = PatternMatcher([
-+    # Native LOG2 extracts five exponent bits; signed floor division gives the exact low-bit remainder.
-+    (UPat(Ops.AND, dtypes.int16, src=[UPat.var("x", dtypes.int16), UPat(Ops.CAST, dtypes.int16, src=(UPat.const(31),))]),
-+     lambda x: x.alu(Ops.SUB, x.alu(Ops.SHR, x.const_like(5)).alu(Ops.MUL, x.const_like(32)))),
-```
+Use a reduction to check ordinary FP32 ADD independently of WMMA:
 
 ```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
-
-161 Ops.CAST dtypes.half dtypes.half [[True]] [dtypes.bool]
-162 Ops.MUL dtypes.half None [[-1.490234375], [1.0]] [dtypes.half, dtypes.half]
-163 Ops.SUB dtypes.half None [[1.0], [1.0]] [dtypes.half, dtypes.half]
-164 Ops.MUL dtypes.half None [[inf], [0.0]] [dtypes.half, dtypes.half]
-165 Ops.ADD dtypes.half None [[-1.490234375], [nan]] [dtypes.half, dtypes.half]
-...
-nan location mismatch:
-ACTUAL: array([[nan, nan, nan, ...], ...])
-DESIRED: array([[-2.355, -0.2162, -1.282, ...], ...])
-Ran 1 test in 52.324s
-FAILED (errors=1)
-```
-UOp 164 multiplies the unused inf branch by 0, then UOp 165 adds that NaN to the finite result. This is the same arithmetic-WHERE problem found in EXP2. The trace and arrays are excerpts.
-
-### Reuse the EXP2 selection fix
-
-We already tested PReLU selection and the NaN detector in EXP2. Reuse them here, with a separate LOG2_SELECT marker so ordinary WHERE stays unchanged:
-
-1. Detect NaN before running the native comparisons.
-2. Replace NaN with 1, a safe LOG2 input whose result is 0.
-3. Keep tinygrad's LOG2 arithmetic, replacing its WHERE nodes with PReLU selection.
-4. Restore NaN at the end.
-
-```text
-nan_mask = isnan(x)
-safe = select(nan_mask, 1, x)
-result = select(nan_mask, NaN, tinygrad_log2(safe))
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_sum_tiny
 ```
 
-| Original x | Working input | Final result       |
-|------------|---------------|--------------------|
-| Positive   | x             | Native LOG2 result |
-| +0 or -0   | x             | -inf               |
-| Negative   | x             | NaN                |
-| +inf       | x             | +inf               |
-| NaN        | 1             | Restore NaN        |
+This is the next targeted check, not a fresh result recorded here. Do not switch SUM_DTYPE to HALF to bypass the missing operation. The optimized WMMA pass does not release the ordinary FP32 ADD gate under NOOPT=1.
 
-PReLU selection preserves negative results. Its zero normalization is also suitable here: log2(1) is +0, and either input zero gives -inf.
+The [historical FP32 ADD investigation](#fp32-add-sub-and-neg) recorded a usable FP32 ADD mode, a signed-zero problem and surprising native SUB infinity behavior. It proposed ADD(a, NEG(b)) for SUB. Recheck those observations with the current builder before porting its helper: that helper depends on private INT32 stages and a different storage path.
 
-Import xlog2 and advertise LOG2 so our matcher can intercept it before automatic decomposition:
+The new diff must include four-byte input packing, output layout/decoding, dispatch and the dtype gate. A register precision field alone is not FP32 support.
 
-```diff
-@@
--from tinygrad.codegen.decomp.transcendental import xexp2
-+from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
-@@
--supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2}
-+supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2}
-```
+## 2. Integer bitwise operations
 
-Rename the selector now that both ops use it, including EXP2's existing caller:
+Bool AND/XOR are already introduced. Their formulas do not implement bitwise operations on whole integers: 2*3 is 6, while 2&3 is 2.
 
-```diff
- class RockchipRenderer(Renderer):
-@@
--  def _pm_exp2_select(mask:UOp, a:UOp, b:UOp) -> UOp:
-+  def _pm_float_select(mask:UOp, a:UOp, b:UOp) -> UOp:
-@@
--     lambda m,a,b: RockchipRenderer._pm_exp2_select(m, a, b)),
-+     lambda m,a,b: RockchipRenderer._pm_float_select(m, a, b)),
-```
-
-Wrap the native formula with the input and output selections above:
-
-```diff
- class RockchipRenderer(Renderer):
-@@
-+  @staticmethod
-+  def _pm_log2(x:UOp) -> UOp:
-+    isnan = UOp(Ops.CUSTOM, src=(x,), arg=("LOG2_ISNAN", dtypes.bool))
-+    safe = UOp(Ops.CUSTOM, src=(isnan, x.const_like(1), x), arg=("LOG2_SELECT", dtypes.half))
-+    result = graph_rewrite(xlog2(safe), PatternMatcher([
-+      (UPat(Ops.WHERE, dtypes.half, name="u"),
-+       lambda u: UOp(Ops.CUSTOM, src=u.src, arg=("LOG2_SELECT", dtypes.half))),
-+    ]))
-+    return UOp(Ops.CUSTOM, src=(isnan, x.const_like(math.nan), result), arg=("LOG2_SELECT", dtypes.half))
-+
-   @staticmethod
-   def _pm_isnan(x:UOp) -> UOp:
-```
-
-As in EXP2, mark the selections early and expand them late. No new register mode is needed:
-
-```diff
- class RockchipRenderer(Renderer):
-@@
-   extra_matcher = PatternMatcher([
-+    # Keep LOG2's native polynomial, with NaN-safe input and PReLU selections.
-+    (UPat(Ops.LOG2, dtypes.half, src=(UPat.var("x", dtypes.half),)), lambda x: RockchipRenderer._pm_log2(x)),
-@@
-   comparison_matcher = PatternMatcher([
-+    # LOG2 shares the verified NaN detector and float selector, not ordinary arithmetic WHERE.
-+    (UPat(Ops.CUSTOM, arg=("LOG2_ISNAN", dtypes.bool), src=(UPat.var("x"),)), lambda x: RockchipRenderer._pm_isnan(x)),
-+    (UPat(Ops.CUSTOM, arg=("LOG2_SELECT", dtypes.half), src=(UPat.var("m"), UPat.var("a"), UPat.var("b"))),
-+     lambda m,a,b: RockchipRenderer._pm_float_select(m, a, b)),
-```
-
-Rerun after adding LOG2_SELECT. PReLU removes the NaN contamination, but the native polynomial still misses the tolerance:
+Run the existing tests one at a time, beginning with AND:
 
 ```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
-
-Mismatched elements: 32 / 2925 (1.09%)
- [0, 17]: 0.4111328125 (ACTUAL), 0.41162109375 (DESIRED)
- [2, 44]: 0.232177734375 (ACTUAL), 0.232421875 (DESIRED)
-Max relative difference among violations: 0.00167
-Ran 1 test in 65.724s
-FAILED (errors=1)
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_and
 ```
 
-### Reduce the FP16 rounding error
+The [historical AND candidate](#opsand) uses two-bit digits and convolution, reusing the shift work. Its XOR/OR extensions change the digit truth table. Keep these candidates; the bool-only blog sections did not supersede them. Rebase their packing, builder calls and gate on the current code before presenting a new diff or pass.
 
-The NaN mismatch is gone, but 32 finite results miss the tolerance. This run does not isolate which arithmetic stage causes the error, so it is not enough to blame FDIV alone.
+After AND works, use test_xor and test_or separately. Preserve the bool cases and matchers. MIN/MAX with EW_BINARY_EN is a comparison primitive, not bitwise AND.
 
-The 1500 branch's _dpu_log2 uses range reduction and an atanh polynomial, not a LUT; it also uses division. Try a division-free candidate instead, keeping tinygrad's exponent helpers:
+## 3. Dtypes and exact integer arithmetic
 
-```text
-x = m * 2^e
-log2(x) = e + log2(m)
-r = m - 1
-log2(m) ≈ r * (1 - r/2 + r²/3 - ... - r¹⁵/16) / ln(2)
-```
+The blog's conversion-based CDIV/CMOD path is not exact for every INT32 input. Casting to INT16 loses upper bits; casting to FP16 loses integer precision. Pursue a wider implementation when an existing test or explicitly requested input requires it.
 
-For example, 6 = 0.75 * 2^3, so log2(6) = 3 + log2(0.75). We only approximate the part near 1:
+The [historical division candidate](#opscdiv) shares quotient/remainder work and sign correction. It is not a mandatory step before rerunning the basic cases already covered in the blog. Keep full-width arithmetic as a candidate rather than reintroducing it unconditionally.
 
-| Stage               | x = 6       | x = 2^-24            |
-|---------------------|-------------|----------------------|
-| Normalize subnormal | a = 6       | a = x * 1024 = 2^-14 |
-| Exponent of a*sqrt2 | e = 3       | e = -14              |
-| m = a * 2^-e        | 0.75        | 1                    |
-| r = m - 1           | -0.25       | 0                    |
-| Correct exponent    | 3           | -14 - 10 = -24       |
-| e + polynomial(r)   | About 2.585 | -24                  |
+For a new CAST pair, inspect both dtypes in TRACE. The blog already has INT32 ↔ FP16 and INT32 ↔ INT16 paths; do not replace run_cast wholesale with the archive's older version. Extend the missing pair and verify conversion on the NPU, not just Python packing.
 
-1. Clamp the working input to the positive finite FP16 range. Keep the original input for the final special-value selections.
-2. Multiply subnormals by 1024 and subtract 10 from the final exponent.
-3. Extract the exponent of a * sqrt(2). This keeps m near 1. At the largest inputs that multiplication can overflow to infinity; its exponent field gives 16, still leaving a valid m between about 0.707 and 1.
-4. Evaluate the polynomial in FP16, then add the exponent. No FDIV is needed.
-5. Select -inf for zero, NaN for negative inputs and +inf for +inf. The outer NaN mask still restores NaN inputs.
+Keep THREEFRY unadvertised so tinygrad can decompose it. If that exposes unsupported widths, handle the observed primitive; a helper probe is not a test_ops.py THREEFRY pass.
 
-A simulation rounding every MUL and ADD to FP16 compared these coefficients:
+## 4. Wider multiplication and division
 
-| Candidate                                     | Failures / 31,743 positive finite encodings |
-|-----------------------------------------------|---------------------------------------------|
-| 16-term Taylor coefficients rounded to FP16   | 1                                           |
-| Move coefficient[1] one FP16 step toward zero | 0                                           |
+FP32 output does not make an operation FP32 end-to-end. The archived direct-MUL probe read operands differently than intended; a later candidate used integer significands instead. Neither is a drop-in extension of our FP16 multiplier.
 
-coefficient[1] changes from -0.72119140625 to -0.720703125. It multiplies r inside the parentheses, or r² in the complete formula. The check uses rtol=0.001, atol=1e-6. This is a rounding simulation, not an exhaustive NPU test; verify the candidate on hardware next.
+| Candidate                                                                        | Check before reuse                                               |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| [FP32 MUL](#fp32-mul-operand-conversion-still-unresolved) | Operand width, exponent range, rounding and storage dependencies |
+| [FP32 FDIV](#fp32-fdiv)                                   | Input dtypes, reciprocal accuracy and invalid results            |
+| [FP16 FDIV fixes](#opsfdiv-signs-and-invalid-results)     | Signed zero, infinity and NaN behavior in the current mode       |
 
-```diff
-@@
--from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
-+from tinygrad.codegen.decomp.transcendental import xexp2, xlog2, ilogb2k, ldexp3k
-```
+Use the failing consumer's UOps to choose a primitive test. Do not add a large significand implementation solely because another branch has one. Check rockchip-2608-1500 on the same settings, including CPU fallbacks and tolerances.
 
-Build the reduced polynomial and restore the special values:
+## 5. Comparisons and WHERE variants
 
-```diff
- class RockchipRenderer(Renderer):
-@@
-+  @staticmethod
-+  def _pm_log2_polynomial(x:UOp) -> UOp:
-+    # Bound only the working input; restore domain and infinity results below.
-+    bounded = x.maximum(x.const_like(2**-24)).alu(Ops.NEG).maximum(x.const_like(-65504)).alu(Ops.NEG)
-+    denormal = bounded < bounded.const_like(2**-14)
-+    a = denormal.where(bounded * 1024, bounded)
-+    exponent = ilogb2k(a * math.sqrt(2)).cast(dtypes.half)
-+    r = ldexp3k(a, exponent.alu(Ops.NEG)) - 1
-+    exponent = denormal.where(exponent - 10, exponent)
-+    coefficients = [(-1)**k / ((k+1)*math.log(2)) for k in range(16)]
-+    # One FP16 step toward zero removes the remaining error in the all-positive-half simulation.
-+    coefficients[1] = -0.720703125
-+    polynomial = r.const_like(coefficients[-1])
-+    for coefficient in reversed(coefficients[:-1]): polynomial = polynomial * r + coefficient
-+    result = exponent + r * polynomial
-+    result = x.ne(0).where(result, x.const_like(-math.inf))
-+    result = (x < 0).where(x.const_like(math.nan), result)
-+    return x.ne(math.inf).where(result, x.const_like(math.inf))
-+
-   @staticmethod
-   def _pm_log2(x:UOp) -> UOp:
-```
+Basic CMPEQ, CMPNE, CMPLT and WHERE are already in the blog. What remains is broader dtype and special-value behavior, not implementing those names again.
 
-Use it inside the same NaN-safe wrapper, keeping the PReLU selections:
+FLOAT_SELECT has a signed-zero limitation. It is useful for the scoped math paths, but cannot silently replace arbitrary WHERE. An unselected NaN must not contaminate the result, and a selected -0 must remain -0 where required.
 
-```diff
- class RockchipRenderer(Renderer):
-@@
-   @staticmethod
-   def _pm_log2(x:UOp) -> UOp:
-@@
--    result = graph_rewrite(xlog2(safe), PatternMatcher([
-+    result = graph_rewrite(RockchipRenderer._pm_log2_polynomial(safe), PatternMatcher([
-@@
--    # Keep LOG2's native polynomial, with NaN-safe input and PReLU selections.
-+    # LOG2 uses a division-free reduced polynomial, with NaN-safe input and PReLU selections.
-```
+The archive's FP32 storage-selection and NaN-comparison candidates depend on old raw-storage and private arithmetic helpers. Review those dependencies before reuse. Do not reintroduce RockchipValue or host arithmetic to make a case green.
 
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_log2
+## 6. Accuracy of composed functions
 
-229 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[-1.0], [nan]] [dtypes.half, dtypes.half]
-230 Ops.CUSTOM dtypes.half ('PRELU', dtypes.half) [[0.0], [0.0]] [dtypes.half, dtypes.half]
-231 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
-232 Ops.NEG dtypes.half None [[nan]] [dtypes.half]
-233 Ops.ADD dtypes.half None [[nan], [0.0]] [dtypes.half, dtypes.half]
-234 Ops.STORE dtypes.void ... [nan]
+A primitive pass does not complete every expression using it. Start from the current trace and first mismatching intermediate, not just the final function name.
 
-Ran 1 test in 62.695s
+| Consumer           | Reason to revisit it                         | Candidate to inspect         |
+| ------------------ | -------------------------------------------- | ---------------------------- |
+| log / log10        | Half LOG2 rounds before scaling              | Wider scaled-log computation |
+| rsqrt              | Reciprocal adds another rounding after SQRT  | Reciprocal/root precision    |
+| SIN large inputs   | Working input clamps to ±10000               | Wider quadrant reduction     |
+| GELU / activations | Composed arithmetic and selection            | Wider intermediates; LUT     |
+| POW variants       | Exponent dtype, zero and negative-base cases | Wider POW intermediates      |
 
-OK
-```
+The [older SIN candidate](#opssin) aimed beyond the clamp. Its historical exhaustive result is not current coverage. The old SQRT exact-root search is also an alternative investigation, not a required replacement for the simpler reviewed fix.
 
-The reconstructed checkpoint passes test_log2, including the finite tensor, [inf, -inf, nan], and scalar cases. The trace is shortened to the final NaN lane. Existing CAST/BITCAST handling is unchanged; this does not remove every interpreter fallback.
+LUT and PPU belong to the blog's additional-hardware discussion. Standalone probes do not replace test_gelu or pooling tests. A successful sigmoid sample is not a GELU-family pass.
 
-Do not count the whole LOG2 family as covered yet. Scaling this rounded FP16 result for test_log and test_log10 failed the live trial with 32 and 13 mismatches respectively. The live backend already has a wider scaled-log implementation; preserving that path is separate from the FP16 polynomial introduced here. The blog still needs that accuracy step before claiming those variants pass.
+## 7. Timeouts and throughput
 
-| Test                               | Status at this tutorial step                 |
-|------------------------------------|----------------------------------------------|
-| test_log2                          | Passed                                       |
-| test_log, test_log10               | Scaled-log accuracy still needs its own step |
-| test_exp2_log2_zero_times_negative | Combined path still needs testing here       |
+Keep accuracy failures separate from time limits. The archive's batching and PC-chain experiments used different helpers and checkpoints; do not append that whole sequence to the current backend.
 
-Do not use the later live backend's wider LOG2 implementation as evidence for these diffs. The next accuracy step must start from this checkpoint too.
+For a timeout, inspect task count and lane utilization first. Fill independent lanes before changing the formula. Larger tasks must respect register dimensions and scratch-buffer lifetime. PC chaining reduces submission overhead but does not implement a missing op or fix wrong arithmetic.
 
+New runs use FORWARD_ONLY=1, serial NPU access and the user's 15-minute per-test limit. Timeouts are neither passes nor pytest skips. Exclude methods that explicitly call backward even with FORWARD_ONLY=1.
 
-## Ops.POW
+## Results and replay
 
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
+The current sweep uses a frozen pre-WMMA backend. Optimized WMMA tests and standalone probes are separate results. The archive's 209/433 count and old /30 table belong to another runtime; they must not become this blog's progress.
 
-79 Ops.MUL dtypes.half None [[28.359375], [1.3330078125]] [dtypes.half, dtypes.half]
-80 Ops.BITCAST dtypes.short dtypes.short [[37.8125]] [dtypes.half]
-81 Ops.SHR dtypes.short None [[20666], [10]] [dtypes.short, dtypes.short]
+For each remaining step:
 
-NotImplementedError: ROCKCHIP NPU does not support Ops.SHR with dtypes.short
-Ran 1 test in 5.203s
-FAILED (errors=1)
-```
+1. Reconstruct the current blog checkpoint and run the existing failing test with TRACE.
+2. Explain the observed missing primitive or numerical error, then derive the proposed fix.
+3. Add a minimal complete diff, including its actual prerequisites; do not reference an undefined historical helper.
+4. Replay and test the reconstructed code. Record failures, skips and timeouts as well as passes.
+5. Check related forward variants before counting the family complete.
 
-Lets add dtypes.short to SHR
+This rewrite changes documentation only. No archived implementation has been installed, and no historical result has been promoted to a fresh pass.
 
-```diff
- class RockchipProgram(Program['RockchipDevice']):
-@@
--                            Ops.SHR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
-+                            Ops.SHR: (dtypes.int16, dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
-@@
--          elif u.op is Ops.SHR and u.dtype in (dtypes.int, dtypes.uint):
--            values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
-+          elif u.op is Ops.SHR and u.dtype in (dtypes.int16, dtypes.int, dtypes.uint):
-+            values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], dtypes.int if u.dtype == dtypes.int16 else u.dtype)
-```
+## Candidate diffs and historical evidence
 
-```bash
-$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
-
-80 Ops.BITCAST dtypes.short dtypes.short [[37.8125]] [dtypes.half]
-81 Ops.SHR dtypes.short None [[20666], [10]] [dtypes.short, dtypes.short]
-82 Ops.AND dtypes.short None [[20], [31]] [dtypes.short, dtypes.short]
-
-NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
-Ran 1 test in 5.570s
-FAILED (errors=1)
-```
-
-What about use NOOPT=0?
-```bash
-$ PARALLEL=0 CACHELEVEL=0 TRACE=1 NOOPT=0 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
-
-114 Ops.BITCAST dtypes.short dtypes.short [[37.125, 38.3125, 36.4375]] [dtypes.half]
-115 Ops.SHR dtypes.short None [[20644, 20682, 20622], [10, 10, 10]] [dtypes.short, dtypes.short]
-116 Ops.AND dtypes.short None [[20, 20, 20], [31, 31, 31]] [dtypes.short, dtypes.short]
-
-NotImplementedError: ROCKCHIP NPU does not support Ops.AND with dtypes.short
-Ran 1 test in 3.813s
-FAILED (errors=1)
-```
-
-We need EXp2 and LOG2 first
-
-The next missing op is INT16 AND, used here to mask the exponent with 31. test_pow still fails, so we need AND before continuing this decomposition.
-
+The material below is retained for reference, not a replayable continuation of the reviewed blog. Its diffs use older helpers and checkpoints. Historical passes do not establish current coverage; old 30-second exits are not the current 15-minute limit.
 
 ## Ops.AND
 
@@ -357,33 +155,9 @@ Ran 1 test in 0.156s
 FAILED (errors=1)
 ```
 
-The traceback stops at `ten & 0x1337`. The test also contains bool inputs, so we need two paths. We have no verified EW AND selector; adding AND to the supported set alone would not implement it.
+The saved traceback stops at `ten & 0x1337`. Bool AND is already in the blog; keep that matcher unchanged and add only the integer path here. We have no verified EW AND selector; adding AND to the supported set alone would not implement it.
 
-For bools, AND is just multiplication of 0/1 masks:
-
-| a     | b     | FP16 a * b | AND   |
-| ----- | ----- | ---------: | ----- |
-| False | False |          0 | False |
-| False | True  |          0 | False |
-| True  | False |          0 | False |
-| True  | True  |          1 | True  |
-
-```text
-a, b → CAST(half) → MUL → CAST(bool)
-```
-
-Keep the final CAST in the late matcher, like our comparison masks:
-
-```diff
- class RockchipRenderer(Renderer):
-@@
-   comparison_matcher = PatternMatcher([
-+    # Bool AND multiplies 0/1 masks; keep the final CAST after general rewrites.
-+    (UPat(Ops.AND, dtypes.bool, name="u"),
-+     lambda u: u.src[0].cast(dtypes.half).alu(Ops.MUL, u.src[1].cast(dtypes.half)).cast(dtypes.bool)),
-```
-
-This does not fix the integer case. Casting to INT16 still leaves AND unimplemented, and FP16 loses bits: 4919 rounds to 4920, but `1 & 4919 = 1` and `1 & 4920 = 0`.
+Casting to INT16 still leaves AND unimplemented, and FP16 loses bits: 4919 rounds to 4920, but `1 & 4919 = 1` and `1 & 4920 = 0`.
 
 MUL is not bitwise AND for whole integers: `2 * 3 = 6`, but `2 & 3 = 2`. We need another decomposition.
 
@@ -554,19 +328,18 @@ The wrapper only packs the original words and reads the result. Unlike signed SH
 Advertise AND without assigning it an EW selector. The bool matcher handles masks; the integer gate routes INT32/UINT32 to our new helper:
 
 ```diff
--supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC}
-+supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.AND}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2, Ops.AND}
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
-           allowed_dtypes = {Ops.SHL: (dtypes.int16, dtypes.int, dtypes.uint),
--                            Ops.SHR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
-+                            Ops.SHR: (dtypes.int, dtypes.uint),
+-                            Ops.SHR: (dtypes.int16, dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
++                            Ops.SHR: (dtypes.int16, dtypes.int, dtypes.uint),
 +                            Ops.AND: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
 @@
-           elif u.op is Ops.SHR and u.dtype in (dtypes.int, dtypes.uint):
-             values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], u.dtype)
-+          elif u.op is Ops.AND:
+           elif u.op is Ops.SHR and u.dtype in (dtypes.int16, dtypes.int, dtypes.uint):
+             values[u] = self.run_u32_shift(Ops.SHR, src_values[0], src_values[1], dtypes.int if u.dtype == dtypes.int16 else u.dtype)
++          elif u.op is Ops.AND and u.dtype in (dtypes.int, dtypes.uint):
 +            values[u] = self.run_u32_and(src_values[0], src_values[1], u.dtype)
            else: values[u] = self.run_npu(u.op, *src_values, dtype=u.dtype)
 ```
@@ -594,39 +367,7 @@ NotImplementedError: ROCKCHIP NPU does not support Ops.XOR with dtypes.int
 Ran 1 test in 0.150s
 FAILED (errors=1)
 ```
-TOREVIEW1: Advertise XOR and allow INT32 through first. As with AND, None means no known EW selector; do not submit an invented algorithm number.
-
-```diff
--ew_algo = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.SHL: 0, Ops.SHR: 0}
-+ew_algo = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.SHL: 0, Ops.SHR: 0, Ops.XOR: None}
-@@
-   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
-@@
--          elif u.op not in self.ew_algo or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-+          elif u.op not in self.ew_algo or u.dtype != (dtypes.int if u.op is Ops.XOR else dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-```
-
-```bash
-$ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_xor
-
-TypeError: unsupported operand type(s) for <<: 'NoneType' and 'int'
-Ran 1 test in 0.150s
-FAILED (errors=1)
-```
-
-The register builder reaches the unset EW selector and stops before submission, just like AND. This is a construction failure in the trial, not evidence of hardware XOR behavior.
-
-TOREVIEW1: Restore the gate-only trial before implementing XOR:
-
-```diff
--ew_algo = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.SHL: 0, Ops.SHR: 0, Ops.XOR: None}
-+ew_algo = {Ops.ADD: 2, Ops.MUL: 0, Ops.SUB: 4, Ops.NEG: 0, Ops.FDIV: 3, Ops.MAX: 0, Ops.RECIPROCAL: 3, Ops.SHL: 0, Ops.SHR: 0}
-@@
--          elif u.op not in self.ew_algo or u.dtype != (dtypes.int if u.op is Ops.XOR else dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-+          elif u.op not in self.ew_algo or u.dtype != (dtypes.int16 if u.op is Ops.SHL else dtypes.half):
-```
-
-The probe establishes this missing path, not an accuracy failure in a built-in decomposition.
+The old gate-only trial used an unset EW selector. Do not repeat that obsolete setup: supported_ops and ew_alu_algo are separate now. Extend the verified AND helper below instead of assigning XOR a fake register algorithm.
 
 Next Ops.XOR. For bools, XOR means the two inputs are different, so reuse CMPNE:
 
@@ -701,8 +442,11 @@ Pass the operation through the wrapper. Input/output packing stays unchanged:
 Then advertise XOR and extend dispatch:
 
 ```diff
--lowered_ops = {Ops.AND, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.TRUNC, Ops.WHERE}
-+lowered_ops = {Ops.AND, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.TRUNC, Ops.WHERE, Ops.XOR}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2, Ops.AND}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2, Ops.AND, Ops.XOR}
+@@
+-                            Ops.AND: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
++                            Ops.AND: (dtypes.int, dtypes.uint), Ops.XOR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
 @@
  class RockchipProgram(Program['RockchipDevice']):
 @@
@@ -760,8 +504,12 @@ The probe establishes this missing path, not an accuracy failure in a built-in d
 First advertise OR and let its INT32/UINT32 inputs reach the existing bitwise helper:
 
 ```diff
--lowered_ops = {Ops.AND, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.TRUNC, Ops.WHERE, Ops.XOR}
-+lowered_ops = {Ops.AND, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.OR, Ops.TRUNC, Ops.WHERE, Ops.XOR}
+-supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2, Ops.AND, Ops.XOR}
++supported_ops = {Ops.ADD, Ops.MUL, Ops.SUB, Ops.NEG, Ops.FDIV, Ops.MAX, Ops.RECIPROCAL, Ops.SHL, Ops.SHR, Ops.CMPEQ, Ops.CMPLT, Ops.CMPNE, Ops.WHERE, Ops.TRUNC, Ops.EXP2, Ops.LOG2, Ops.AND, Ops.XOR, Ops.OR}
+@@
+-                            Ops.AND: (dtypes.int, dtypes.uint), Ops.XOR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
++                            Ops.AND: (dtypes.int, dtypes.uint), Ops.XOR: (dtypes.int, dtypes.uint),
++                            Ops.OR: (dtypes.int, dtypes.uint)}.get(u.op, (dtypes.half,))
 @@
    def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
 @@
@@ -818,7 +566,19 @@ OR now has an INT32/UINT32 path in addition to bool, with the same 14 convolutio
 
 Four additional INT32/UINT32 Tensor checks passed (144 lanes), including broadcasting, random full-width values, sign-bit boundaries and alternating-bit patterns. Every check submitted NPU work.
 
+The first three sections were rerun together after rebasing their supported-op sets and dtype gates onto the blog:
+
+```bash
+$ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_and TestOps.test_xor TestOps.test_or
+
+Ran 3 tests in 23.003s
+
+OK
+```
+
 ## Ops.BITCAST
+
+TOREVIEW1: Sequential replay currently stops at this section's old packing hunk. The blog now uses dtype-based INT16 packing and arg rather than custom. Update those contexts together with raw-result decoding before running this checkpoint; the saved results below are from the older draft.
 
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_bitcast
@@ -1612,11 +1372,11 @@ A saved integration probe exercised Tensor fusion, with a CNA task before MULACC
 
 The Tensor checks also passed with NOOPT=0, with 67 MULACC dispatches. These checks count calls to run_mulacc, so a constant-folded expression cannot silently pass as an NPU MULACC test.
 
-## Ops.THREEFRY
+## Integer widths: narrow bitwise ops and 64-bit shifts
 
 TOREVIEW1: There is no test_threefry method in test_ops.py. Do not substitute a separate test file or count the helper probe as acceptance coverage. This section keeps native decomposition: advertising THREEFRY would suppress the very decomposition we want to reuse, so it is not a gate-only experiment for a direct THREEFRY implementation.
 
-No THREEFRY entry is needed in ops_map: leaving it unsupported lets tinygrad expand it into simpler UOps. The saved decomposition probe stopped at UINT64 SHR, before the rounds. This is probe evidence, not a test_ops.py pass.
+Keep THREEFRY out of supported_ops, as decided in the blog. The saved decomposition probe below exposed reusable integer-width helpers, not a reason to add a native THREEFRY implementation. Later comparisons and CASTs use these helpers, so introduce them here after BITCAST and integer arithmetic.
 
 The first missing primitive is UINT64 SHR. No THREEFRY handler has been added.
 
@@ -1757,7 +1517,7 @@ The storage paths use typed memoryviews, not a wrapper class. BITCAST changes th
 
 The raw-storage check round-trips half and wider encodings without unpacking/repacking NaN payloads. MULACC's rounding and signed-zero checks are recorded in its own step above.
 
-Still to introduce: SQRT, EXP2, LOG2, POW and SIN. This is not every dtype or edge case, and the full test_ops.py sweep is still pending.
+SQRT and SIN remain new ops. EXP2, LOG2 and basic POW already work in the blog; their later sections below are wider-precision candidates and variant fixes, not first implementations.
 
 ## Shared math prerequisites: SHR, comparisons and WHERE
 
@@ -2047,9 +1807,9 @@ No dtype gate is relaxed. Boolean WHERE must lower to the supported selection an
 
 The first retest of test_masked_select reached the 30-second command limit without finishing. It no longer stopped at the bool WHERE gate, but that is not a pass.
 
-## Recorded WHERE timeout investigation (deferred)
+## Shared task batching and recorded WHERE timeouts
 
-The following changes were investigated before the accuracy-first pass. Keep their diffs because later sections extend these helpers, but skip their timed-out test commands for now. They do not establish a full masked_select pass.
+The following changes were investigated before the accuracy-first pass. Keep the setup here because later FP32 and comparison diffs extend int_stage, batched workgroups and the task-width layout. Moving these definitions behind their callers would break that sequence. The timeout commands are historical diagnostics, not required acceptance steps or a full masked_select pass.
 
 ### Fill the existing lanes first
 
@@ -4307,8 +4067,6 @@ The call-size check now sees 8, 8, 1. The unchanged full ReLU → CAST test fini
 
 ## Ops.SQRT
 
-TOREVIEW1: The separate ops_map/dtype-gate-only trial is still missing here. The full SQRT test is a known timeout and remains deferred. The implementation and saved probes below do not substitute for that trial.
-
 The following is the recorded FP16-decomposition accuracy investigation, before the FP32 and numeric CAST extensions now introduced above. It is not a new baseline in this order.
 
 Rerun the decomposition after fixing selection.
@@ -4546,15 +4304,15 @@ This uses more tasks than Newton iteration. All 65,536 FP16 bit patterns passed:
 
 The saved exhaustive probe enumerated every FP16 encoding against a double-precision reference rounded to half. It checked NaN classification rather than payload.
 
-That historical exhaustive run is not part of the short test sequence here. Keep each new command within 30 seconds.
+That exhaustive run is historical, not part of the test sequence here. Its results must not be attributed to the new blog checkpoint.
 
 The ADD, MUL, maximum, MULACC and raw-NaN regressions also passed: 6 passed in 6.46s.
 
-EXP2, LOG2, POW and SIN remain. The full test_ops.py sweep is still pending.
+SIN remains a new op. Next review the wider EXP2 and LOG2 candidates used by the later accuracy work; the blog's existing implementations are the baseline, not missing support.
 
-## Ops.EXP2
+## EXP2: wider candidate and numeric conversions
 
-TOREVIEW1: The separate ops_map/dtype-gate-only trial is still missing. Do not infer its result from the direct implementation below. test_exp2 is a known timeout, so that full-test checkpoint remains deferred.
+TOREVIEW1: The blog now passes test_exp2 using tinygrad's decomposition and FLOAT_SELECT. The following run_math candidate predates that reviewed path. Keep its conversion and wider-arithmetic findings for the dependent LOG2/SIN work, but do not apply a second EXP2 advertisement or claim this candidate is needed for the basic test. Its integration with the blog's early matcher still needs replay and a new baseline.
 
 With the earlier fixes in place, run tinygrad's existing EXP2 decomposition before advertising EXP2. The fresh run at this reordered checkpoint was bounded to 30 seconds:
 
@@ -4563,7 +4321,7 @@ $ NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/tes
 # 30-second command limit, exit 124. No test summary.
 ```
 
-The older checkpoint completed this test in 119.310s with OK. That is a historical result, not a pass for the new order or permission to run beyond the current limit.
+The older checkpoint completed this test in 119.310s with OK. Both that result and the bounded run above are historical; neither replaces the reviewed blog's newer pass.
 
 A separate small probe used [-25, -24.5, -24, -15, -2, -0.5, -0, 0, 0.5, 1, 2, 10, 15, 16, +inf, -inf, NaN]. It passed rtol=1e-3, atol=1e-6 against double-precision exp2 rounded to half. This is a tolerance check, not bit-exact or full-test coverage. Inspecting its lowered program found no EXP2 UOp and these numeric CAST pairs:
 
@@ -4886,9 +4644,9 @@ The saved EXP2 probe also covered all FP16 encodings.
 
 test_exp2 passes with the code built here, before LOG2. The all-encodings check also passed in an earlier run: `2 passed in 54.35s`. That longer sweep was not rerun for this revision.
 
-## Ops.LOG2
+## LOG2: wider candidate for scaled-log accuracy
 
-TOREVIEW1: The direct LOG2 candidate still needs its own gate-only trial before implementation. test_log2 is a known timeout; retain that gap rather than reporting the later helper result as the trial.
+TOREVIEW1: The blog now passes test_log2 with its FP16 polynomial and FLOAT_SELECT. This older run_math extension is a wider candidate for log/log10 and POW accuracy. It depends on the preceding run_math setup, but its diffs must be reconciled with _pm_log2 before application; the old timeout is not the current basic-test result.
 
 First use the code built so far, without adding LOG2 support or forcing a different decomposition. The earlier investigation recorded this failure:
 
@@ -5654,9 +5412,9 @@ The NPU result matches the half-intermediate calculation. Changing its LOG2 resu
 
 A CPU diagnostic evaluated cast-half(log2(cast-float(x))*ln(2)) on the same 2925 inputs. All values passed rtol=1e-3, atol=1e-6 against the double-precision reference rounded to half. The corresponding log10 expression passed too. These are candidate-expression checks, not passes of the unchanged test_log/test_log10 methods. The shared methods have not been edited here.
 
-## Ops.POW
+## POW variants: wider intermediates
 
-The following long result is historical. Fresh reconstructed pre-POW runs of test_pow and test_pow_full each reached the 30-second limit (exit 124), without a test summary. They are not new passes or reproduced accuracy failures.
+Basic test_pow already passes at the end of the blog. This section targets tensor exponents and wider intermediates. The following results are historical: the older reconstructed runs of test_pow and test_pow_full reached a 30-second limit without a summary. Do not replace the blog's newer basic pass with those old timeouts.
 
 ```bash
 $ TRACE=1 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_pow
@@ -5920,44 +5678,9 @@ OK
 
 This is not a claim of every POW edge case. For example, `Tensor([1.0]) ** Tensor([nan])` returns NaN on tinygrad CPU too. A Python scalar NaN exponent instead fails in the common `simplify_pow` rewrite before reaching either backend.
 
-## Full-suite sweep
+## Variant audits
 
-
-The full-runtime run reached **209 / 433 passed**. It ran the whole file serially, with a longer timeout for slow NPU decompositions. No comparisons were relaxed or cases removed. This is the earlier runtime sweep; the step-by-step reruns above did not repeat the whole file.
-
-```bash
-$ TRACE=1 TEST_TIMEOUT=600 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP \
-    python -m pytest -n0 -vv --tb=short test/backend/test_ops.py
-```
-
-`test_all_large` hit the 600-second per-test timeout; its log contains the timeout dump, and the process exited with signal 11 while dumping it. We continued the unattempted cases in separate serial pytest processes, using the same settings and unchanged source. Each process kept the 600-second timeout, with a 660-second external limit. Timeouts are not passes or skips.
-
-The complete sweep gave **209 passed, 195 failed, 21 timed out, 8 skipped — 433 methods total**. This is the combined result, not one pytest summary. All collected methods were accounted for, and the runtime and test-file hashes stayed unchanged. The eight skips came from existing test decorators.
-
-Count collected test methods, not the green parent line alone: pytest can print `PASSED` for a method whose subtests failed, then exit with code 1. The summary checks the exit code and `SUBFAILED` entries too. Both asymmetric-padding convolution methods failed this way on unsupported FP32 ADD; they are not passes.
-
-## Progress and remaining limits
-
-Progress so far
-
-| Group             | Implementations to verify              |
-| ----------------- | -------------------------------------- |
-| `GroupOp.Unary`   | `NEG`, `RECIPROCAL`, `TRUNC`           |
-|                   | `SQRT`, `EXP2`, `LOG2`, `SIN`          |
-| `GroupOp.Binary`  | `ADD`, `MUL`, `SUB`, `FDIV`, `MAX`     |
-|                   | `CMPEQ`, `CMPNE`, `CMPLT`              |
-|                   | `AND`, `OR`, `XOR`, `SHL`, `SHR`       |
-|                   | `CDIV`, `CMOD`, `FLOORDIV`, `FLOORMOD` |
-|                   | `THREEFRY`, `POW`                      |
-| `GroupOp.Ternary` | `WHERE`, `MULACC`                      |
-| Extras            | `CAST`, `BITCAST`                      |
-| **Variant tests verified** | **13 / 30** |
-
-The rows above are an implementation inventory. The completed count includes CMPEQ, CMPNE, CMPLT, WHERE, AND, OR, XOR, ADD, SUB, NEG, TRUNC, SHL and SHR: their applicable variant methods passed, with the configuration matrices and boundary checks recorded below. This is test coverage, not a proof for every possible input or unsupported dtype. The other 17 ops remain unverified; a basic or helper-test pass is not enough.
-
-FLOORDIV, FLOORMOD, THREEFRY and POW use tinygrad's existing decompositions. The earlier sections now dispatch FP32 ADD/SUB/NEG/MUL/FDIV and raw-storage WHERE; other FP32 paths still need their own implementation and tests. The later shift audit replaces public narrow SHL's saturating MUL path with convolution and accepts per-lane counts. Counts outside `0..bits-1` remain unsupported. Some CAST combinations still use the Python fallback. BITCAST only reinterprets storage; it does not calculate new values.
-
-The full sweep uses forward-only FP16 with NOOPT=1. It does not establish backward, default-FP32 or optimized-kernel coverage.
+The primitive candidates above come first. Now check their consumers and dtype variants. These saved runs belong to the older runtime; use FORWARD_ONLY=1 for new runs and keep explicit gradient tests outside this pass. The historical whole-file sweep is collected at the end, not used as evidence that these reordered checkpoints pass.
 
 ### Variant audit: rounding family
 
@@ -8478,3 +8201,42 @@ acos(x) = WHERE(x < 0, pi - q, q)
 A separate Tensor probe ran that expression on the NPU, without changing the runtime matcher or the existing test. At 0.990234375 it gave 0.1397705078125; at 0.9990234375 it gave 0.044189453125. The probe also checked ±1, ±0.9, ±0.5, zero and an out-of-domain input 2, which remained NaN.
 
 This is a candidate, not an implemented fix or a full test_acos pass. Next check its rounding across the input range and identify a precise lowering pattern. Do not replace the existing test with these few points or widen its tolerance.
+
+## Historical full-suite sweep
+
+
+The full-runtime run reached **209 / 433 passed**. It ran the whole file serially, with a longer timeout for slow NPU decompositions. No comparisons were relaxed or cases removed. This is the earlier runtime sweep; the step-by-step reruns above did not repeat the whole file.
+
+```bash
+$ TRACE=1 TEST_TIMEOUT=600 NOOPT=1 FORWARD_ONLY=1 DEFAULT_FLOAT=HALF DEV=ROCKCHIP \
+    python -m pytest -n0 -vv --tb=short test/backend/test_ops.py
+```
+
+`test_all_large` hit the 600-second per-test timeout; its log contains the timeout dump, and the process exited with signal 11 while dumping it. We continued the unattempted cases in separate serial pytest processes, using the same settings and unchanged source. Each process kept the 600-second timeout, with a 660-second external limit. Timeouts are not passes or skips.
+
+The complete sweep gave **209 passed, 195 failed, 21 timed out, 8 skipped — 433 methods total**. This is the combined result, not one pytest summary. All collected methods were accounted for, and the runtime and test-file hashes stayed unchanged. The eight skips came from existing test decorators.
+
+Count collected test methods, not the green parent line alone: pytest can print `PASSED` for a method whose subtests failed, then exit with code 1. The summary checks the exit code and `SUBFAILED` entries too. Both asymmetric-padding convolution methods failed this way on unsupported FP32 ADD; they are not passes.
+
+### Historical progress and remaining limits
+
+Recorded coverage at that older runtime checkpoint; not the current blog's coverage:
+
+| Group             | Implementations to verify              |
+| ----------------- | -------------------------------------- |
+| `GroupOp.Unary`   | `NEG`, `RECIPROCAL`, `TRUNC`           |
+|                   | `SQRT`, `EXP2`, `LOG2`, `SIN`          |
+| `GroupOp.Binary`  | `ADD`, `MUL`, `SUB`, `FDIV`, `MAX`     |
+|                   | `CMPEQ`, `CMPNE`, `CMPLT`              |
+|                   | `AND`, `OR`, `XOR`, `SHL`, `SHR`       |
+|                   | `CDIV`, `CMOD`, `FLOORDIV`, `FLOORMOD` |
+|                   | `THREEFRY`, `POW`                      |
+| `GroupOp.Ternary` | `WHERE`, `MULACC`                      |
+| Extras            | `CAST`, `BITCAST`                      |
+| **Variant tests verified** | **13 / 30** |
+
+The rows above are an implementation inventory. The completed count includes CMPEQ, CMPNE, CMPLT, WHERE, AND, OR, XOR, ADD, SUB, NEG, TRUNC, SHL and SHR: their applicable variant methods passed, with the configuration matrices and boundary checks recorded below. This is test coverage, not a proof for every possible input or unsupported dtype. The other 17 ops remain unverified; a basic or helper-test pass is not enough.
+
+FLOORDIV, FLOORMOD, THREEFRY and POW use tinygrad's existing decompositions. The earlier sections now dispatch FP32 ADD/SUB/NEG/MUL/FDIV and raw-storage WHERE; other FP32 paths still need their own implementation and tests. The later shift audit replaces public narrow SHL's saturating MUL path with convolution and accepts per-lane counts. Counts outside `0..bits-1` remain unsupported. Some CAST combinations still use the Python fallback. BITCAST only reinterprets storage; it does not calculate new values.
+
+The full sweep uses forward-only FP16 with NOOPT=1. It does not establish backward, default-FP32 or optimized-kernel coverage.
