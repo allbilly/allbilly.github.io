@@ -48,19 +48,4 @@ extra_css:
   - assets/extra.css
 
 nav:
-  - Home: index.md
-  - NPU:
-      - npu/index.md
-      - RK3588: npu/rk3588.md
-      - Apple ANE: npu/apple-ane.md
-      - NVDLA: npu/nvdla.md
-      - AMD XDNA: npu/amd-xdna.md
-  - GPU:
-      - gpu/index.md
-      - nvgpu: gpu/nvgpu.md
-      - amdgpu: gpu/amdgpu.md
-      - Mali: gpu/mali.md
-      - RK3588 Mali: gpu/rk3588gpu.md
-      - Vortex: gpu/vortex.md
-  - Blog:
-      - Understanding AMD XDNA (part 1): blog/xdna-4d-dma.md
+  - Tinygrad backend: blog/tinygrad-backend.md

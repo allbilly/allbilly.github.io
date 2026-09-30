@@ -1,5 +1,12 @@
 .md-grid {
-  max-width: 1440px;
+  max-width: none;
+  margin-inline: clamp(0.5rem, 2vw, 2rem);
+}
+
+/* Preserve code indentation while wrapping long lines to the content width. */
+.md-typeset pre > code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 :root {
@@ -11,29 +18,13 @@
   background-color: #111318;
 }
 
-.md-sidebar--primary {
-  width: 18rem;
-}
-
-.md-sidebar--primary .md-sidebar__scrollwrap {
-  padding-left: 2.75rem;
-  padding-right: 1rem;
-  scrollbar-width: none;
-}
-
-/* Keep the documentation tree visible like the tinygrad docs on desktop. */
-@media screen and (min-width: 768px) {
+/* Use a compact desktop navigation; retain the theme's drawer on smaller screens. */
+@media screen and (min-width: 76.25em) {
   .md-sidebar--primary {
-    display: block;
-    visibility: visible;
-    transform: none;
+    width: 10rem;
   }
 
-  .md-header__button[for="__drawer"] {
-    display: none;
-  }
-
-  .md-overlay {
-    display: none;
+  .md-sidebar--primary .md-sidebar__scrollwrap {
+    padding-inline: 0.5rem;
   }
 }
