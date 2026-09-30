@@ -1,0 +1,30 @@
+.md-grid {
+  max-width: none;
+  margin-inline: clamp(0.5rem, 2vw, 2rem);
+}
+
+/* Preserve code indentation while wrapping long lines to the content width. */
+.md-typeset pre > code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+:root {
+  --md-primary-fg-color: #111318;
+  --md-default-bg-color: #1b1e26;
+}
+
+.md-header {
+  background-color: #111318;
+}
+
+/* Use a compact desktop navigation; retain the theme's drawer on smaller screens. */
+@media screen and (min-width: 76.25em) {
+  .md-sidebar--primary {
+    width: 10rem;
+  }
+
+  .md-sidebar--primary .md-sidebar__scrollwrap {
+    padding-inline: 0.5rem;
+  }
+}
