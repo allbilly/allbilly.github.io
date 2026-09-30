@@ -51,9 +51,12 @@ Tinygrad is a zero-dependency minmial codebase (25407 core lines @20260920) to d
 
 It sounds simple but I found no resource or blog post on how to add new accelerator to tinygrad, so here it is and we will find out how deep is the rabbit hole.
 
-In this blog seris, we  
+In this blog seris, we
+
 - Part 1: Modify ops_python.py as starting point to understand the NPU and implements the ~25 Ops and run test_ops.py.
+
 - Part 2 (WIP): fix each failed test case and then rewrite ops_rockchip.py from scratch 
+
 - Part 3 (WIP): prepare for PR
 
 U can follow among if u own an OrangePi 5 running the OrangePi Ubuntu 22.02 stock image.
@@ -75,8 +78,6 @@ In tinygrad, u can choose a runtime with env like DEV=ROCKCHIP. If u want to run
 uv pip install -e . numpy torch pytest pytest-xdist --torch-backend=cpu
 DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_add
 ```
-
-The sequential replay checks use Python 3.12.12, NumPy 2.5.3, CPU Torch 2.14.0, pytest 9.1.1 and pytest-xdist 3.8.0 with the pinned tinygrad checkout above. The older timings below are recorded runs, not speed guarantees for this environment.
 
 ```
 (tinygrad) orangepi@orangepi5:~/tinygrad$ DEV=ROCKCHIP python test/backend/test_ops.py TestOps.test_add
@@ -559,7 +560,8 @@ Most important one for us is EW_CFG, and TRM shows
 
 At first glance, ew_alu_algo looks interesting, but it doesnt contains MUL we want
 
-ew_alu_algo
+`ew_alu_algo`
+
 | Value  | Operation |
 | :----: | --------- |
 | `4'd0` | Max       |
@@ -572,7 +574,8 @@ ew_alu_algo
 | `4'd7` | Floor     |
 | `4'd8` | Ceil      |
 
-MUL is is in ew_op_type
+MUL is in `ew_op_type`
+
 | Value  | Operator Type |
 | :----: | ------------- |
 | `1'd0` | ALU           |
