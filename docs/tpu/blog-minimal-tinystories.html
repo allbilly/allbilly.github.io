@@ -1,0 +1,1231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d0f12">
+<title>A TPU you can read: nine rungs from Tiny-TPU to TinyStories-15M</title>
+<meta name="description" content="Rebuilding the ladder without imports: 22 commits, 5,175 authored lines, 96 tests, and a real TinyStories-15M checkpoint decoded in simulation.">
+<meta name="author" content="the tiny-tpu crew">
+<meta property="og:type" content="article">
+<meta property="og:title" content="A TPU you can read: nine rungs from Tiny-TPU to TinyStories-15M">
+<meta property="og:description" content="22 commits, 5,175 authored lines, zero imports, one real checkpoint decoded.">
+<meta property="og:site_name" content="Tiny TPU">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="A TPU you can read: nine rungs from Tiny-TPU to TinyStories-15M">
+<meta name="twitter:description" content="22 commits, 5,175 authored lines, zero imports, one real checkpoint decoded.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#e7e4de; --muted:#9aa3b0; --line:#272c34; --soft:#12151b;
+    --cream:#211b13; --cream-line:#3a2f21;
+    --green:#7fce9a; --green-soft:#12211a;
+    --red:#e08f8f; --red-soft:#241416;
+    --blue:#8db8e0; --blue-soft:#111a26;
+    --gold:#d9bd74; --gold-soft:#221d10;
+    --purple:#b3a6de; --purple-soft:#1a1626;
+    --maxw:48rem;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;color-scheme:dark}
+  body{
+    margin:0; background:#0d0f12; color:var(--ink);
+    font-family:"Lora",Georgia,"Times New Roman",serif;
+    font-size:1.0625rem; line-height:1.75;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:6rem 1.25rem 5rem}
+  .kicker{
+    font-size:.7rem; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--muted); font-weight:600; margin:0 0 .9rem;
+  }
+  h1{font-size:clamp(2.1rem,5.4vw,3.15rem); line-height:1.1; font-weight:700; margin:0 0 1.1rem; letter-spacing:-.015em}
+  .dek{font-size:1.22rem; line-height:1.6; color:#cfccc5; margin:0 0 1.4rem; font-style:italic}
+  .byline{font-size:.9rem; color:var(--muted); margin:0 0 1.6rem}
+  .tags{display:flex;flex-wrap:wrap;gap:.45rem;margin:0 0 2.6rem}
+  .tag{
+    font-size:.74rem;font-weight:600;font-family:"Roboto Mono",monospace;
+    background:#161a21;border:1px solid #333a45;border-radius:.35rem;
+    padding:.28rem .55rem;color:#cfd5df;
+    box-shadow:inset 0 1px 0 #ffffff14, 0 1px 0 #00000060;
+  }
+  nav.toc{
+    background:var(--soft); border:1px solid var(--line); border-radius:.6rem;
+    padding:1.1rem 1.4rem; margin:0 0 3rem;
+  }
+  nav.toc h2{font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 .6rem;font-weight:600}
+  nav.toc ol{margin:0;padding-left:1.2rem;columns:2;column-gap:2rem;font-size:.92rem;line-height:1.7}
+  nav.toc li{break-inside:avoid;break-inside:avoid-column}
+  @media (max-width:640px){nav.toc ol{columns:1}}
+  nav.toc a{color:var(--ink);text-decoration:none;border-bottom:1px solid transparent}
+  nav.toc a:hover{border-bottom-color:var(--ink)}
+  h2{font-size:1.62rem;line-height:1.25;margin:3.2rem 0 1rem;font-weight:700;letter-spacing:-.01em}
+  h3{font-size:1.2rem;margin:2.2rem 0 .6rem;font-weight:700}
+  p{margin:0 0 1.15rem}
+  a{color:var(--blue);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px}
+  strong{font-weight:700}
+  em{font-style:italic}
+  ul,ol{margin:0 0 1.2rem;padding-left:1.4rem}
+  li{margin:.35rem 0}
+  blockquote{
+    margin:1.8rem 0;padding:.2rem 0 .2rem 1.2rem;border-left:3px solid #3a414c;
+    color:#b6bec9;font-size:1.1rem;font-style:italic;
+  }
+  code{font-family:"Roboto Mono",ui-monospace,monospace;font-size:.86em;background:#1a1e26;color:#e3e7ee;border-radius:.25rem;padding:.12em .35em}
+  pre{
+    background:#0b0e12;color:#dce1e8;border:1px solid #23292f;border-radius:.55rem;padding:1.05rem 1.2rem;
+    overflow-x:auto;font-size:.84rem;line-height:1.65;margin:1.4rem 0;
+    box-shadow:0 2px 10px #00000012;
+  }
+  pre code{background:none;padding:0;color:inherit;font-size:inherit}
+  .callout{
+    border:1px solid var(--cream-line); background:var(--cream); border-radius:.6rem;
+    padding:1rem 1.25rem; margin:1.6rem 0; font-size:.98rem;
+  }
+  .callout .label{font-size:.68rem;letter-spacing:.16em;text-transform:uppercase;font-weight:700;color:var(--gold);display:block;margin-bottom:.25rem}
+  .callout.lesson{border-color:#cfd9e6;background:var(--blue-soft)}
+  .callout.lesson .label{color:var(--blue)}
+  .callout.warn{border-color:#e8c9c9;background:var(--red-soft)}
+  .callout.warn .label{color:var(--red)}
+  figure{margin:2.6rem 0;padding:0}
+  @media (min-width:1000px){
+    figure.wide{margin-left:-6rem;margin-right:-6rem}
+    figure.wide figcaption{max-width:var(--maxw);margin-left:auto;margin-right:auto}
+    /* code is copied verbatim from the branch, so give it more room than the prose column
+       instead of rewrapping lines that exist exactly that way in the file */
+    .codebox{margin-left:-4rem;margin-right:-4rem}
+  }
+  figure svg{width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:.6rem;background:#12161d}
+  figcaption{font-size:.83rem;color:var(--muted);margin-top:.7rem;line-height:1.55;text-align:center}
+  .tablewrap{overflow-x:auto;margin:1.6rem 0;border:1px solid var(--line);border-radius:.6rem;
+    scrollbar-width:thin;scrollbar-color:#2a323b transparent}
+  .tablewrap::-webkit-scrollbar{height:6px}
+  .tablewrap::-webkit-scrollbar-track{background:transparent}
+  .tablewrap::-webkit-scrollbar-thumb{background:#2a323b;border-radius:3px}
+  table code{overflow-wrap:anywhere}
+  table{border-collapse:collapse;width:100%;font-size:.88rem;line-height:1.5}
+  th,td{text-align:left;padding:.6rem .75rem;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--soft);font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.step{font-family:"Roboto Mono",monospace;font-size:.8rem;color:var(--muted);white-space:normal}
+  .chip{display:inline-block;font-family:"Roboto Mono",monospace;font-size:.7rem;font-weight:500;
+        padding:.12rem .42rem;border-radius:.3rem;border:1px solid;white-space:nowrap}
+  .chip.ok{color:var(--green);border-color:#2f5a3f;background:var(--green-soft)}
+  .chip.blocked{color:var(--red);border-color:#4a2a2a;background:var(--red-soft)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));gap:.8rem;margin:1.8rem 0}
+  .stat{border:1px solid var(--line);border-radius:.6rem;padding:.9rem 1rem;background:var(--soft)}
+  .stat .n{font-size:1.9rem;font-weight:700;line-height:1.1;letter-spacing:-.02em}
+  .stat .l{font-size:.74rem;color:var(--muted);line-height:1.35;margin-top:.25rem}
+  .stat.green .n{color:var(--green)} .stat.blue .n{color:var(--blue)}
+  .stat.gold .n{color:var(--gold)} .stat.red .n{color:var(--red)}
+  hr.sep{border:0;border-top:1px solid var(--line);margin:3.2rem 0}
+  .footnotes{font-size:.83rem;color:var(--muted);line-height:1.6;border-top:1px solid var(--line);margin-top:3.5rem;padding-top:1.3rem}
+  .footnotes ol{padding-left:1.1rem}
+  footer{margin-top:3.2rem;font-size:.85rem;color:var(--muted);font-style:italic}
+  sup a{text-decoration:none;font-size:.72em}
+  ::selection{background:#4a3c1a}
+
+  section.step{border-top:1px solid var(--line);margin-top:2.6rem;padding-top:2.4rem;scroll-margin-top:1.5rem}
+  section.step:first-of-type{border-top:0;margin-top:1.4rem;padding-top:.4rem}
+  section.step h2{margin:.1rem 0 .7rem;font-size:1.42rem}
+  section.step h3{font-size:1.05rem;margin:1.8rem 0 .5rem}
+  .step-kicker{font-family:"Roboto Mono",monospace;font-size:.7rem;letter-spacing:.15em;text-transform:uppercase;margin:0;font-weight:500}
+  .rung-index{display:flex;flex-wrap:wrap;gap:.35rem;margin:-2rem 0 3rem}
+  .rung-index a{font-family:"Roboto Mono",monospace;font-size:.7rem;text-decoration:none;color:var(--muted);
+    border:1px solid var(--line);border-radius:.35rem;padding:.24rem .45rem;background:var(--soft);
+    display:inline-flex;gap:.35rem;align-items:center}
+  .rung-index a:hover{color:var(--ink);border-color:#3a414c}
+  .rung-index a b{color:var(--ink);font-weight:600}
+  .rung-index a i{font-style:normal;font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;opacity:.8}
+  .step-meta{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.2rem 0 1rem;font-size:.84rem;color:var(--muted)}
+  .step-meta strong{color:var(--ink);font-weight:600}
+  .step-phase{font-family:"Roboto Mono",monospace;font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);opacity:.85}
+  .codebox{margin:1.3rem 0 1.8rem;border:1px solid #23292f;border-radius:.6rem;overflow:hidden;background:#0b0e12}
+  .codebox-head{display:flex;flex-wrap:wrap;gap:.55rem;align-items:baseline;padding:.5rem .8rem;
+    border-bottom:1px solid #1d232a;background:#11151b;font-family:"Roboto Mono",monospace;font-size:.72rem}
+  .codebox-head .fname{color:#cfd5df}
+  .codebox-head .delta{color:var(--muted)}
+  .codebox-head .delta b{color:#7fce9a;font-weight:500}
+  .codebox-head .delta i{color:#e08f8f;font-style:normal;font-weight:500}
+  .codebox-head .why{margin-left:auto;color:var(--muted);font-style:italic;font-family:Lora,serif}
+  .codebox pre{margin:0;border:0;border-radius:0;box-shadow:none;background:transparent;padding:.85rem 1rem;font-size:.755rem;line-height:1.62;overflow-x:auto;scrollbar-width:thin;scrollbar-color:#2a323b transparent}
+  .codebox pre::-webkit-scrollbar{height:7px}
+  .codebox pre::-webkit-scrollbar-thumb{background:#2a323b;border-radius:4px}
+  pre::-webkit-scrollbar{height:8px}pre::-webkit-scrollbar-track{background:transparent}pre::-webkit-scrollbar-thumb{background:#2a323b;border-radius:4px}
+  .codebox pre .c{color:#7b8794;font-style:italic}      /* comment */
+  .codebox pre .k{color:#9db8e8;font-weight:500}        /* keyword */
+  .codebox pre .t{color:#8fd0e0}                        /* type / module keyword */
+  .codebox pre .s{color:#d9bd74}                        /* string */
+  .codebox pre .n{color:#c3b3e8}                        /* number / constant */
+  .codebox pre .b{color:#7fce9a}                        /* builtin / function */
+  .codebox pre .o{color:#a7b0bf}                        /* operator / punctuation */
+  .codebox pre .m{color:#d0aa8e}                        /* macro / directive */
+  .codebox pre .f{color:#e7e4de}                        /* filename header refs */
+  .codebox pre .x{color:#e08f8f}                        /* string escape / warning */
+  .codebox pre .n{color:#c9b6f0}
+  .step-fig{margin:1.4rem 0 2.2rem}
+  .step-fig .rung-diagram{background:var(--soft);border:1px solid var(--line);border-radius:.65rem;padding:.7rem .8rem}
+  .step-fig .rung-diagram svg{width:100%;height:auto;display:block;border:0;background:transparent}
+  .rung-diagram{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media (max-width:760px){
+    .wrap{padding-top:3rem}
+    figure{overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:.4rem}
+    figure svg,.rung-diagram svg{min-width:660px}
+    figure.wide{overflow-x:auto}
+    figcaption{font-size:.78rem;text-align:left}
+  }
+  @media print{
+    body{font-size:10.5pt}
+    .wrap{padding:0;max-width:100%}
+    nav.toc,.tags{display:none}
+    pre{box-shadow:none}
+    figure{break-inside:avoid}
+    a{color:inherit}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="kicker">tiny-tpu &rarr; openTPU</p>
+  <h1>A TPU you can read</h1>
+  <p class="dek">The first branch added 310,000 lines and more than half of them were copied from
+  somebody else's tree. This one is nine rungs, twenty-two commits, and every line written here. Below is each rung
+  in order &mdash; what it was for, the code that mattered, what it caught &mdash; and then, last,
+  the toolchain question the whole ladder exists to answer.</p>
+  <p class="byline">November 2026 &middot; the tiny-tpu crew &middot; ~20 min read</p>
+  <div class="tags">
+    <span class="tag">hardware</span><span class="tag">TPU</span><span class="tag">SystemVerilog</span>
+    <span class="tag">LLM inference</span><span class="tag">int8</span><span class="tag">openXC7</span>
+  </div>
+
+  <nav class="toc" aria-label="Contents">
+    <h2>The ladder, then the tools</h2>
+    <ol>
+      <li><a href="#why">Why this branch exists</a></li>
+      <li><a href="#rung0">m0 &middot; the plan</a></li>
+      <li><a href="#rung1">m1 &middot; our own fp32</a></li>
+      <li><a href="#rung3">m3 &middot; our own ISA and machine</a></li>
+      <li><a href="#rung4">m4 &middot; the memory map</a></li>
+      <li><a href="#rung5">m5 &middot; the decode kernels</a></li>
+      <li><a href="#rung6">m6 &middot; one layer, composed</a></li>
+      <li><a href="#rung9">m9 &middot; a real token</a></li>
+      <li><a href="#openxc7">openXC7, last</a></li>
+      <li><a href="#tally">What it adds up to</a></li>
+    </ol>
+  </nav>
+
+  <div class="stats">
+    <div class="stat green"><div class="n">9</div><div class="l">rungs, each one commit</div></div>
+    <div class="stat green"><div class="n">5,175</div><div class="l">lines we wrote</div></div>
+    <div class="stat gold"><div class="n">0</div><div class="l">lines imported</div></div>
+    <div class="stat blue"><div class="n">96</div><div class="l">tests (95 pass, 1 skip)</div></div>
+    <div class="stat blue"><div class="n">6/6</div><div class="l">rungs with a PASS receipt</div></div>
+    <div class="stat"><div class="n">23.5<span style="font-size:.95rem">&nbsp;MiB</span></div><div class="l">int8 weights, decoded in sim</div></div>
+  </div>
+
+  <hr class="sep">
+
+<section class="step" id="why">
+    <p class="step-kicker" style="color:var(--red)">Before the rungs</p>
+    <h2>Why this branch exists</h2>
+
+    <p>The goal was never to reproduce openTPU byte for byte. It was: <strong>reproduce what
+    tiny-tpu taught us, at the smallest size that can run a real LLM.</strong> The first attempt
+    answered a different question &mdash; it copied the production tree and pruned it:</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>measured as a net diff from the same base commit</th><th>first branch</th><th>this branch</th></tr></thead>
+        <tbody>
+          <tr><td>commits</td><td>28</td><td><strong>22</strong></td></tr>
+          <tr><td>files changed</td><td>1,037</td><td><strong>62</strong></td></tr>
+          <tr><td>lines added</td><td>310,178</td><td><strong>5,175</strong></td></tr>
+          <tr><td>lines sitting in files byte-identical to the production tree</td><td>197,981 &middot; 515 of 972 added files</td><td><strong>0</strong></td></tr>
+          <tr><td>share that is somebody else's code</td><td>63.8% of lines, 50% of files</td><td><strong>0%</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout lesson">
+      <span class="label">The rule that makes a ladder honest</span>
+      <p style="margin:0"><code>docs/isa.md</code> is a <strong>specification</strong>. Implementing
+      from a specification is authorship. Copying <code>opentpu/isa.py</code> is not. Every line of
+      implementation below, we wrote &mdash; and where the spec had a corner nobody documented, we
+      wrote a test for it and left the test in.</p>
+    </div>
+
+    <p>What that rule cost, in the two places it was expensive:</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>what the first branch imported</th><th>lines</th><th>what replaced it</th><th>our lines</th></tr></thead>
+        <tbody>
+          <tr><td class="step">rtl/ladder/otpu_fp.sv</td><td>536</td><td class="step">rtl/fp32.sv + make_fp32_pkg.py + model/fp32.py</td><td><strong>769</strong></td></tr>
+          <tr><td class="step">opentpu/isa.py + isasim.py</td><td>1,352</td><td class="step">model/isa.py + model/sim.py</td><td><strong>805</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+<section class="step" id="rung0">
+    <p class="step-kicker">rung m0 &middot; +47 lines &middot; 1 file</p>
+    <h2>The plan, before any code</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">no tests &mdash; a plan</span>
+      <span class="step-phase">mini/docs/PLAN.md</span>
+    </div>
+
+    <p>m0 contains no implementation at all, and it is the rung that decides whether the rest is
+    honest. It writes down the rule and the rung list, so a later reader can check the branch
+    against its own stated criteria rather than against whatever it turned out to be.</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/docs/PLAN.md</span><span class="delta"><b>the seed</b></span><span class="why">47 lines that the other eight rungs are measured against</span></div>
+      <pre><span class="k">## The rule</span>
+
+<span class="o">&gt;</span> <span class="s">`docs/isa.md` is a specification. Implementing from a specification is not importing.`</span>
+
+Every line of implementation we commit, we wrote. Reading the spec and writing an
+encoder is authorship; copying `opentpu/isa.py` is not.
+
+<span class="k">## The rungs</span>
+
+| rung | what we write | why it exists |
+|---|---|---|
+| **m0** | — | the authored seed: toy TPU + mini-core + runner, already green |
+| **m1** | `mini/rtl/fp32.sv` + `mini/model/fp32.py` | our own fp32 arithmetic and its Python mirror |
+| **m3** | `mini/model/isa.py`, `mini/model/sim.py` | our own encoder and ISA machine, replacing `opentpu/` |
+| **m4** | `mini/model/layout.py` | where the TinyStories checkpoint lives in DRAM |
+| **m5** | `mini/kernels/llama.py` | matmul, RMSNorm and SwiGLU as program fragments |
+| **m7** | `mini/openflow/` | where the open-source FPGA flow stops working |</pre>
+    </div>
+
+    <p>Note what m0 also does: it deletes <code>rtl/ladder/otpu_fp.sv</code>, the 536-line
+    imported arithmetic package, on the first commit. The deletion is the point &mdash; the branch
+    starts by removing the thing it was going to lean on.</p>
+  </section>
+
+<section class="step" id="rung1">
+    <p class="step-kicker">rung m1 &middot; +935 lines &middot; 8 files &middot; 36 tests</p>
+    <h2>Our own fp32, bit-exact against our own model</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">2,118 vectors &middot; whole value &middot; no tolerance</span>
+    </div>
+
+    <p>The ISA's arithmetic is fp32 with unusual rules: round-to-nearest-even, <em>flush
+    denormals to zero</em>, a single canonical NaN, and comparisons on the raw sign-magnitude
+    bits rather than on numeric order. A "close enough" float library would be wrong here, so
+    m1 writes two things: a Python model from the spec's prose, and RTL that must match it.</p>
+
+    <p>The single decision that made the rung tractable is that there is <strong>one rounding
+    site</strong>. The adder is an exact integer add in an 8-guard-bit window; rounding happens
+    once, in one function:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/rtl/fp32.sv</span><span class="delta"><b>pack_fp</b></span><span class="why">the only place in the branch where a float is rounded</span></div>
+      <pre><span class="c">// Pack: the one rounding site. `mag` is a magnitude whose leading one sits at bit `lead`;</span>
+<span class="c">// `exp` is the biased exponent of that leading one. Rounds ties-to-even, flushes denormal</span>
+<span class="c">// results, saturates to infinity.</span>
+<span class="k">function automatic</span> f32_t pack_fp(<span class="k">input</span> <span class="t">logic</span> sign, <span class="k">input</span> <span class="t">logic</span> [63:0] mag,
+                                 <span class="k">input</span> <span class="t">integer</span> lead, <span class="k">input</span> <span class="t">logic</span> <span class="k">signed</span> [15:0] exp,
+                                 <span class="k">input</span> <span class="t">logic</span> extra_sticky = 1'b0);
+  <span class="t">logic</span> [63:0] win;
+  <span class="t">logic</span> [23:0] frac;
+  <span class="t">logic</span> sticky, guard, rnd;
+
+  <span class="k">if</span> (mag == 0) pack_fp = {sign, 31'd0};
+  <span class="k">else</span> <span class="k">begin</span>
+    <span class="c">// normalize: shift the leading one to bit 26, folding the shifted-out bits into sticky</span>
+    <span class="k">if</span> (lead &gt; 26) <span class="k">begin</span>
+      sh = lead - 26;
+      <span class="k">for</span> (k = 0; k &lt; 64; k = k + 1)
+        <span class="k">if</span> (k &lt; sh &amp;&amp; mag[k]) sticky = 1'b1;
+      win = mag &gt;&gt; sh;
+    <span class="k">end</span> <span class="k">else</span> <span class="k">begin</span>
+      win = mag &lt;&lt; (26 - lead);
+    <span class="k">end</span>
+    frac   = win[26:3];                       <span class="c">// 24 bits, MSB is the leading one</span>
+    guard  = win[2];
+    rnd    = win[1];
+    sticky = sticky | win[0] | extra_sticky;
+    <span class="k">if</span> (guard &amp;&amp; (rnd || sticky || frac[0])) frac = frac + 24'd1;   <span class="c">// ties-to-even</span>
+    <span class="k">if</span> (frac == 24'd0) <span class="k">begin</span>            <span class="c">// significand carried into the next binade</span>
+      frac = 24'h800000;
+      exp  = exp + 16'sd1;
+    <span class="k">end</span>
+    <span class="k">if</span> (exp &lt;= 0) <span class="k">begin</span>
+      <span class="c">// Round on the subnormal grid. Landing exactly on 2^-126 is a NORMAL value and is KEPT;</span>
+      <span class="c">// anything smaller is denormal and flushes.</span>
+      <span class="k">if</span> (exp &lt;= -16'sd22) pack_fp = {sign, 31'd0};
+      <span class="k">else</span> <span class="k">begin</span>
+        shift = 1 - exp;
+        frac2 = {1'b0, frac} &gt;&gt; shift;
+        rem_bits = {1'b0, frac} &amp; ((25'd1 &lt;&lt; shift) - 25'd1);
+        half = 25'd1 &lt;&lt; (shift - 1);
+        <span class="k">if</span> ((rem_bits &gt; half) || ((rem_bits == half) &amp;&amp; frac2[0])) frac2 = frac2 + 25'd1;
+        <span class="k">if</span> (frac2 &gt;= 25'h800000) pack_fp = {sign, 8'd1, 23'd0};   <span class="c">// rounded up to 2^-126: KEEP</span>
+        <span class="k">else</span>                     pack_fp = {sign, 31'd0};          <span class="c">// still denormal: flush</span>
+      <span class="k">end</span>
+    <span class="k">end</span>
+    <span class="k">else</span> <span class="k">if</span> (exp &gt;= 16'sd255) pack_fp = {sign, 8'hFF, 23'd0};    <span class="c">// overflow -&gt; infinity</span>
+    <span class="k">else</span>                      pack_fp = {sign, exp[7:0], frac[22:0]};
+  <span class="k">end</span>
+<span class="k">endfunction</span></pre>
+    </div>
+
+    <p>Then the RTL has something exact to be wrong against. The test builds the DUT with
+    iverilog and compares <strong>2,118 vectors, whole-value, bit for bit</strong>, with vectors
+    chosen to sit on the corners the spec names:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/tests/test_m1_fp32_rtl.py</span><span class="delta"><b>the corner set</b></span><span class="why">every vector here is a place a naive implementation differs</span></div>
+      <pre>INTERESTING = [
+    0x00000000, 0x80000000,                      <span class="c"># +0, -0</span>
+    0x3F800000, 0xBF800000,                      <span class="c"># +-1</span>
+    0x7F7FFFFF, 0xFF7FFFFF,                      <span class="c"># +-max normal</span>
+    0x00800000, 0x80800000,                      <span class="c"># +-smallest normal</span>
+    0x00000001, 0x80000001,                      <span class="c"># +-smallest denormal (flushes)</span>
+    0x00FFFFFF,                                  <span class="c"># denormal near the boundary</span>
+    0x7F800000, 0xFF800000,                      <span class="c"># +-inf</span>
+    0x7FC00000, 0xFFC00000,                      <span class="c"># canonical NaN, sign-set NaN</span>
+    0x7F800001,                                  <span class="c"># signalling-style NaN</span>
+    0x43000000, 0xC2FC0000, 0x42FE0000,          <span class="c"># 128, -126, 127</span>
+    0x4B000000,                                  <span class="c"># 2^23</span>
+    0x4B800000,                                  <span class="c"># 2^24</span>
+]</pre>
+    </div>
+
+    <h3>The corners the tests found</h3>
+    <p>All real behaviour differences, none of them visible by reading:</p>
+    <ul>
+      <li>an 8-bit exponent cast that wrapped 128 &rarr; &minus;128;</li>
+      <li><code>inf + (&minus;inf)</code> must be the <strong>canonical &plus;NaN</strong>, not a
+      sign-preserving infinity;</li>
+      <li>a subnormal result the spec explicitly says must be <strong>kept</strong> &mdash;
+      <code>0.5 &times; 0x00FFFFFF = 2<sup>&minus;126</sup></code>;</li>
+      <li>a <code>floor()</code> off by one for negative fractions;</li>
+      <li>a sticky bit that never reached the rounding site &mdash; a genuine 1-ULP error where
+      <em>the model was right and the RTL was wrong</em>.</li>
+    </ul>
+
+    <div class="callout lesson">
+      <span class="label">Why the model comes first</span>
+      <p style="margin:0">That 1-ULP sticky bit is the argument for the whole rung. With no
+      bit-exact oracle, <strong>a 1-ULP error looks exactly like success.</strong> The model pins
+      the semantics; the RTL is only allowed to disagree with the model, never with the spec.</p>
+    </div>
+  </section>
+
+<section class="step" id="rung3">
+    <p class="step-kicker">rung m3 &middot; +1,101 lines &middot; 4 files &middot; 28 tests</p>
+    <h2>Our own ISA encoder and reference machine</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">13 opcodes &middot; 8 words per instruction</span>
+    </div>
+
+    <p>This is the rung that replaces 1,352 imported lines with 805 of ours. It has two halves:
+    an <em>encoder</em> that says what the bits are, and a <em>machine</em> that says what they do.
+    Keeping them separate is what makes the encoder testable on its own.</p>
+
+    <p>The instruction format is the whole of the ISA's addressing, so it is short enough to
+    show in full:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/model/isa.py</span><span class="delta"><b>w0</b></span><span class="why">one word carries the opcode, four registers and the flags</span></div>
+      <pre><span class="c"># w0 = opcode[7:0] | ra[11:8] | rb[15:12] | rc[19:16] | rd[23:20] | flags[31:24]</span>
+
+<span class="k">def</span> word(op: <span class="t">int</span>, ra=0, rb=0, rc=0, rd=0, flags=0) -&gt; <span class="t">int</span>:
+    <span class="k">return</span> (op            | (ra    &lt;&lt; <span class="n">8</span>)  | (rb    &lt;&lt; <span class="n">12</span>)
+            | (rc  &lt;&lt; <span class="n">16</span>) | (rd    &lt;&lt; <span class="n">20</span>) | (flags &lt;&lt; <span class="n">24</span>))
+
+<span class="c"># only the thirteen the mini-core actually implements</span>
+OP_NOP  = <span class="n">0x00</span>;  OP_HALT = <span class="n">0x01</span>;  OP_LI   = <span class="n">0x02</span>;  OP_ADDI = <span class="n">0x03</span>
+OP_LOOP = <span class="n">0x04</span>;  OP_BAR  = <span class="n">0x05</span>;  OP_RLD  = <span class="n">0x06</span>
+OP_LD   = <span class="n">0x10</span>;  OP_ST   = <span class="n">0x11</span>
+OP_MM   = <span class="n">0x20</span>;  OP_QACT = <span class="n">0x21</span>;  OP_QST  = <span class="n">0x22</span>;  OP_VOP = <span class="n">0x30</span></pre>
+    </div>
+
+    <p>The machine is where the spec's arithmetic becomes behaviour. The MM opcode is the one
+    that matters for LLM work &mdash; an exact integer accumulate loop with an fp32 epilogue:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/model/sim.py</span><span class="delta"><b>_mm</b></span><span class="why">int8 weights, exact integer accumulation, three-multiply epilogue</span></div>
+      <pre><span class="k">def</span> _mm(self, w, ra, rb, rc, flags):
+    <span class="s">"""The exact-integer accumulate loop with the fp32 epilogue (docs/isa.md "MM")."""</span>
+    sa  = self.rget(ra) + w[<span class="n">1</span>]      <span class="c"># weight base (DRAM bytes)</span>
+    ssa = self.rget(rb) + w[<span class="n">2</span>]      <span class="c"># scale base   (DRAM BYTES, not TMEM words)</span>
+    out = self.rget(rc) + w[<span class="n">3</span>]      <span class="c"># TMEM word address</span>
+    n  = w[<span class="n">4</span>] &amp; <span class="n">0xFFFF</span>          <span class="c"># output rows</span>
+    kb = (w[<span class="n">4</span>] &gt;&gt; <span class="n">16</span>) &amp; <span class="n">0xFF</span>    <span class="c"># K-blocks of depth D</span>
+    ab = (w[<span class="n">6</span>] &gt;&gt; <span class="n">24</span>) &amp; <span class="n">0xFF</span>
+    D  = self.cfg.D
+
+    <span class="k">for</span> j <span class="k">in</span> range(m):
+        sw = F.bits(<span class="n">1.0</span>) <span class="k">if</span> unit <span class="k">else</span> <span class="k">None</span>
+        <span class="k">for</span> col <span class="k">in</span> range(n):
+            accm = <span class="n">0</span>
+            <span class="k">if</span> <span class="k">not</span> unit:
+                <span class="c"># the scale row is DRAM: the row's fp32 scale, then one byte per block</span>
+                sw = self.rd32(ssa + col * srs)
+            <span class="k">for</span> k <span class="k">in</span> range(kb):
+                dw = <span class="n">0</span> <span class="k">if</span> (unit <span class="k">or</span> (flags &amp; isa.MM_RSC)) <span class="k">else</span> \
+                    self.rd8(self._scale_byte_addr(ssa, srs, col, k0 + k))
+                <span class="k">for</span> b <span class="k">in</span> range(<span class="n">4</span>):
+                    c = <span class="n">0</span>
+                    <span class="k">for</span> i <span class="k">in</span> range(D // <span class="n">4</span>):
+                        actv = self.slice.act[row * self.cfg.ACT_BLOCKS * D
+                                              + (ab + k) * D + b * (D // <span class="n">4</span>) + i]
+                        <span class="k">if</span> actv &gt;= <span class="n">128</span>:
+                            actv -= <span class="n">256</span>                  <span class="c"># ACT RAM is int8</span>
+                        wv = self.rd8(sa + col * rs + k * D + b * (D // <span class="n">4</span>) + i)
+                        <span class="k">if</span> wv &gt;= <span class="n">128</span>:
+                            wv -= <span class="n">256</span>
+                        c += actv * wv
+                    <span class="c"># the sub-block offset shifts this quarter-block, not the whole accumulator</span>
+                    sh = <span class="n">16</span> - dw - (<span class="n">0</span> <span class="k">if</span> unit <span class="k">else</span> self.slice.da[row][ab + k][b])
+                    <span class="k">if</span> sh &gt;= <span class="n">0</span>:
+                        accm += (c &lt;&lt; sh)
+            <span class="c"># epilogue: y = (i2f(acc) * Sw) * (Sa * 2^-W), with W = 16 for int8</span>
+            y = F.mul(F.mul(F.i2f(accm), sw),
+                      F.mul(self.slice.sa[j * self.cfg.ACT_BLOCKS + ab],
+                            F.bits(<span class="n">2.0</span> ** <span class="o">-</span><span class="n">16</span>)))
+            old = self.tget(out + j * ors + col)
+            y = F.add(old, y) <span class="k">if</span> acc <span class="k">else</span> y</pre>
+    </div>
+
+    <p>Two things in that snippet are already load-bearing for later rungs, and both were
+    <em>documented</em> before the kernels depended on them: <code>ssa</code> is a DRAM
+    <strong>byte</strong> address (not a TMEM word index), and the epilogue multiplies by
+    <code>2<sup>&minus;W</sup></code> where <code>W = 16</code> for int8.</p>
+
+    <h3>What the 28 tests cover</h3>
+    <p>The encoder tests are cheap and exact; the machine tests are the ones that found things:</p>
+    <ul>
+      <li>w0's bit layout, and <code>MM</code>'s byte lanes 
+      (<code>w4 = N | KB&lt;&lt;16 | k0&lt;&lt;24</code>, <code>w6 = ors | M&lt;&lt;16 | ab&lt;&lt;24</code>);</li>
+      <li><code>R0</code> reads as 0 and <code>R8..R15</code> take the run's arguments;</li>
+      <li><code>LOOP</code> runs, skips on a zero count, nests, and refuses more than four levels;</li>
+      <li><code>LD</code>/<code>ST</code> move words and reject unaligned DRAM addresses;</li>
+      <li>the quantizer's per-row scale and per-sub-block offsets;</li>
+      <li>an end-to-end program: load two DRAM words, add them as fp32, store &mdash; <strong>3.75</strong>.</li>
+    </ul>
+  </section>
+
+<section class="step" id="rung4">
+    <p class="step-kicker">rung m4 &middot; +358 lines &middot; 5 files &middot; 11 tests</p>
+    <h2>The memory map, and a DRAM that holds it</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">32 MiB DRAM &middot; 23.5 MiB weights</span>
+    </div>
+
+    <p>m4 is where the checkpoint's real shape first bites. We had assumed hidden 288 and about
+    13&nbsp;MB of weights; the model's own <code>config.json</code> said
+    <strong>hidden 384</strong> and the projections are <code>n_heads*head_dim = 768</code> wide,
+    not 384. So the layer stride is arithmetic worth writing down rather than hiding in a kernel:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/model/layout.py</span><span class="delta"><b>LAYER_STRIDE</b></span><span class="why">every matrix in one layer, sized from the real tensors</span></div>
+      <pre>LAYER_STRIDE = (HIDDEN * ATTN_WIDTH * <span class="n">4</span>     <span class="c"># q, k, v, o  (each HIDDEN x ATTN_WIDTH)</span>
+                + HIDDEN * FFN * <span class="n">3</span>            <span class="c"># gate, up, down</span>
+                + HIDDEN * <span class="n">4</span> * <span class="n">2</span>)             <span class="c"># rms1, rms2 (fp32)</span>
+LAYER_STRIDE = _align(LAYER_STRIDE)        <span class="c"># D-aligned: MM streams whole chunks</span></pre>
+    </div>
+
+    <p>Running that against the real model gives the numbers the blog depends on:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">python3 mini/model/layout.py</span><span class="delta"><b>the map</b></span><span class="why">printed by the module itself, not composed by hand</span></div>
+      <pre>TinyStories-Llama-15M int8 layout (32 MiB DRAM)
+  hidden 384, head_dim 128, 6 layers, ffn 768, vocab 32000 (tied embeddings)
+
+  embed        0x00000000 .. 0x00bb8000 (   12000 KiB)
+  L&lt;n&gt;.wq     base+0x000000 (     288 KiB)  * 6 layers
+  L&lt;n&gt;.wk     base+0x048000 (     288 KiB)  * 6
+  L&lt;n&gt;.wv     base+0x090000 (     288 KiB)  * 6
+  L&lt;n&gt;.wo     base+0x0d8000 (     288 KiB)  * 6
+  L&lt;n&gt;.gate   base+0x120000 (     288 KiB)  * 6
+  L&lt;n&gt;.up     base+0x168000 (     288 KiB)  * 6
+  L&lt;n&gt;.down   base+0x1b0000 (     288 KiB)  * 6
+  L&lt;n&gt;.rms1   base+0x1f8000 (       2 KiB)  * 6
+  L&lt;n&gt;.rms2   base+0x1f8600 (       2 KiB)  * 6
+  activations  0x0178ce00 .. 0x0180ce00 (     512 KiB)
+  kv           0x0180ce00 .. 0x01c8ce00 (    4608 KiB)
+  scratch      0x01c8ce00 .. 0x01ccce00 (     256 KiB)
+
+  weights end    0x0178ce00 (24116 KiB)
+  total used     0x01ccce00 (29492 KiB) of 0x02000000
+  fits           True</pre>
+    </div>
+
+    <p>And that forced a hardware change in the same commit: the mini-core's DRAM was sized for
+    a toy. DRAM went <strong>256&nbsp;KB &rarr; 32&nbsp;MiB</strong> and TMEM
+    <strong>4,096 &rarr; 8,192 words</strong>, because a decode layer's whole activation tile
+    needs <strong>6,416 words</strong> and 4,096 could not hold it.</p>
+
+    <div class="callout warn">
+      <span class="label">A number we had to fix later</span>
+      <p style="margin:0">The docstring in this rung said weights total
+      <strong>19,955,712 B (19.0 MiB)</strong>. It was written before the tensors were read and
+      sized q and o as <code>h&times;h</code>. The code was corrected when m9 read the checkpoint;
+      the prose wasn't, and stayed wrong for five rungs. Corrected &mdash; <strong>24,692,736 B
+      (23.5 MiB)</strong> &mdash; in a later commit. The lesson is small and general: <strong>the
+      number in the comment is the one nothing tests, so it rots first.</strong></p>
+    </div>
+
+    <p>One more fact changed the conclusion rather than just a number. With the LM head
+    <em>tied</em> to the embedding, 11.7&nbsp;MiB serves both roles and the map fits. Untied, the
+    same model needs <strong>35.3&nbsp;MiB and does not fit 32&nbsp;MiB at all.</strong> Tying
+    isn't an optimisation here; it's the reason the map exists.</p>
+  </section>
+
+<section class="step" id="rung5">
+    <p class="step-kicker">rung m5 &middot; +351 lines &middot; 7 files &middot; 9 tests</p>
+    <h2>The decode kernels, and five bugs running them found</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">matmul &middot; RMSNorm &middot; SwiGLU</span>
+    </div>
+
+    <p>The kernels are program <em>fragments</em> emitted through our own encoder &mdash; not C,
+    not a compiler. A matmul is four instructions, which is the shortest useful thing to show
+    because each immediate is a different kind of address:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/llama.py</span><span class="delta"><b>matmul()</b></span><span class="why">weight base, scale base and TMEM output, in four instructions</span></div>
+      <pre><span class="k">def</span> matmul(weights, out_tmem, n, kb, *, ab=<span class="n">0</span>, rs=<span class="k">None</span>, srs=<span class="k">None</span>, acc=<span class="k">False</span>, rmax=<span class="k">False</span>):
+    <span class="s">"""One MM: ACT RAM activations against `n` rows of int8 weights streamed from DRAM."""</span>
+    rs  = L.HIDDEN <span class="k">if</span> rs  <span class="k">is</span> <span class="k">None</span> <span class="k">else</span> rs    <span class="c"># row stride in the weights (BYTES)</span>
+    srs = L.scale_row_bytes(kb) <span class="k">if</span> srs <span class="k">is</span> <span class="k">None</span> <span class="k">else</span> srs
+    <span class="k">return</span> [
+        isa.li(<span class="n">1</span>, weights),              <span class="c"># R1 = weights</span>
+        isa.li(<span class="n">2</span>, weights + rs * n),      <span class="c"># R2 = scale rows FOLLOW the weight bytes</span>
+        isa.li(<span class="n">3</span>, out_tmem * <span class="n">4</span>),          <span class="c"># R3 = MM's out field is a TMEM WORD address</span>
+        isa.mm(<span class="n">1</span>, <span class="n">2</span>, <span class="n">3</span>, n=n, kb=kb, m=<span class="n">1</span>, ab=ab, rs=rs, ors=<span class="n">1</span>, srs=srs, acc=acc, rmax=rmax),
+    ]</pre>
+    </div>
+
+    <p>RMSNorm is the fragment that shows the ISA's shape most clearly, because the ISA has no
+    divide &mdash; the reciprocal square root is a VOP function, and the scalar chain has to live
+    somewhere that isn't the source tile:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/llama.py</span><span class="delta"><b>rmsnorm()</b></span><span class="why">a scalar chain in T_SCRATCH, never touching src</span></div>
+      <pre><span class="k">def</span> rmsnorm(src, dst, weight, rows=<span class="n">1</span>, n=<span class="k">None</span>, scratch=<span class="k">None</span>):
+    <span class="s">"""RMSNorm: y = x * rsqrt(mean(x^2) + eps) * gamma.
+
+    The ISA has no divide, so the reciprocal square root of the mean square is the RSQRT VOP.
+    The scalar chain lives in T_SCRATCH and never touches `src`, which the final multiplicands
+    still need.
+    """</span>
+    <span class="k">return</span> [
+        <span class="c"># T_SCRATCH = sum(x^2)</span>
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, dst_imm=sc, a_imm=src, rows=rows, cols=n, func=isa.F_RSSQ),
+        <span class="c"># mean = sum * (1/n)</span>
+        isa.li(<span class="n">4</span>, _f32_word(<span class="n">1.0</span> / n)),
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">4</span>, dst_imm=sc, a_imm=sc, rows=<span class="n">1</span>, cols=<span class="n">1</span>,
+                func=isa.F_MUL, bmode=<span class="n">3</span>),          <span class="c"># bmode=3: b comes from an immediate REGISTER</span>
+        <span class="c"># + eps</span>
+        isa.li(<span class="n">5</span>, _f32_word(<span class="n">7.5e-6</span>)),
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">5</span>, dst_imm=sc, a_imm=sc, rows=<span class="n">1</span>, cols=<span class="n">1</span>, func=isa.F_ADD, bmode=<span class="n">3</span>),
+        <span class="c"># the factor</span>
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, dst_imm=sc, a_imm=sc, rows=<span class="n">1</span>, cols=<span class="n">1</span>, func=isa.F_RSQRT),
+        <span class="c"># dst = src * factor           (factor via b_imm, so `src` is untouched)</span>
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, dst_imm=dst, a_imm=src, b_imm=sc, rows=rows, cols=n,
+                func=isa.F_MUL, bmode=<span class="n">2</span>),
+        <span class="c"># dst = dst * gamma</span>
+        isa.vop(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, dst_imm=dst, a_imm=dst, b_imm=weight, rows=rows, cols=n,
+                func=isa.F_MUL, bmode=<span class="n">2</span>),
+    ]</pre>
+    </div>
+
+    <h3>The five bugs the tests found</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>the bug</th><th>what it did</th></tr></thead>
+        <tbody>
+          <tr><td>VOP's <code>ra</code> addresses the destination while <code>rd</code> supplies the immediate</td>
+            <td>we passed <code>ra=4</code>, so every TMEM address became R4's <em>fp32 bits</em>. The machine tried to write to address 1069071675 and stopped.</td></tr>
+          <tr><td>silu negated <em>after</em> <code>exp2</code> instead of inside the constant</td>
+            <td>computed &minus;<code>exp(x)</code>: returned &minus;0.58 for x = 1, where the answer is +0.73.</td></tr>
+          <tr><td>ACT RAM holds <strong>int8</strong>, and we read it as unsigned</td>
+            <td>&minus;2 became 254, and a dot product of 33 came out as 1569 &mdash; 47&times; too large.</td></tr>
+          <tr><td>MM's scale rows are DRAM <em>bytes</em>, not TMEM words</td>
+            <td>the spec's <code>ssa</code> is a byte address; we read it as a TMEM word index.</td></tr>
+          <tr><td>RMSNorm wrote its reduction into its own source tile</td>
+            <td>then multiplied the clobbered values and returned zeros.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout lesson">
+      <span class="label">Test the number, not the smoke</span>
+      <p style="margin:0">Every one of those five produced <em>plausible-looking instructions</em>.
+      A test that checked "does it run" would have passed all five. Only running them on real
+      values catches a sign extension and a negated silu.</p>
+    </div>
+  </section>
+
+<section class="step" id="rung6">
+    <p class="step-kicker">rung m6 &middot; +1,063 lines &middot; 6 tests</p>
+    <h2>One decoder layer, composed</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">rmsnorm &rarr; qkv &rarr; attention &rarr; wo &rarr; mlp &rarr; residual</span>
+    </div>
+
+    <p>Each kernel being right alone is not the same as them composing. m6 drives one layer in
+    the order a token runs it and compares against the same computation in plain Python over
+    the <em>same</em> quantized weights.</p>
+
+    <p>The rung's most important change is structural rather than algorithmic: the layer gets
+    <strong>distinct TMEM regions per role</strong> instead of reusing buffers. That decision is
+    the whole of <code>Shape</code>'s map, and it is worth showing because three of the five bugs
+    below were aliasing inside it:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/layer.py</span><span class="delta"><b>the TMEM map</b></span><span class="why">one region per role; every term here was a bug at some point</span></div>
+      <pre><span class="c"># the attention projections are n_heads*head_dim wide, which is NOT hidden in general</span>
+<span class="k">@property</span>
+<span class="k">def</span> attn_width(self): <span class="k">return</span> self.n_heads * self.head_dim
+
+t_x = <span class="n">0</span>                                        <span class="c"># the residual stream</span>
+
+<span class="k">@property</span>
+<span class="k">def</span> t_n(self):     <span class="k">return</span> self.t_x + self.hidden     <span class="c"># norm output</span>
+<span class="k">@property</span>
+<span class="k">def</span> t_q(self):     <span class="k">return</span> self.t_n + self.hidden     <span class="c"># q is ATTN_WIDTH wide</span>
+<span class="k">@property</span>
+<span class="k">def</span> t_k(self):     <span class="k">return</span> self.t_q + self.attn_width
+<span class="k">@property</span>
+<span class="k">def</span> t_v(self):     <span class="k">return</span> self.t_k + self.attn_width
+<span class="k">@property</span>
+<span class="k">def</span> t_ctx(self):   <span class="k">return</span> self.t_v + self.attn_width     <span class="c"># the context tile, ATTN_WIDTH</span>
+<span class="k">@property</span>
+<span class="k">def</span> t_scratch(self): <span class="k">return</span> self.t_ctx + self.attn_width   <span class="c"># &lt;-- t_ctx + ATTN_WIDTH, not + hidden</span>
+<span class="k">@property</span>
+<span class="k">def</span> t_scratch_width(self): <span class="k">return</span> max(self.hidden, self.ffn) + <span class="n">8</span>   <span class="c"># scalars AND silu's tile</span>
+
+<span class="k">@property</span>
+<span class="k">def</span> t_out(self):   <span class="k">return</span> self.t_scratch + self.t_scratch_width
+<span class="k">@property</span>
+<span class="k">def</span> t_norm(self):  <span class="k">return</span> self.t_out + self.hidden
+<span class="k">@property</span>
+<span class="k">def</span> t_gate(self):  <span class="k">return</span> self.t_norm + self.hidden
+<span class="k">@property</span>
+<span class="k">def</span> t_up(self):    <span class="k">return</span> self.t_gate + self.ffn
+<span class="k">@property</span>
+<span class="k">def</span> t_hid(self):   <span class="k">return</span> self.t_up + self.ffn
+<span class="k">@property</span>
+<span class="k">def</span> t_gamma2(self): <span class="k">return</span> self.t_hid + self.ffn</pre>
+    </div>
+
+    <p>And the weight placement, because the scale rows sit immediately after each matrix's
+    weight bytes &mdash; which is exactly the bug the composition found:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/layer.py</span><span class="delta"><b>the fix that mattered</b></span><span class="why">advance past the weights AND the scales</span></div>
+      <pre><span class="c">-  addr = sbase + nrows * (4 + ...)        # wrong: advanced by the scale-row size</span>
+<span class="o">+</span>  <span class="c"># the next matrix starts after this one's weight rows AND its scale rows</span>
+<span class="o">+</span>  addr = sbase + nrows * srs</pre>
+    </div>
+
+    <h3>Five bugs only composition could find</h3>
+    <ol>
+      <li><strong>The weight scale rows overlapped the next matrix's weights.</strong> The scale
+      base is <code>addr + nrows*in_width</code>, so the next matrix starts at
+      <code>sbase + nrows*srs</code>. We advanced by the scale-row size instead, and
+      <code>gate</code>'s scales silently corrupted <code>up</code>'s weights.
+      <code>up</code> matched the reference; <code>gate</code> did not. <em>That asymmetry is
+      what gave it away.</em></li>
+      <li><strong>rmsnorm's destination aliased its own scratch</strong>, so the norm returned zeros.</li>
+      <li><strong>The matmul output slot was 8 TMEM words wide</strong> while a matmul writes
+      <code>hidden</code> of them, so it overlapped the norm tile.</li>
+      <li><strong>Six fp32 functions needed the flush rules</strong>, and <code>max</code>/<code>min</code>
+      must flush operands <em>before</em> comparing, not after.</li>
+      <li><strong><code>recip</code>'s threshold was one binade low</strong> &mdash; exponent field
+      254 instead of <code>0x7E800000</code>. One binade; a whole class of inputs.</li>
+    </ol>
+
+    <div class="callout lesson">
+      <span class="label">The pattern worth remembering</span>
+      <p style="margin:0">Four of the bugs on this branch had the same shape: <strong>a TMEM
+      region sized or placed wrong.</strong> Each was invisible to unit tests, because each
+      component worked alone. What catches that class of bug is not more tests &mdash; it's
+      <em>asserting the regions are disjoint.</em> That assertion is a test now, not an eyeball.</p>
+    </div>
+  </section>
+
+<section class="step" id="rung9">
+    <p class="step-kicker">rung m9 &middot; +801 lines &middot; 4 commits &middot; 6 tests &middot; the last rung</p>
+    <h2>A real token, and the one-line bug that made every layer look 33% off</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">PASS</span>
+      <span class="step-phase">real checkpoint &middot; 6 layers &middot; 32,000 logits</span>
+    </div>
+
+    <p>The last rung of the ladder is the one that finally runs the thing. It needed a reader for the
+    checkpoint's format, and &mdash; following the branch's rule &mdash; one written rather than
+    installed:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/model/checkpoint.py</span><span class="delta"><b>safetensors, 40 lines</b></span><span class="why">the format is small; the dependency would not be</span></div>
+      <pre><span class="s">"""m9 — read the TinyStories safetensors checkpoint with no third-party library.
+
+    [8-byte little-endian header length][JSON header][tensor bytes, back to back]
+
+Each header entry names a tensor's dtype, shape and *byte offsets within the data section*.
+That is it.
+
+Why bother instead of `pip install safetensors`: the ladder is a claim about how small and
+readable a real LLM stack can be. Every dependency we skip is a dependency a reader does not
+have to install to follow along, and the format is 40 lines of code.
+"""</span></pre>
+    </div>
+
+    <p>Then the whole model: embedding, six layers, final norm, LM head, argmax.</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/decode.py</span><span class="delta"><b>forward()</b></span><span class="why">the shape the entire branch was built to reach</span></div>
+      <pre><span class="k">def</span> forward(self, token: <span class="t">int</span>, pos: <span class="t">int</span> = <span class="n">0</span>) -&gt; list:
+    <span class="s">"""One token through every layer; returns the hidden state as fp32 bits."""</span>
+    x = self.embed_row(token)
+    <span class="k">for</span> lay <span class="k">in</span> self.layers:
+        x = lay.forward_bits(x, pos=pos)
+    <span class="c"># the final norm, using the same fragment the layers use</span>
+    <span class="k">for</span> k, v <span class="k">in</span> enumerate(x):
+        m.tset(s.t_x + k, v)
+    <span class="k">for</span> k, g <span class="k">in</span> enumerate(self.final_norm):
+        m.tset(s.t_gamma2 + k, F.bits(g))
+    self.layers[<span class="o">-</span><span class="n">1</span>]._norm(s.t_x, s.t_scratch, s.t_gamma2, s.t_norm)
+    <span class="k">return</span> [m.tget(s.t_norm + k) <span class="k">for</span> k <span class="k">in</span> range(s.hidden)]</pre>
+    </div>
+
+    <p>The first run produced finite logits and the right two candidates &mdash; <strong>in the
+    wrong order, about 3&times; too small.</strong> We labelled that commit
+    <strong>PARTIAL</strong>, because "close enough" is how the first branch got written.</p>
+
+    <p>Then an isolation pass instead of a guess. Every component, tested alone:</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>component, alone</th><th>result</th></tr></thead>
+        <tbody>
+          <tr><td>LM head vs a Python recomputation from the machine's own state</td><td><span class="chip ok">exact</span> to 1e-9</td></tr>
+          <tr><td>layer 0, attention half</td><td><span class="chip ok">0.000%</span></td></tr>
+          <tr><td>layer 0, MLP half</td><td><span class="chip ok">0.000%</span></td></tr>
+          <tr><td>a single matmul vs the machine's ACT RAM</td><td><span class="chip ok">0.000%</span></td></tr>
+          <tr><td><code>forward()</code> vs a copy of its own body</td><td><span class="chip ok">identical</span></td></tr>
+          <tr><td><strong>the composed layer</strong></td><td><span class="chip blocked">33.7% off</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Every piece exact, the composition 33% wrong. That can only be <em>state</em> &mdash; a
+    region one stage leaves and the next reads. Which meant the bug was in the memory map, and
+    it was one line:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/kernels/layer.py</span><span class="delta"><b>the bug</b></span><span class="why">a scratch buffer placed inside the tile it was building</span></div>
+      <pre><span class="c"># t_ctx spans 3072 .. 3839  -- it is attn_width = 768 wide</span>
+<span class="c"># t_scratch = t_ctx + hidden = 3456 = index 384 inside t_ctx = head 3, position 0</span>
+
+<span class="o">-</span>    <span class="k">def</span> t_scratch(self): <span class="k">return</span> self.t_ctx <span class="o">+</span> self.hidden
+<span class="o">+</span>    <span class="k">def</span> t_scratch(self): <span class="k">return</span> self.t_ctx <span class="o">+</span> self.attn_width</pre>
+    </div>
+
+    <p>The attention loop wrote its softmax score to <code>t_scratch</code> &mdash; <strong>which
+    sat inside the very context tile it was building.</strong> Head 3's first value got
+    overwritten by a scalar score, and that corrupted context flowed through <code>wo</code> into
+    every downstream layer. Every layer looked a third wrong because every layer inherited the
+    same corrupted context.</p>
+
+    <p>One line. Then:</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th></th><th>our machine</th><th>fp32 reference</th></tr></thead>
+        <tbody>
+          <tr><td>top-2 tokens</td><td><strong>(1, 13)</strong></td><td><strong>(1, 13)</strong></td></tr>
+          <tr><td>leading logit</td><td><strong>3.51</strong></td><td>3.54</td></tr>
+          <tr><td>second logit</td><td>2.30</td><td>2.23</td></tr>
+          <tr><td>all six layers vs a same-quantization reference</td><td><span class="chip ok">0.000%</span></td><td>&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Same tokens, same order, leading logit within 1%. The prediction is a test now, not a
+    screenshot:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/tests/test_m9_decode.py</span><span class="delta"><b>the claim, as an assertion</b></span></div>
+      <pre><span class="k">def</span> test_the_prediction_matches_the_fp32_reference(decoded):
+    <span class="s">"""The end-to-end claim: same top tokens, same order, within int8 quantization error."""</span>
+    machine   = d.logits(hidden, first=<span class="n">0</span>, count=N_LOGITS)
+    reference = _fp32_reference(decoded[<span class="s">'ck'</span>])
+    got_top = sorted(range(N_LOGITS), key=<span class="k">lambda</span> i: <span class="o">-</span>machine[i])[:<span class="n">2</span>]
+    ref_top = sorted(range(N_LOGITS), key=<span class="k">lambda</span> i: <span class="o">-</span>reference[i])[:<span class="n">2</span>]
+    assert got_top == ref_top, <span class="s">f'top tokens differ: machine {got_top}, reference {ref_top}'</span>
+    assert machine[got_top[<span class="n">0</span>]] == pytest.approx(reference[ref_top[<span class="n">0</span>]], rel=<span class="n">0.05</span>)</pre>
+    </div>
+
+    <div class="callout warn">
+      <span class="label">What we'd have missed by rounding</span>
+      <p style="margin:0">If we'd called 3&times; off "within quantization error", we'd have shipped
+      a decoder whose attention silently deleted a head's first context value. It would have
+      produced fluent-looking garbage forever, and every metric except a bit-exact reference
+      would have called it fine.</p>
+    </div>
+  </section>
+
+  <section class="step" id="openxc7">
+    
+    <p class="step-kicker" style="color:var(--blue)">the last session &middot; 1,470 lines &middot; 5 commits</p>
+    <h2>openXC7: whether the open flow can carry the ladder</h2>
+
+    <div class="step-meta">
+      <span class="chip ok">synthesis measured</span>
+      <span class="chip blocked">place &amp; route: not yet run</span>
+      <span class="step-phase">xc7k480tffg1156-2</span>
+    </div>
+
+    <div class="callout warn">
+      <span class="label">Scope, stated before the numbers</span>
+      <p style="margin:0">Everything in this session is <strong>synthesis</strong> &mdash; yosys to
+      technology-mapped LUT/FF/DSP/BRAM, plus Vivado's <code>synth_design</code>. <strong>Neither
+      flow ran place-and-route.</strong> So nothing below says whether the design fits on the
+      device; it says whether each rung's RTL survives the frontend and the mapper. The
+      place-and-route question is the one still open, and it is named as open at the end.</p>
+    </div>
+
+    <h3>The instrument</h3>
+
+    
+    <p>The question "can openXC7 build this" is only worth asking if a failure says <em>where</em>
+    it broke. <code>mini/openflow/measure.py</code> synthesizes each rung's own RTL as a standalone
+    design and classifies the stop:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/openflow/measure.py</span><span class="delta"><b>the classification</b></span><span class="why">the distinction is the whole point</span></div>
+      <pre><span class="s">"""Find the openXC7 limit, using the ladder's own rungs as a complexity staircase.
+
+  stage 1  read_slang      SystemVerilog frontend
+  stage 2  proc/opt        behavioural to netlist
+  stage 3  check -assert    structural sanity
+  stage 4  synth_xilinx     technology mapping (LUT/FF/DSP/BRAM)
+
+A rung failing stage 1 is a *language* limit; failing stage 4 is a *capacity or mapping* limit.
+That distinction is the whole point: "openXC7 cannot do it" is useless, "openXC7's frontend
+handles the core but its mapper runs out of steam at N LUTs" is actionable.
+"""</span></pre>
+    </div>
+
+    <p>Its first finding was immediate and was not about the tool: the <code>mini-v0</code> rung
+    passes four files but the top instantiates five more unconditionally, so it fails the
+    frontend. <strong>The rung's file list was wrong, not openXC7.</strong></p>
+
+    <h3>The staircase</h3>
+
+    
+    <p>This session also finally removes the last import: the ladder's RTL was compiling against
+    product code. Rather than copy it, a <em>package</em> is derived from our own module, so the
+    two cannot drift:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">mini/rtl/make_fp32_pkg.py</span><span class="delta"><b>generated</b></span><span class="why">one source of arithmetic, two presentation forms</span></div>
+      <pre><span class="s">"""Generate `fp32_pkg.sv` from `fp32.sv`, so the module and the package cannot drift.
+
+The simulation wants the arithmetic as functions in a module (the testbench instantiates it and
+calls `dut.fp.fadd(...)`); the synthesizable ladder RTL wants a package it can `import`. Both
+must be the same arithmetic, so the package is *derived* from the module rather than written
+out a second time -- one source, one behaviour, and a test that fails if the file is stale.
+"""</span></pre>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>rung</th><th>source lines</th><th>verdict</th><th>stopped at</th><th>time</th></tr></thead>
+        <tbody>
+          <tr><td>our fp32 package</td><td>343</td><td><span class="chip ok">synthesizes</span></td><td>&mdash;</td><td>0.1 s</td></tr>
+          <tr><td>the toy TPU, 2&times;2 Q8.8</td><td>3,181</td><td><span class="chip ok">synthesizes</span> (148 cells)</td><td>&mdash;</td><td>4.2 s</td></tr>
+          <tr><td>mini-core v0</td><td>1,800</td><td><span class="chip blocked">frontend</span></td><td><em>our</em> file list, not the tool</td><td>0.6 s</td></tr>
+          <tr><td><strong>the full mini-core</strong></td><td>3,600</td><td><span class="chip blocked">host</span></td><td><code>TECHMAP</code>, killed at 254 s</td><td>254 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>Our fp32 arithmetic synthesizes cleanly.</strong> That is the most important
+    positive result here: an adder, a multiplier, <code>exp2</code>'s degree-7 chain,
+    <code>recip</code>, <code>rsqrt</code> and <code>log2</code> all map with no complaint. The
+    arithmetic a real model needs is within the open flow's reach.</p>
+
+    <p><strong>The full mini-core reaches <code>TECHMAP</code> and then takes SIGTERM.</strong>
+    After 254 seconds in technology mapping the process was killed (&minus;15) because this
+    machine runs a thermal guard that kills CPU burners above 97&nbsp;&deg;C (Tctl 99.1&nbsp;&deg;C
+    when it fired). yosys never reported an error.</p>
+
+    <div class="callout warn">
+      <span class="label">The distinction that keeps the finding honest</span>
+      <p style="margin:0">The honest statement is <em>not</em> "openXC7 cannot build the
+      mini-core". It is: <strong>the flow gets through the frontend and deep into technology
+      mapping, and this host has not yet given it a cool enough window to finish.</strong>
+      "The tool said no" and "the machine said stop" are different facts, and only one is a
+      toolchain limit.</p>
+    </div>
+
+    
+    <h3>The defect the second toolchain found</h3>
+    <p>Verilator had been accepting an <code>always_ff</code> that SystemVerilog forbids; slang
+    rejected it:</p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">src/pe.sv</span><span class="delta"><b>the fix</b></span><span class="why">an enable is a clock enable, not a thing in the event list</span></div>
+      <pre><span class="o">+</span> <span class="c">// slang (and SystemVerilog) require every signal an always_ff reads on the clock edge to</span>
+<span class="o">+</span> <span class="c">// be in its event list. `pe_enabled` is a data signal, so it cannot gate this block: it</span>
+<span class="o">+</span> <span class="c">// becomes a clock enable instead, which is also what the hardware wants.</span>
+  always_ff @(posedge clk <span class="k">or</span> posedge rst) <span class="k">begin</span>
+<span class="o">-</span>     <span class="k">if</span> (rst || !pe_enabled) <span class="k">begin</span>
+<span class="o">+</span>     <span class="k">if</span> (rst) <span class="k">begin</span>
+          pe_input_out &lt;= <span class="n">16'b0</span>;
+          ...
+<span class="o">+</span>     <span class="k">end</span> <span class="k">else if</span> (!pe_enabled) <span class="k">begin</span>
+<span class="o">+</span>         pe_valid_out &lt;= <span class="n">0</span>;
+<span class="o">+</span>         pe_switch_out &lt;= <span class="n">0</span>;
+<span class="o">+</span>         ...
+      <span class="k">end</span> <span class="k">else</span> <span class="k">begin</span>
+          pe_valid_out &lt;= pe_valid_in;</pre>
+    </div>
+
+    <h3>Vivado on the same rungs</h3>
+
+    
+    <p>"Which is better" deserves measurements rather than loyalty, so both flows were run
+    through the same ladder on the same part.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>rung</th><th>openXC7</th><th>Vivado</th></tr></thead>
+        <tbody>
+          <tr><td>our fp32 package</td><td><span class="chip ok">synthesizes</span> (0.1 s)</td><td>n/a &mdash; a package has no top</td></tr>
+          <tr><td>the toy TPU</td><td><span class="chip ok">synthesizes</span> (4.2 s)</td><td><span class="chip ok">synthesizes</span> (254.7 s)</td></tr>
+          <tr><td>the full mini-core</td><td><span class="chip blocked">TECHMAP</span>, killed at 254 s</td><td>all 8 modules, killed at 56 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>Both build the toy &mdash; and both produce 0 LUTs, 0 FFs.</strong> That is not
+    the tools failing. The toy's top has no output ports carrying the datapath, so both tools
+    correctly discard the design as unreachable. That they <em>agree</em> is what makes the
+    measurement trustworthy &mdash; and it means the RTL needs real output ports before a cell
+    count means anything.</p>
+
+    <p><strong>Neither finished the mini-core, and neither was stopped by the tool.</strong>
+    openXC7 reached technology mapping; Vivado synthesized all eight modules. Then both took
+    SIGTERM from the thermal guard at 97&ndash;99&nbsp;&deg;C, and neither reported an error.
+    So: <strong>neither tool has demonstrated a limit here. The host has.</strong></p>
+
+    <div class="codebox">
+      <div class="codebox-head"><span class="fname">the comparison's real yield</span><span class="why">the failure sets barely overlap, which is the argument for running both</span></div>
+      <pre>  only openXC7 found:  <span class="k">always_ff</span> testing a signal outside its event list
+  only Vivado found:   <span class="k">default_nettype</span> leakage, port net types
+  neither:             the host's thermal guard, which is not a toolchain property</pre>
+    </div>
+
+    <p>The Vivado-only one is subtle. <code>`default_nettype none</code> leaked across files
+    because nothing restored the default at end-of-file, so Vivado reported <em>"net type must be
+    explicitly specified"</em> at the <em>next</em> file's first port &mdash; slang reads each
+    file in isolation and never noticed. And under that directive an input port must name its net
+    type: <code>input logic</code> is a variable declaration Vivado rejects for a port;
+    <code>input wire logic</code> is correct &mdash; while an <em>output</em> driven from
+    <code>always_ff</code> must still be a variable. Fixed across 15 files.</p>
+
+    <h3>So which is better?</h3>
+    <ul>
+      <li><strong>For iterating on RTL: openXC7.</strong> 56&times; faster on the one rung both
+      completed (4.2&nbsp;s vs 254.7&nbsp;s), no licence, and its stricter frontend is a free linter.</li>
+      <li><strong>For producing a bitstream for this card: Vivado.</strong> It has produced the
+      actual shipped images, and it is what the board flow documents.</li>
+      <li><strong>For finding bugs: both</strong>, because they fail on different things.</li>
+    </ul>
+
+    <h3>What this session did not answer</h3>
+    <div class="callout warn">
+      <span class="label">Place and route is still the open question</span>
+      <p style="margin:0 0 .6em">The question the goal actually asks is whether openXC7 can
+      <strong>place and route</strong> the ladder's rungs, not whether it can map them to
+      cells. <code>synth_xilinx</code> stops at the mapped netlist; <code>nextpnr-himbaechel</code>
+      is the stage that places cells and routes wires, and <strong>this session never invoked
+      it.</strong></p>
+      <p style="margin:0">What would have to change first: the rungs that "synthesize" are not
+      yet placeable. The toy's netlist has <strong>0 output ports</strong> and 148 IBUFs &mdash;
+      nothing to place. And the 32&nbsp;MiB DRAM is a <code>logic [7:0] mem [0:33554431]</code>
+      behavioural array, which would need <strong>~910 BRAM36</strong> (~47% of an
+      xc7k480t) to exist on-chip. So the synthesis results above are necessary and not
+      sufficient; they do not yet constitute a fit claim, and the blog does not make one.</p>
+    </div>
+
+  </section>
+
+  <section class="step" id="tally">
+    <p class="step-kicker" style="color:var(--green)">The tally</p>
+    <h2>What it adds up to</h2>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>rung</th><th>what it adds</th><th>+ lines</th><th>tests</th><th>verdict</th></tr></thead>
+        <tbody>
+          <tr><td class="step">m0</td><td>the plan and the no-import rule</td><td>47</td><td>&mdash;</td><td><span class="chip ok">plan</span></td></tr>
+          <tr><td class="step">m1</td><td>fp32 arithmetic + its Python oracle</td><td>935</td><td>36</td><td><span class="chip ok">PASS</span></td></tr>
+          <tr><td class="step">m2</td><td>the openXC7 measurement instrument</td><td>185</td><td>&mdash;</td><td><span class="chip ok">probe</span></td></tr>
+          <tr><td class="step">m3</td><td>ISA encoder + reference machine</td><td>1,101</td><td>28</td><td><span class="chip ok">PASS</span></td></tr>
+          <tr><td class="step">m4</td><td>the TinyStories-15M memory map</td><td>358</td><td>11</td><td><span class="chip ok">PASS</span></td></tr>
+          <tr><td class="step">m5</td><td>matmul, RMSNorm, SwiGLU fragments</td><td>351</td><td>9</td><td><span class="chip ok">PASS</span></td></tr>
+          <tr><td class="step">m6</td><td>one decoder layer, composed</td><td>1,063</td><td>6</td><td><span class="chip ok">PASS</span></td></tr>
+          <tr><td class="step">m7</td><td>openXC7 staircase + the fp32 package</td><td>743</td><td>&mdash;</td><td><span class="chip ok">measured</span></td></tr>
+          <tr><td class="step">m8</td><td>Vivado comparison + portability fixes</td><td>542</td><td>&mdash;</td><td><span class="chip ok">measured</span></td></tr>
+          <tr><td class="step">m9</td><td>decode a real TinyStories-15M token</td><td>801</td><td>6</td><td><span class="chip ok">PASS</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Those are <em>gross</em> additions &mdash; what each rung's own commits introduced &mdash;
+    which is why they sum to more than the net diff. Counted as a net diff from the base commit,
+    the branch is <strong>+5,175 / &minus;326 across 62 files in 22 commits.</strong> The
+    difference is one 923-line restore after a bad edit, and three commits that correct the
+    record rather than the code.</p>
+
+    <figure>
+      <svg viewBox="0 0 870 190" role="img" aria-labelledby="f2t f2d">
+        <title id="f2t">What the 5,175 added lines are</title>
+        <desc id="f2d">Five segments: model and kernels 1,939 lines, tests 1,210, RTL 1,007, openflow 431, receipts and docs 588.</desc>
+        <text x="20" y="30" font-size="12.5" fill="#e7e4de" font-family="Lora, Georgia, serif">5,175 lines, by kind</text>
+        <rect x="20" y="46" width="270" height="40" fill="#7fce9a"/>
+        <rect x="290" y="46" width="168" height="40" fill="#8db8e0"/>
+        <rect x="458" y="46" width="140" height="40" fill="#d9bd74"/>
+        <rect x="598" y="46" width="60" height="40" fill="#b3a6de"/>
+        <rect x="658" y="46" width="82" height="40" fill="#6b7684"/>
+        <text x="24" y="72" font-size="11" fill="#0d0f12" font-family="Roboto Mono, monospace">1,939</text>
+        <text x="294" y="72" font-size="11" fill="#0d0f12" font-family="Roboto Mono, monospace">1,210</text>
+        <text x="462" y="72" font-size="11" fill="#0d0f12" font-family="Roboto Mono, monospace">1,007</text>
+        <text x="602" y="72" font-size="10.5" fill="#f2efff" font-family="Roboto Mono, monospace">431</text>
+        <text x="662" y="72" font-size="10.5" fill="#e7e4de" font-family="Roboto Mono, monospace">588</text>
+        <rect x="20" y="110" width="9" height="9" rx="2" fill="#7fce9a"/>
+        <text x="36" y="119" font-size="11.5" fill="#cfccc5" font-family="Lora, Georgia, serif">model + kernels</text>
+        <rect x="200" y="110" width="9" height="9" rx="2" fill="#8db8e0"/>
+        <text x="216" y="119" font-size="11.5" fill="#cfccc5" font-family="Lora, Georgia, serif">tests</text>
+        <rect x="320" y="110" width="9" height="9" rx="2" fill="#d9bd74"/>
+        <text x="336" y="119" font-size="11.5" fill="#cfccc5" font-family="Lora, Georgia, serif">RTL</text>
+        <rect x="420" y="110" width="9" height="9" rx="2" fill="#b3a6de"/>
+        <text x="436" y="119" font-size="11.5" fill="#cfccc5" font-family="Lora, Georgia, serif">openflow</text>
+        <rect x="556" y="110" width="9" height="9" rx="2" fill="#6b7684"/>
+        <text x="572" y="119" font-size="11.5" fill="#cfccc5" font-family="Lora, Georgia, serif">receipts, docs, glue</text>
+        <text x="20" y="150" font-size="12" fill="#9aa3b0" font-family="Lora, Georgia, serif">Zero of these lines is a copy. The tests are a fifth of the branch, which is roughly the point.</text>
+      </svg>
+      <figcaption>Measured as a net diff from the base commit: 62 files, +5,175 / &minus;326.
+      Of the 5,175 added lines, <strong>0</strong> sit in a file that is a copy of anything in the
+      upstream tree.</figcaption>
+    </figure>
+
+    <h3>Seven lessons, one per rung that taught one</h3>
+
+    <div class="callout lesson">
+      <span class="label">1. A ladder that imports tells you nothing</span>
+      <p style="margin:0">197,981 lines of byte-identical product code is not progress.
+      <strong>If the branch can't explain its own diff, the diff is the wrong shape.</strong></p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">2. A specification is not an implementation</span>
+      <p style="margin:0">Reading <code>docs/isa.md</code> and writing an encoder is authorship.
+      Copying <code>isa.py</code> is not. It cost about 1,500 extra lines, which is a bargain.</p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">3. Bit-exactness needs a model, not a tolerance</span>
+      <p style="margin:0">The 1-ULP sticky bit is invisible without an oracle that says which 32
+      bits are correct. Write the model first, then the hardware has something to be wrong
+      <em>against</em>.</p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">4. Test the number, not the smoke</span>
+      <p style="margin:0">All five kernel bugs produced plausible instructions. And "3&times; off
+      but right tokens" is still a bug &mdash; our own PARTIAL verdict is what forced the isolation
+      pass that found the one-line fix.</p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">5. Units don't compose; regions do</span>
+      <p style="margin:0">Three of the m6 bugs and the m9 bug were all a TMEM region sized or placed
+      wrong. <strong>Assert disjointness; then a wrong address is a failing test instead of a
+      plausible number.</strong></p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">6. Never report a host kill as a toolchain limit</span>
+      <p style="margin:0">The thermal guard firing at 97&nbsp;&deg;C is not openXC7 refusing to
+      synthesize. Distinguishing "the tool said no" from "the machine said stop" is the difference
+      between a finding and a fabrication.</p>
+    </div>
+    <div class="callout lesson">
+      <span class="label">7. ALWAYS TRY THE HACKY WAY &mdash; then measure what it gave you</span>
+      <p style="margin:0">Copying the product tree got us a bit-exact proof we still rely on. But
+      the numbers said "half of this is somebody else's code", so we threw the branch away and did
+      it properly. <strong>The hack got us the information; honesty made us act on it.</strong></p>
+    </div>
+
+    <h3>What's next</h3>
+    <ul>
+      <li><strong>A real bitstream.</strong> Neither flow has been allowed to finish the mini-core,
+      because this host kills CPU burners above 97&nbsp;&deg;C. A scheduling problem, not a
+      toolchain verdict.</li>
+      <li><strong>The card.</strong> The hardware rungs stay blocked on a cable that isn't here.
+      The simulation is faithful now; the board run is a different claim and needs different
+      evidence.</li>
+      <li><strong>More than one token.</strong> Decoding one token proves the pipeline; decoding a
+      sentence proves the KV cache, which the layout already reserves 4,608&nbsp;KiB for but no
+      kernel writes yet.</li>
+    </ul>
+
+    <p>The honest summary: <strong>the simulation objective is met</strong> &mdash; a readable TPU
+    that runs the real TinyStories-15M checkpoint and predicts the same next tokens, in the same
+    order, as an fp32 reference &mdash; and <strong>the hardware objective is not</strong>, because
+    the cable is absent and the host will not let a synthesis run finish.</p>
+
+    <p>Nine rungs, 5,175 lines, and the last commit is the one where a real checkpoint finally
+    produced the right answer.</p>
+  </section>
+
+  <div class="footnotes">
+    <p><strong>How the numbers were measured.</strong> Both branches are compared as a net diff
+    from the base commit they forked from (<code>6746fe5d</code>). "Imported" means the added
+    file's final blob is byte-identical to a blob anywhere in the upstream tree &mdash; a yes/no
+    test, not a similarity score. Tests were counted by <code>pytest --collect-only</code> over
+    <code>mini/tests</code>: 96 collected, 95 passing, 1 skipped. Every code block above is
+    copied from the branch at the rung named above it. Synthesis numbers are from
+    <code>mini/openflow/measure.py</code> (openXC7) and
+    <code>mini/openflow/vivado_measure.py</code> (Vivado) against
+    <code>xc7k480tffg1156-2</code>; the openXC7 toy-rung time is the measured 4.2&nbsp;s in
+    <code>results.json</code>. Synthesis output is gitignored, so the branch's history contains no
+    generated artifacts.</p>
+    <p><strong>What is not claimed.</strong> No bitstream was produced for the mini-core by either
+    tool. No board run happened. The old ladder's step tests still compile against
+    <code>otpu_fp.sv</code>, and the README says so rather than claiming the substitution is
+    finished.</p>
+  </div>
+
+  <footer>&copy; 2026 the tiny-tpu crew &middot; written after the branch, not before &middot; every number here was measured on it.</footer>
+
+</div>
+
+
+</body>
+</html>
