@@ -1,0 +1,1453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d0f12">
+<title>From Tiny-TPU to openTPU: the middle steps nobody blogs about</title>
+<meta name="description" content="How a 2×2 Q8.8 toy TPU grew, in seventeen tested rungs, into an accelerator that runs LLMs on an FPGA — with a bit-exact simulator as the referee.">
+<meta name="author" content="the tiny-tpu crew">
+<meta property="og:type" content="article">
+<meta property="og:title" content="From Tiny-TPU to openTPU: the middle steps nobody blogs about">
+<meta property="og:description" content="Seventeen tested rungs, one bit-exact oracle, and a toy 2×2 TPU that grows into an FPGA LLM accelerator.">
+<meta property="og:site_name" content="Tiny TPU">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="From Tiny-TPU to openTPU: the middle steps nobody blogs about">
+<meta name="twitter:description" content="Seventeen tested rungs, one bit-exact oracle, and a toy 2×2 TPU that grows into an FPGA LLM accelerator.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#e7e4de; --muted:#9aa3b0; --line:#272c34; --soft:#12151b;
+    --cream:#211b13; --cream-line:#3a2f21;
+    --green:#7fce9a; --green-soft:#12211a;
+    --red:#e08f8f; --red-soft:#241416;
+    --blue:#8db8e0; --blue-soft:#111a26;
+    --gold:#d9bd74; --gold-soft:#221d10;
+    --purple:#b3a6de; --purple-soft:#1a1626;
+    --maxw:44rem;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;color-scheme:dark}
+  body{
+    margin:0; background:#0d0f12; color:var(--ink);
+    font-family:"Lora",Georgia,"Times New Roman",serif;
+    font-size:1.0625rem; line-height:1.75;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:6rem 1.25rem 5rem}
+  .kicker{
+    font-size:.7rem; letter-spacing:.18em; text-transform:uppercase;
+    color:var(--muted); font-weight:600; margin:0 0 .9rem;
+  }
+  h1{font-size:clamp(2.1rem,5.4vw,3.15rem); line-height:1.1; font-weight:700; margin:0 0 1.1rem; letter-spacing:-.015em}
+  .dek{font-size:1.22rem; line-height:1.6; color:#cfccc5; margin:0 0 1.4rem; font-style:italic}
+  .byline{font-size:.9rem; color:var(--muted); margin:0 0 1.6rem}
+  .tags{display:flex;flex-wrap:wrap;gap:.45rem;margin:0 0 2.6rem}
+  .tag{
+    font-size:.74rem;font-weight:600;font-family:"Roboto Mono",monospace;
+    background:#161a21;border:1px solid #333a45;border-radius:.35rem;
+    padding:.28rem .55rem;color:#cfd5df;
+    box-shadow:inset 0 1px 0 #ffffff14, 0 1px 0 #00000060;
+  }
+  nav.toc{
+    background:var(--soft); border:1px solid var(--line); border-radius:.6rem;
+    padding:1.1rem 1.4rem; margin:0 0 3rem;
+  }
+  nav.toc h2{font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:0 0 .6rem;font-weight:600}
+  nav.toc ol{margin:0;padding-left:1.2rem;columns:2;column-gap:2rem;font-size:.92rem;line-height:1.7}
+  nav.toc li{break-inside:avoid;break-inside:avoid-column}
+  @media (max-width:640px){nav.toc ol{columns:1}}
+  nav.toc a{color:var(--ink);text-decoration:none;border-bottom:1px solid transparent}
+  nav.toc a:hover{border-bottom-color:var(--ink)}
+  h2{font-size:1.62rem;line-height:1.25;margin:3.2rem 0 1rem;font-weight:700;letter-spacing:-.01em}
+  h3{font-size:1.2rem;margin:2.2rem 0 .6rem;font-weight:700}
+  p{margin:0 0 1.15rem}
+  a{color:var(--blue);text-decoration:underline;text-underline-offset:2px;text-decoration-thickness:1px}
+  strong{font-weight:700}
+  em{font-style:italic}
+  ul,ol{margin:0 0 1.2rem;padding-left:1.4rem}
+  li{margin:.35rem 0}
+  blockquote{
+    margin:1.8rem 0;padding:.2rem 0 .2rem 1.2rem;border-left:3px solid #3a414c;
+    color:#b6bec9;font-size:1.1rem;font-style:italic;
+  }
+  code{font-family:"Roboto Mono",ui-monospace,monospace;font-size:.86em;background:#1a1e26;color:#e3e7ee;border-radius:.25rem;padding:.12em .35em}
+  pre{
+    background:#0b0e12;color:#dce1e8;border:1px solid #23292f;border-radius:.55rem;padding:1.05rem 1.2rem;
+    overflow-x:auto;font-size:.84rem;line-height:1.65;margin:1.4rem 0;
+    box-shadow:0 2px 10px #00000012;
+  }
+  pre code{background:none;padding:0;color:inherit;font-size:inherit}
+  .callout{
+    border:1px solid var(--cream-line); background:var(--cream); border-radius:.6rem;
+    padding:1rem 1.25rem; margin:1.6rem 0; font-size:.98rem;
+  }
+  .callout .label{font-size:.68rem;letter-spacing:.16em;text-transform:uppercase;font-weight:700;color:var(--gold);display:block;margin-bottom:.25rem}
+  .callout.lesson{border-color:#cfd9e6;background:var(--blue-soft)}
+  .callout.lesson .label{color:var(--blue)}
+  .callout.warn{border-color:#e8c9c9;background:var(--red-soft)}
+  .callout.warn .label{color:var(--red)}
+  figure{margin:2.6rem 0;padding:0}
+  @media (min-width:1000px){
+    figure.wide{margin-left:-6rem;margin-right:-6rem}
+    figure.wide figcaption{max-width:var(--maxw);margin-left:auto;margin-right:auto}
+  }
+  figure svg{width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:.6rem;background:#12161d}
+  figcaption{font-size:.83rem;color:var(--muted);margin-top:.7rem;line-height:1.55;text-align:center}
+  .tablewrap{overflow-x:auto;margin:1.6rem 0;border:1px solid var(--line);border-radius:.6rem}
+  table{border-collapse:collapse;width:100%;font-size:.88rem;line-height:1.5}
+  th,td{text-align:left;padding:.6rem .75rem;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--soft);font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td.step{font-family:"Roboto Mono",monospace;font-size:.8rem;color:var(--muted);white-space:nowrap}
+  .chip{display:inline-block;font-family:"Roboto Mono",monospace;font-size:.7rem;font-weight:500;
+        padding:.12rem .42rem;border-radius:.3rem;border:1px solid;white-space:nowrap}
+  .chip.ok{color:var(--green);border-color:#2f5a3f;background:var(--green-soft)}
+  .chip.blocked{color:var(--red);border-color:#4a2a2a;background:var(--red-soft)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));gap:.8rem;margin:1.8rem 0}
+  .stat{border:1px solid var(--line);border-radius:.6rem;padding:.9rem 1rem;background:var(--soft)}
+  .stat .n{font-size:1.9rem;font-weight:700;line-height:1.1;letter-spacing:-.02em}
+  .stat .l{font-size:.74rem;color:var(--muted);line-height:1.35;margin-top:.25rem}
+  .stat.green .n{color:var(--green)} .stat.blue .n{color:var(--blue)}
+  .stat.gold .n{color:var(--gold)} .stat.red .n{color:var(--red)}
+  hr.sep{border:0;border-top:1px solid var(--line);margin:3.2rem 0}
+  .footnotes{font-size:.83rem;color:var(--muted);line-height:1.6;border-top:1px solid var(--line);margin-top:3.5rem;padding-top:1.3rem}
+  .footnotes ol{padding-left:1.1rem}
+  footer{margin-top:3.2rem;font-size:.85rem;color:var(--muted);font-style:italic}
+  sup a{text-decoration:none;font-size:.72em}
+  ::selection{background:#4a3c1a}
+
+  section.step{border-top:1px solid var(--line);margin-top:2.6rem;padding-top:2.4rem;scroll-margin-top:1.5rem}
+  section.step:first-of-type{border-top:0;margin-top:1.4rem;padding-top:.4rem}
+  section.step h2{margin:.1rem 0 .7rem;font-size:1.42rem}
+  section.step h3{font-size:1.05rem;margin:1.8rem 0 .5rem}
+  .step-kicker{font-family:"Roboto Mono",monospace;font-size:.7rem;letter-spacing:.15em;text-transform:uppercase;margin:0;font-weight:500}
+  .rung-index{display:flex;flex-wrap:wrap;gap:.35rem;margin:-2rem 0 3rem}
+  .rung-index a{font-family:"Roboto Mono",monospace;font-size:.7rem;text-decoration:none;color:var(--muted);
+    border:1px solid var(--line);border-radius:.35rem;padding:.24rem .45rem;background:var(--soft);
+    display:inline-flex;gap:.35rem;align-items:center}
+  .rung-index a:hover{color:var(--ink);border-color:#3a414c}
+  .rung-index a b{color:var(--ink);font-weight:600}
+  .rung-index a i{font-style:normal;font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;opacity:.8}
+  .step-meta{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.2rem 0 1rem;font-size:.84rem;color:var(--muted)}
+  .step-meta strong{color:var(--ink);font-weight:600}
+  .step-phase{font-family:"Roboto Mono",monospace;font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);opacity:.85}
+  .codebox{margin:1.3rem 0 1.8rem;border:1px solid #23292f;border-radius:.6rem;overflow:hidden;background:#0b0e12}
+  .codebox-head{display:flex;flex-wrap:wrap;gap:.55rem;align-items:baseline;padding:.5rem .8rem;
+    border-bottom:1px solid #1d232a;background:#11151b;font-family:"Roboto Mono",monospace;font-size:.72rem}
+  .codebox-head .fname{color:#cfd5df}
+  .codebox-head .delta{color:var(--muted)}
+  .codebox-head .delta b{color:#7fce9a;font-weight:500}
+  .codebox-head .delta i{color:#e08f8f;font-style:normal;font-weight:500}
+  .codebox-head .why{margin-left:auto;color:var(--muted);font-style:italic;font-family:Lora,serif}
+  .codebox pre{margin:0;border:0;border-radius:0;box-shadow:none;background:transparent;padding:.85rem 1rem;font-size:.8rem;line-height:1.6;overflow-x:auto;scrollbar-width:thin;scrollbar-color:#2a323b transparent}
+  pre::-webkit-scrollbar{height:8px}pre::-webkit-scrollbar-track{background:transparent}pre::-webkit-scrollbar-thumb{background:#2a323b;border-radius:4px}
+  .codebox pre .c{color:#7b8794;font-style:italic}      /* comment */
+  .codebox pre .k{color:#9db8e8;font-weight:500}        /* keyword */
+  .codebox pre .t{color:#8fd0e0}                        /* type / module keyword */
+  .codebox pre .s{color:#d9bd74}                        /* string */
+  .codebox pre .n{color:#c3b3e8}                        /* number / constant */
+  .codebox pre .b{color:#7fce9a}                        /* builtin / function */
+  .codebox pre .o{color:#a7b0bf}                        /* operator / punctuation */
+  .codebox pre .m{color:#d0aa8e}                        /* macro / directive */
+  .codebox pre .f{color:#e7e4de}                        /* filename header refs */
+  .codebox pre .x{color:#e08f8f}                        /* string escape / warning */
+  .codebox pre .n{color:#c9b6f0}
+  .step-fig{margin:1.4rem 0 2.2rem}
+  .step-fig .rung-diagram{background:var(--soft);border:1px solid var(--line);border-radius:.65rem;padding:.7rem .8rem}
+  .step-fig .rung-diagram svg{width:100%;height:auto;display:block;border:0;background:transparent}
+  .rung-diagram{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media (max-width:760px){
+    .wrap{padding-top:3rem}
+    figure{overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:.4rem}
+    figure svg,.rung-diagram svg{min-width:660px}
+    figure.wide{overflow-x:auto}
+    figcaption{font-size:.78rem;text-align:left}
+  }
+  @media print{
+    body{font-size:10.5pt}
+    .wrap{padding:0;max-width:100%}
+    nav.toc,.tags{display:none}
+    pre{box-shadow:none}
+    figure{break-inside:avoid}
+    a{color:inherit}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="kicker">tiny-tpu → openTPU</p>
+  <h1>From Tiny-TPU to openTPU: the middle steps nobody blogs about</h1>
+  <p class="dek">We had a 2×2 toy TPU. We had an accelerator that runs LLMs on an FPGA. What we didn't have was anything in between.</p>
+  <p class="byline">November 2026 · the tiny-tpu crew, one ladder lighter · ~18 min read</p>
+  <div class="tags">
+    <span class="tag">hardware</span><span class="tag">TPU</span><span class="tag">FPGA</span>
+    <span class="tag">LLM inference</span><span class="tag">bit-exact</span>
+  </div>
+
+  <nav class="toc" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#gap">The gap nobody blogs about</a></li>
+      <li><a href="#oracle">Rule #1: the simulator is the grown-up</a></li>
+      <li><a href="#ladder">The ladder</a></li>
+      <li><a href="#middle">Seventeen rungs, one by one</a></li>
+      <li><a href="#numbers">Numbers that kept us honest</a></li>
+      <li><a href="#lessons">What we'd tell ourselves at the start</a></li>
+      <li><a href="#try">Try this at home</a></li>
+    </ol>
+  </nav>
+
+  <div class="rung-index" aria-label="Jump to a rung">
+    <a href="#s0" style="border-left:3px solid #b0b8c4"><b>00</b><i>toy</i></a>
+    <a href="#s1" style="border-left:3px solid #b0b8c4"><b>01</b><i>receipts</i></a>
+    <a href="#s2" style="border-left:3px solid #b0b8c4"><b>02</b><i>scoreboard</i></a>
+    <a href="#s3" style="border-left:3px solid #8db8e0"><b>03</b><i>ISA contract</i></a>
+    <a href="#s4" style="border-left:3px solid #7fce9a"><b>04</b><i>sequencer</i></a>
+    <a href="#s5" style="border-left:3px solid #7fce9a"><b>05</b><i>VPU</i></a>
+    <a href="#s6" style="border-left:3px solid #7fce9a"><b>06</b><i>quantizer</i></a>
+    <a href="#s7" style="border-left:3px solid #7fce9a"><b>07</b><i>MXU</i></a>
+    <a href="#s8" style="border-left:3px solid #7fce9a"><b>08</b><i>reductions</i></a>
+    <a href="#s9" style="border-left:3px solid #8db8e0"><b>09</b><i>prod. core</i></a>
+    <a href="#s10" style="border-left:3px solid #8db8e0"><b>10</b><i>compiler</i></a>
+    <a href="#s11" style="border-left:3px solid #8db8e0"><b>11</b><i>board</i></a>
+    <a href="#s12" style="border-left:3px solid #e08f8f"><b>12</b><i>FPGA</i></a>
+    <a href="#s13" style="border-left:3px solid #e08f8f"><b>13</b><i>JTAG</i></a>
+    <a href="#s14" style="border-left:3px solid #b3a6de"><b>14</b><i>LLM</i></a>
+    <a href="#s15" style="border-left:3px solid #e08f8f"><b>15</b><i>card</i></a>
+    <a href="#s16" style="border-left:3px solid #d9bd74"><b>16</b><i>converge</i></a>
+  </div>
+
+  <p>We built Tiny-TPU because nobody really understands how TPUs work… and neither do we. We had a strict design philosophy: <strong>ALWAYS TRY THE HACKY WAY.</strong> Draw everything. Reinvent it instead of reverse-engineering it. Learn in public.</p>
+
+  <p>Then a while ago someone looked at our 2×2 systolic array, our 128-word unified buffer and our Q8.8 microcode, and asked the obvious question:</p>
+
+  <blockquote>okay but can it run an LLM?</blockquote>
+
+  <p>No. Obviously not. Our toy TPU does the forward <em>and</em> backward pass of a 2→2→1 XOR network. It does not have an instruction bus, a compiler, DRAM, a host interface, or any concept of a “model” larger than sixteen words. The adult version of this idea — <strong>openTPU</strong> — is a compiler-driven int8 accelerator with a 256-bit instruction, a tile memory, a systolic matrix unit with per-block scales, a fp32 vector unit, a Triton-style language, a bit-exact simulator, a PCIe <em>and</em> JTAG host stack, and ten different LLMs whose on-card tokens match the simulator bit for bit.</p>
+
+  <p>Between those two things there was… a blank page. Every write-up goes from <em>“here’s a matmul”</em> to <em>“and then Qwen 3.5 generates tokens at 8 tok/s.”</em> That is the <a href="https://knowyourmeme.com/memes/how-to-draw-an-owl">rest-of-the-owl meme</a> of hardware.</p>
+
+  <figure class="wide">
+    <svg viewBox="0 0 860 330" role="img" aria-labelledby="f1t f1d">
+      <title id="f1t">Two machines with a blank page between them</title>
+      <desc id="f1d">On the left, the tiny-tpu toy: a 2×2 Q8.8 systolic array, a 128-word unified buffer and a VPU, with no ISA, DRAM or host. On the right, openTPU: slices with a sequencer, MXU, VPU, DMA, DDR3, a compiler and a card. Between them a dashed box asks for the missing middle.</desc>
+      <defs>
+        <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#e58c8c"/>
+        </marker>
+      </defs>
+      <rect x="14" y="22" width="248" height="286" rx="14" fill="#151920" stroke="#2c2a25"/>
+      <text x="34" y="52" font-size="14" font-weight="700" fill="#e8e5df">tiny-tpu</text>
+      <text x="34" y="71" font-size="11.5" fill="#8b93a0">where we started</text>
+      <g stroke="#6b7482" fill="#f4f2ec">
+        <rect x="34" y="88" width="56" height="42" rx="6"/><rect x="98" y="88" width="56" height="42" rx="6"/>
+        <rect x="34" y="138" width="56" height="42" rx="6"/><rect x="98" y="138" width="56" height="42" rx="6"/>
+      </g>
+      <g font-size="10" font-weight="600" fill="#b0a99a" text-anchor="middle">
+        <text x="62" y="113">MAC</text><text x="126" y="113">MAC</text>
+        <text x="62" y="163">MAC</text><text x="126" y="163">MAC</text>
+      </g>
+      <rect x="34" y="192" width="186" height="24" rx="5" fill="#1b2029" stroke="#6b7482"/>
+      <text x="127" y="208" font-size="10.5" fill="#b0a99a" text-anchor="middle">unified buffer · 128 × 16b</text>
+      <rect x="34" y="224" width="186" height="24" rx="5" fill="#1b2029" stroke="#6b7482"/>
+      <text x="127" y="240" font-size="10.5" fill="#b0a99a" text-anchor="middle">VPU · bias · leaky-ReLU · loss</text>
+      <text x="34" y="272" font-size="10.5" fill="#e58c8c">no ISA · no DRAM · no host · no compiler</text>
+      <text x="34" y="291" font-size="10.5" fill="#8b93a0">2×2 systolic · Q8.8 fixed point</text>
+
+      <rect x="300" y="86" width="260" height="122" rx="12" fill="none" stroke="#e58c8c" stroke-width="1.6" stroke-dasharray="7 6"/>
+      <text x="430" y="126" font-size="26" font-weight="700" fill="#e58c8c" text-anchor="middle">?</text>
+      <text x="430" y="150" font-size="12.5" font-weight="600" fill="#b8a99c" text-anchor="middle">the missing middle</text>
+      <text x="430" y="169" font-size="11" fill="#8b93a0" text-anchor="middle">seventeen tested rungs</text>
+      <line x1="266" y1="147" x2="292" y2="147" stroke="#e58c8c" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#f1a)"/>
+      <line x1="568" y1="147" x2="594" y2="147" stroke="#e58c8c" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#f1a)"/>
+      <text x="430" y="232" font-size="11" fill="#e58c8c" text-anchor="middle">the blank page of hardware writing</text>
+
+      <rect x="598" y="22" width="248" height="286" rx="14" fill="#131c28" stroke="#26303d"/>
+      <text x="618" y="52" font-size="14" font-weight="700" fill="#9cc2e8">openTPU</text>
+      <text x="618" y="71" font-size="11.5" fill="#8fa8c2">where it ends</text>
+      <g font-size="10.5" fill="#9cc2e8">
+        <rect x="618" y="86" width="104" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="670" y="107" text-anchor="middle">slice · seq · TMEM</text>
+        <rect x="732" y="86" width="96" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="780" y="107" text-anchor="middle">MXU · 8 cols</text>
+        <rect x="618" y="128" width="104" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="670" y="149" text-anchor="middle">VPU · fp32</text>
+        <rect x="732" y="128" width="96" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="780" y="149" text-anchor="middle">DMA · DDR3 ×2</text>
+        <rect x="618" y="170" width="104" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="670" y="191" text-anchor="middle">compiler · ol</text>
+        <rect x="732" y="170" width="96" height="34" rx="5" fill="#1b2029" stroke="#334a63"/><text x="780" y="191" text-anchor="middle">JTAG + PCIe</text>
+      </g>
+      <text x="618" y="238" font-size="11" fill="#9cc2e8" font-weight="600">ten LLMs, exact tokens</text>
+      <text x="618" y="256" font-size="10.5" fill="#8fa8c2">on a Kintex-7 card</text>
+      <text x="618" y="291" font-size="10.5" fill="#8b93a0">256-bit ISA · int8 · bit-exact simulator</text>
+    </svg>
+    <figcaption><strong>Two machines, one blank page.</strong> The distance between them isn’t a single idea — it’s a sequence of ideas that nobody writes down in order.</figcaption>
+  </figure>
+
+  <p>So we built the middle. As a ladder of seventeen commits, each a small machine you can check out, run, and test. This is the story of what we learned on the rungs — and a map if you want to climb it yourself.</p>
+
+  <hr class="sep">
+
+  <h2 id="gap">The gap is where the understanding lives</h2>
+
+  <p>A toy TPU teaches you <em>an idea</em>: MACs flow through an array, partial sums drip down, a buffer holds the tiles. A production accelerator teaches you <em>nothing</em> the first time you open it, because it is 55,000 lines of SystemVerilog and 50,000 lines of Python and all of it assumes you already know what a scoreboard is.</p>
+
+  <p>The middle is the part with the actual lessons:</p>
+  <ul>
+    <li>how a <strong>fixed-point 2×2 array</strong> becomes a <strong>quantized 8-column MXU</strong>,</li>
+    <li>how <strong>microcode</strong> becomes an <strong>instruction set</strong> with loops and registers,</li>
+    <li>how <strong>“load a tile”</strong> becomes <strong>DMA, DRAM, a quantizer, and a scale-row layout</strong>,</li>
+    <li>how a <strong>Python program</strong> becomes an <strong>image</strong> on a card, and</li>
+    <li>how you <em>know</em> any of it is right, when the hardware sits on another desk.</li>
+  </ul>
+
+  <p>Here’s the trick that made the whole thing tractable: <strong>we didn’t start from Tiny-TPU.</strong> We started from the end, and built the ladder downwards.</p>
+
+  <p>The end was already here — openTPU, a tree that runs real LLMs on a real Xilinx Kintex-7 card. That tree also ships a <strong>bit-exact ISA simulator</strong>. Every instruction you can run on the hardware, you can run in Python, word for word, cycle semantics included. Which gives us the one thing a toy project never has:</p>
+
+  <p style="text-align:center;font-size:1.35rem;font-weight:700;margin:1.6rem 0">an oracle.</p>
+
+  <h2 id="oracle">Rule #1: the simulator is the grown-up in the room</h2>
+
+  <p>Here’s the thing about hardware: it lies. Not on purpose — it just has more states than you have test benches. A stray latch, an off-by-one in a loop counter, a multiplier that flushes denormals when the spec says round-to-nearest-even: all of it produces <em>something</em>, and the something looks plausible right up until the tokens are wrong.</p>
+
+  <p>The production openTPU test methodology is brutal and beautiful: run the same program on the RTL and on the ISA simulator, then compare <strong>every TMEM word and every DRAM byte</strong>. No tolerance. No <code>np.allclose</code>. No “close enough for ML.”</p>
+
+  <figure class="wide">
+    <svg viewBox="0 0 860 350" role="img" aria-labelledby="f2t f2d">
+      <title id="f2t">The oracle: RTL versus the bit-exact ISA simulator</title>
+      <desc id="f2d">A program and DRAM image are run on both the production RTL (Verilator) and the bit-exact ISA simulator. Their TMEM, DRAM and instruction counts are compared word for word; any difference is a failure.</desc>
+      <defs>
+        <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/>
+        </marker>
+      </defs>
+      <rect x="22" y="128" width="168" height="96" rx="9" fill="#151920" stroke="#33312a"/>
+      <text x="106" y="162" font-size="12" font-weight="700" fill="#e8e5df" text-anchor="middle">one program</text>
+      <text x="106" y="182" font-size="11" fill="#b8a99c" text-anchor="middle">+ one DRAM image</text>
+      <text x="106" y="203" font-size="10.5" font-family="Roboto Mono, monospace" fill="#8b93a0" text-anchor="middle">8 × 32-bit words / instr</text>
+
+      <line x1="194" y1="152" x2="248" y2="96" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f2a)"/>
+      <line x1="194" y1="200" x2="248" y2="256" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f2a)"/>
+
+      <rect x="252" y="58" width="230" height="78" rx="9" fill="#131c28" stroke="#26303d"/>
+      <text x="367" y="86" font-size="12.5" font-weight="700" fill="#9cc2e8" text-anchor="middle">production RTL</text>
+      <text x="367" y="106" font-size="11" fill="#8fa8c2" text-anchor="middle">Verilator · tb_top · real design</text>
+      <text x="367" y="123" font-size="10" fill="#8b93a0" text-anchor="middle">systolic MXU, TMEM, ACT RAM, DDR</text>
+
+      <rect x="252" y="218" width="230" height="78" rx="9" fill="#12211a" stroke="#233d2c"/>
+      <text x="367" y="246" font-size="12.5" font-weight="700" fill="#94d0ad" text-anchor="middle">bit-exact ISA simulator</text>
+      <text x="367" y="266" font-size="11" fill="#8fc3a5" text-anchor="middle">pure Python · the golden model</text>
+      <text x="367" y="283" font-size="10" fill="#8b93a0" text-anchor="middle">every instruction, every corner</text>
+
+      <line x1="486" y1="97" x2="540" y2="140" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f2a)"/>
+      <line x1="486" y1="257" x2="540" y2="214" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f2a)"/>
+
+      <rect x="544" y="128" width="150" height="98" rx="9" fill="#1b2029" stroke="#33312a"/>
+      <text x="619" y="157" font-size="11.5" font-weight="700" fill="#e8e5df" text-anchor="middle">state to compare</text>
+      <text x="619" y="180" font-size="11" font-family="Roboto Mono, monospace" fill="#b0b8c4" text-anchor="middle">TMEM</text>
+      <text x="619" y="198" font-size="11" font-family="Roboto Mono, monospace" fill="#b0b8c4" text-anchor="middle">whole DRAM</text>
+      <text x="619" y="216" font-size="11" font-family="Roboto Mono, monospace" fill="#b0b8c4" text-anchor="middle">icount</text>
+
+      <line x1="698" y1="177" x2="744" y2="177" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f2a)"/>
+      <rect x="748" y="140" width="92" height="76" rx="9" fill="#211b13" stroke="#3d3121"/>
+      <text x="794" y="170" font-size="12" font-weight="700" fill="#d6b083" text-anchor="middle">equal?</text>
+      <text x="794" y="192" font-size="10.5" fill="#8b93a0" text-anchor="middle">word for word</text>
+
+      <rect x="544" y="252" width="296" height="34" rx="7" fill="#12211a" stroke="#2f5a3f"/>
+      <text x="570" y="274" font-size="11.5" font-weight="700" fill="#94d0ad">PASS</text>
+      <text x="612" y="274" font-size="10.5" fill="#8fc3a5">every bit identical — ship it</text>
+      <rect x="544" y="294" width="296" height="34" rx="7" fill="#241416" stroke="#4a2a2a"/>
+      <text x="570" y="316" font-size="11.5" font-weight="700" fill="#e58c8c">FAIL</text>
+      <text x="612" y="316" font-size="10.5" fill="#c99a9a">first differing word — find the latch</text>
+    </svg>
+    <figcaption><strong>The oracle.</strong> Both machines eat the same program and the same DRAM image; their whole state must match to the bit. It’s the only test that has an opinion about ulps.</figcaption>
+  </figure>
+
+  <p>We borrowed that. Every rung in the ladder from step 3 onwards is graded by the same rule: RTL versus <code>isasim</code>, whole-state equality, bit for bit. Fingerprints of wrongness show up immediately — a wrong scale row changes one word, a wrong sum order changes a value in the last ulp, a wrong quantizer offset changes a whole block at once.</p>
+
+  <p>And yes, chasing the last ulp taught us more about the design than any diagram ever did.</p>
+
+  <h2 id="ladder">The ladder</h2>
+
+  <p>Seventeen rungs. Each one is a commit you can check out and run; each ships its own tests and its own machine-readable receipt.</p>
+
+  <figure class="wide">
+    <svg viewBox="0 0 900 660" role="img" aria-labelledby="f3t f3d">
+      <title id="f3t">The seventeen-rung ladder</title>
+      <desc id="f3d">A staircase of seventeen steps from the tiny-tpu baseline up to convergence on the product tree, colour-coded by phase: toy, contract, mini-core, production integration, silicon/tooling, LLM, convergence; rungs 12, 13 and 15 are dashed red because the card is absent.</desc>
+      <defs>
+        <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/>
+        </marker>
+      </defs>
+      <!-- axes -->
+      <line x1="40" y1="620" x2="840" y2="620" stroke="#262b33" stroke-width="1.5"/>
+      <text x="40" y="644" font-size="11" fill="#98a2b3">a toy TPU</text>
+      <text x="760" y="644" font-size="11" fill="#98a2b3" text-anchor="end">the product tree</text>
+      <line x1="830" y1="612" x2="830" y2="96" stroke="#4a5360" stroke-width="1.4" stroke-dasharray="5 5" marker-end="url(#f3a)" opacity="0"/>
+      <text x="842" y="360" font-size="11" fill="#98a2b3" transform="rotate(90 842 360)" opacity="0">understanding</text>
+
+      <!-- 17 steps: dx=36, dy=30 ; start (52, 596) -->
+      <!-- phase colours: toy #211b13/#d6b083, contract #131c28/#9cc2e8, mini #12211a/#94d0ad,
+           integration #131c28/#3f7fbf, silicon #241416/#e58c8c (blocked dashed),
+           llm #1a1626/#b7a8e8, converge #221d10/#d9bd74 -->
+      <!-- step 0 -->
+      <g>
+        <rect x="52" y="596" width="270" height="24" rx="4" fill="#211b13" stroke="#3d3121"/>
+        <text x="60" y="613" font-size="11" font-weight="600" fill="#d6b083">0 · tiny-tpu baseline imported</text>
+        <rect x="298" y="593" width="25" height="30" rx="3" fill="#6b7482"/>
+        <text x="310.5" y="613" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">0</text>
+      </g>
+      <g>
+        <rect x="88" y="566" width="270" height="24" rx="4" fill="#211b13" stroke="#3d3121"/>
+        <text x="96" y="583" font-size="11" font-weight="600" fill="#d6b083">1 · harness, evidence receipts, roadmap</text>
+        <rect x="334" y="563" width="25" height="30" rx="3" fill="#6b7482"/>
+        <text x="346.5" y="583" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">1</text>
+      </g>
+      <g>
+        <rect x="124" y="536" width="270" height="24" rx="4" fill="#211b13" stroke="#3d3121"/>
+        <text x="132" y="553" font-size="11" font-weight="600" fill="#d6b083">2 · scoreboard + the bug it found</text>
+        <rect x="370" y="533" width="25" height="30" rx="3" fill="#6b7482"/>
+        <text x="382.5" y="553" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">2</text>
+      </g>
+      <g>
+        <rect x="160" y="506" width="270" height="24" rx="4" fill="#131c28" stroke="#26303d"/>
+        <text x="168" y="523" font-size="11" font-weight="600" fill="#9cc2e8">3 · sign the ISA contract</text>
+        <rect x="406" y="503" width="25" height="30" rx="3" fill="#3f7fbf"/>
+        <text x="418.5" y="523" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">3</text>
+      </g>
+      <g>
+        <rect x="196" y="476" width="270" height="24" rx="4" fill="#12211a" stroke="#233d2c"/>
+        <text x="204" y="493" font-size="11" font-weight="600" fill="#94d0ad">4 · sequencer, TMEM, DRAM, LD/ST</text>
+        <rect x="442" y="473" width="25" height="30" rx="3" fill="#3f9f6a"/>
+        <text x="454.5" y="493" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">4</text>
+      </g>
+      <g>
+        <rect x="232" y="446" width="270" height="24" rx="4" fill="#12211a" stroke="#233d2c"/>
+        <text x="240" y="463" font-size="11" font-weight="600" fill="#94d0ad">5 · fp32 VPU, four broadcast modes</text>
+        <rect x="478" y="443" width="25" height="30" rx="3" fill="#3f9f6a"/>
+        <text x="490.5" y="463" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">5</text>
+      </g>
+      <g>
+        <rect x="268" y="416" width="270" height="24" rx="4" fill="#12211a" stroke="#233d2c"/>
+        <text x="276" y="433" font-size="11" font-weight="600" fill="#94d0ad">6 · quantizer + ACT RAM</text>
+        <rect x="514" y="413" width="25" height="30" rx="3" fill="#3f9f6a"/>
+        <text x="526.5" y="433" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">6</text>
+      </g>
+      <g>
+        <rect x="304" y="386" width="270" height="24" rx="4" fill="#12211a" stroke="#233d2c"/>
+        <text x="312" y="403" font-size="11" font-weight="600" fill="#94d0ad">7 · int8 MXU, scales, 48-bit epilogue</text>
+        <rect x="550" y="383" width="25" height="30" rx="3" fill="#3f9f6a"/>
+        <text x="562.5" y="403" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">7</text>
+      </g>
+      <g>
+        <rect x="340" y="356" width="270" height="24" rx="4" fill="#12211a" stroke="#233d2c"/>
+        <text x="348" y="373" font-size="11" font-weight="600" fill="#94d0ad">8 · reductions, argmax, outer</text>
+        <rect x="586" y="353" width="25" height="30" rx="3" fill="#3f9f6a"/>
+        <text x="598.5" y="373" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">8</text>
+      </g>
+      <g>
+        <rect x="376" y="326" width="270" height="24" rx="4" fill="#131c28" stroke="#26303d"/>
+        <text x="384" y="343" font-size="11" font-weight="600" fill="#3f7fbf">9 · replay the mini-core on the real core</text>
+        <rect x="622" y="323" width="25" height="30" rx="3" fill="#3f7fbf"/>
+        <text x="634.5" y="343" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">9</text>
+      </g>
+      <g>
+        <rect x="412" y="296" width="270" height="24" rx="4" fill="#131c28" stroke="#26303d"/>
+        <text x="420" y="313" font-size="11" font-weight="600" fill="#3f7fbf">10 · compiler, language, kernels</text>
+        <rect x="658" y="293" width="25" height="30" rx="3" fill="#3f7fbf"/>
+        <text x="670.5" y="313" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">10</text>
+      </g>
+      <g>
+        <rect x="448" y="266" width="270" height="24" rx="4" fill="#131c28" stroke="#26303d"/>
+        <text x="456" y="283" font-size="11" font-weight="600" fill="#3f7fbf">11 · board shell + host interface</text>
+        <rect x="694" y="263" width="25" height="30" rx="3" fill="#3f7fbf"/>
+        <text x="706.5" y="283" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">11</text>
+      </g>
+      <g>
+        <rect x="484" y="230" width="270" height="22" rx="4" fill="#241416" stroke="#4a2a2a" stroke-dasharray="5 4"/>
+        <text x="492" y="246" font-size="11" font-weight="600" fill="#e58c8c">12 · FPGA image — BLOCKED (no cable)</text>
+        <rect x="730" y="226" width="25" height="30" rx="3" fill="none" stroke="#e58c8c" stroke-dasharray="3 3"/>
+        <text x="742.5" y="246" font-size="11" font-weight="700" fill="#e58c8c" text-anchor="middle">12</text>
+      </g>
+      <g>
+        <rect x="520" y="200" width="270" height="22" rx="4" fill="#241416" stroke="#4a2a2a" stroke-dasharray="5 4"/>
+        <text x="528" y="216" font-size="11" font-weight="600" fill="#e58c8c">13 · JTAG/XVC runtime — BLOCKED</text>
+        <rect x="766" y="196" width="25" height="30" rx="3" fill="none" stroke="#e58c8c" stroke-dasharray="3 3"/>
+        <text x="778.5" y="216" font-size="11" font-weight="700" fill="#e58c8c" text-anchor="middle">13</text>
+      </g>
+      <g>
+        <rect x="556" y="166" width="270" height="24" rx="4" fill="#1a1626" stroke="#332b4a"/>
+        <text x="564" y="183" font-size="11" font-weight="600" fill="#b7a8e8">14 · an LLM in simulation, bit-exact</text>
+        <rect x="802" y="163" width="25" height="30" rx="3" fill="#b7a8e8"/>
+        <text x="814.5" y="183" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">14</text>
+      </g>
+      <g>
+        <rect x="592" y="132" width="270" height="22" rx="4" fill="#241416" stroke="#4a2a2a" stroke-dasharray="5 4"/>
+        <text x="600" y="148" font-size="11" font-weight="600" fill="#e58c8c">15 · TinyStories on the card — BLOCKED</text>
+        <rect x="838" y="128" width="25" height="30" rx="3" fill="none" stroke="#e58c8c" stroke-dasharray="3 3"/>
+        <text x="850.5" y="148" font-size="11" font-weight="700" fill="#e58c8c" text-anchor="middle">15</text>
+      </g>
+      <g>
+        <rect x="628" y="94" width="196" height="26" rx="4" fill="#221d10" stroke="#453a1c"/>
+        <text x="636" y="112" font-size="11" font-weight="600" fill="#d9bd74">16 · converge on the product</text>
+        <rect x="838" y="92" width="25" height="30" rx="3" fill="#d9bd74"/>
+        <text x="850.5" y="112" font-size="11" font-weight="700" fill="#f4f2ec" text-anchor="middle">16</text>
+      </g>
+
+      <!-- legend -->
+      <g font-size="10.5" fill="#98a2b3">
+        <rect x="52" y="24" width="12" height="12" rx="2" fill="#6b7482"/><text x="70" y="34">toy</text>
+        <rect x="112" y="24" width="12" height="12" rx="2" fill="#3f7fbf"/><text x="130" y="34">contract / integration</text>
+        <rect x="286" y="24" width="12" height="12" rx="2" fill="#3f9f6a"/><text x="304" y="34">mini-core (bit-exact)</text>
+        <rect x="456" y="24" width="12" height="12" rx="2" fill="none" stroke="#e58c8c" stroke-dasharray="3 2"/><text x="474" y="34">blocked on hardware</text>
+        <rect x="628" y="24" width="12" height="12" rx="2" fill="#b7a8e8"/><text x="646" y="34">LLM</text>
+        <rect x="690" y="24" width="12" height="12" rx="2" fill="#d9bd74"/><text x="708" y="34">convergence</text>
+      </g>
+      <line x1="884" y1="612" x2="884" y2="96" stroke="#4a5360" stroke-width="1.4" stroke-dasharray="5 5" marker-end="url(#f3a)"/>
+      <text x="884" y="80" font-size="10.5" fill="#98a2b3" text-anchor="end">understanding</text>
+    </svg>
+    <figcaption><strong>Seventeen rungs.</strong> Fourteen are green — 360 passing test cases, every RTL claim checked bit-for-bit against the simulator. Three are dashed because the card’s JTAG cable wasn’t attached, and we refuse to draw a green step we didn’t climb.</figcaption>
+  </figure>
+
+
+  <p>Steps 12, 13 and 15 are the ones that touch the physical card — and our card’s JTAG cable wasn’t attached while we did this. Those rungs are committed with honest <code>BLOCKED</code> receipts and a read-only probe that says exactly why, plus the exact commands to finish them when the cable comes back. <strong>No fake PASS. Ever.</strong> The other fourteen rungs are green: <strong>360 test cases</strong>, from 14 to 102 per rung.</p>
+
+  <hr class="sep">
+
+  <h2 id="middle">Seventeen rungs, one by one</h2>
+
+  <p>The rest of this post climbs the ladder one rung at a time, and every rung is its own section: a real commit, its own machine, its own tests and its own diagram. Read it in order, or use the index above to jump to the one you are curious about.</p>
+
+<section class="step" id="s0">
+    <p class="step-kicker" style="color:#b0b8c4">rung 00 · toy</p>
+    <h2>Step 0 · the toy baseline</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>14 tests</strong></p>
+  <p>A 2×2 systolic array, a 128-word unified buffer, and a VPU that knows bias, leaky-ReLU and the loss function. It is fed with hand-written Q8.8 microcode and it trains a 2→2→1 XOR network — forward and backward pass — under cocotb.</p>
+  <p>We imported it as the branch’s first commit: ten cocotb targets (19 cases), lint, and a provenance check against the original toy repository. What it can’t do is everything the rest of this post is about: no instruction bus, no DRAM, no compiler, no host.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 49 files · <b style="color:#7fce9a">+6902</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/toy/src/fixedpoint.sv</span> <span class="delta"><b>+1251</b> lines</span><span class="why">step 0 imports this 1,251-line arithmetic package</span></div><pre><code data-lang="sv"><span class="c">// ladder/toy/src/fixedpoint.sv — fxp_mul (WII=WIF=8 → signed 16-bit Q8.8)</span>
+<span class="c">// one rounded operation: 32-bit Q16.16 product → shift right 8 with the</span>
+<span class="c">// &quot;round-half-up on the floored value&quot; bump, then saturate to int16</span>
+<span class="k">if</span><span class="o">(</span> ROUND <span class="o">&amp;</span><span class="o">&amp;</span> <span class="o">~</span><span class="o">(</span><span class="o">&amp;</span>res<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">)</span> <span class="o">&amp;</span><span class="o">&amp;</span>
+    <span class="o">(</span>acc<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">+</span><span class="o">(</span>divrp<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">&gt;</span><span class="o">&gt;</span><span class="o">(</span>WOF<span class="o">)</span><span class="o">)</span><span class="o">-</span>divdp<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">)</span>
+      <span class="o">&lt;</span> <span class="o">(</span>divdp<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">-</span>acc<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">)</span> <span class="o">)</span>
+    roundedres <span class="o">&lt;</span><span class="o">=</span> res<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span> <span class="o">+</span> ONEO<span class="o">;</span>   <span class="c">// bump</span>
+<span class="k">else</span>
+    roundedres <span class="o">&lt;</span><span class="o">=</span> res<span class="o">[</span>WOI<span class="o">+</span>WOF<span class="o">]</span><span class="o">;</span></code></pre></div>
+    <div class="codebox"><div class="codebox-head"><span class="fname">ladder/toy/src/tpu.sv</span><span class="delta"><b>+185 lines</b></span><span class="why">the toy top: UB + systolic + VPU in one loop</span></div><pre><code data-lang="sv"><span class="c">// ladder/toy/src/tpu.sv — the whole toy machine is a microcode monitor</span>
+<span class="c">// 0: load X and W into the unified buffer   1: 2×2 systolic forward</span>
+<span class="c">// 2: bias + leaky-ReLU (VPU)                3: loss + gradients</span>
+<span class="c">// 4: SGD update the weights, host reads Y   (Q8.8 everywhere)</span>
+<span class="k">always</span> <span class="o">@</span><span class="o">(</span><span class="k">posedge</span> clk<span class="o">)</span> <span class="k">begin</span>
+  <span class="k">case</span> <span class="o">(</span>stage<span class="o">)</span>
+    S_LOAD_X<span class="o">:</span>  ub_wr <span class="o">=</span> <span class="o">{</span><span class="n">12&#x27;d0</span><span class="o">,</span> <span class="n">5&#x27;d0</span><span class="o">,</span> x_word<span class="o">}</span><span class="o">;</span>
+    S_FORWARD<span class="o">:</span> systolic_start <span class="o">=</span> <span class="n">1&#x27;b1</span><span class="o">;</span>              <span class="c">// the PE array drips partial sums</span>
+    S_LOSS<span class="o">:</span>    loss_start <span class="o">=</span> <span class="n">1&#x27;b1</span><span class="o">;</span>                  <span class="c">// (2/N)(H-Y) in fixed point</span>
+    S_UPDATE<span class="o">:</span>  gd_start <span class="o">=</span> <span class="n">1&#x27;b1</span><span class="o">;</span>                    <span class="c">// w &lt;= w - lr*g</span>
+  <span class="k">endcase</span>
+<span class="k">end</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 128" role="img" aria-label="tiny-tpu: 2x2 MACs, unified buffer, VPU, XOR network and cocotb"><defs><marker id="s0a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="128" fill="transparent"/><rect x="20" y="16" width="150" height="42" rx="6" fill="#211b13" stroke="#3d3121"/>
+<text x="95.0" y="33.925" font-size="10.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">2×2 MACs</text>
+<text x="95.0" y="47.425" font-size="10.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">systolic · Q8.8</text>
+<rect x="20" y="70" width="150" height="42" rx="6" fill="#211b13" stroke="#3d3121"/>
+<text x="95.0" y="87.925" font-size="10.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">unified buffer</text>
+<text x="95.0" y="101.425" font-size="10.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">128 × 16-bit</text>
+<line x1="172" y1="37" x2="206" y2="52" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s0a)"/>
+<line x1="172" y1="90" x2="206" y2="76" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s0a)"/>
+<rect x="210" y="36" width="150" height="46" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="285.0" y="55.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">VPU</text>
+<text x="285.0" y="69.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">bias · leaky-ReLU · loss</text>
+<line x1="362" y1="59" x2="392" y2="59" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s0a)"/>
+<rect x="396" y="28" width="170" height="62" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="481.0" y="55.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">XOR network</text>
+<text x="481.0" y="69.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">forward + backward · SGD</text>
+<line x1="568" y1="59" x2="598" y2="59" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s0a)"/>
+<rect x="602" y="40" width="238" height="38" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="721.0" y="62.5" font-size="10" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">10 cocotb targets · 19 cases</text>
+<text x="430" y="120" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">no instruction bus · no DRAM · no host</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s1">
+    <p class="step-kicker" style="color:#b0b8c4">rung 01 · toy</p>
+    <h2>Step 1 · a runner that writes receipts</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>10 tests</strong></p>
+  <p>First we gave the project a spine. One runner runs each rung in tiers: light Python and toy tests first, then the production-RTL tier under Verilator, then the heavy tier under a shared-host lock and thermal gate. Every run writes a JSON receipt — commit, exact command, toolchain, per-test verdicts, thermal state — and an evidence checker refuses a branch whose receipts disagree with the tree.</p>
+  <p>Those receipts are why you can trust any number in this post: each one is a file in the repository next to the commit it describes.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 8 files · <b style="color:#7fce9a">+849</b> / <b style="color:#e08f8f">−60</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/run.py</span> <span class="delta"><b>+489</b> lines</span><span class="why">the receipts every later claim rests on</span></div><pre><code data-lang="py"><span class="c"># ladder/run.py — the spine: one rung, three tiers, then a receipt</span>
+light      →  toy cocotb <span class="o">+</span> pure-Python tests        <span class="o">(</span>no lock<span class="o">)</span>
+production →  Verilator RTL<span class="o">,</span> minutes                <span class="o">(</span>flock <span class="o">+</span> thermal gate<span class="o">)</span>
+heavy      →  the biggest builds<span class="o">/</span>sims               <span class="o">(</span>flock <span class="o">+</span> thermal gate<span class="o">)</span>
+
+<span class="c"># every run ends by writing ladder/evidence/stepNN.json:</span>
+receipt <span class="o">=</span> <span class="o">{</span>
+  <span class="s">&quot;git&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;commit&quot;</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">,</span> <span class="s">&quot;dirty&quot;</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">}</span><span class="o">,</span>   <span class="c"># what exactly ran</span>
+  <span class="s">&quot;command&quot;</span><span class="o">:</span> <span class="s">&quot;python3 ladder/run.py step 07&quot;</span><span class="o">,</span>
+  <span class="s">&quot;toolchain&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;iverilog&quot;</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">,</span> <span class="s">&quot;verilator&quot;</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">,</span> <span class="s">&quot;thermal_c&quot;</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">}</span><span class="o">,</span>
+  <span class="s">&quot;tests&quot;</span><span class="o">:</span> <span class="o">[</span><span class="o">{</span><span class="s">&quot;test&quot;</span><span class="o">:</span> <span class="s">&quot;...&quot;</span><span class="o">,</span> <span class="s">&quot;status&quot;</span><span class="o">:</span> <span class="s">&quot;PASSED&quot;</span><span class="o">}</span><span class="o">,</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">]</span><span class="o">,</span>
+  <span class="s">&quot;summary&quot;</span><span class="o">:</span> <span class="s">&quot;PASS&quot;</span><span class="o">,</span> <span class="s">&quot;passed&quot;</span><span class="o">:</span> <span class="n">31</span><span class="o">,</span> <span class="s">&quot;failed&quot;</span><span class="o">:</span> <span class="n">0</span><span class="o">,</span> <span class="s">&quot;skipped&quot;</span><span class="o">:</span> <span class="n">0</span><span class="o">,</span>
+<span class="o">}</span></code></pre></div>
+    <div class="codebox"><div class="codebox-head"><span class="fname">ladder/evidence/step01.json</span><span class="delta"><b>120 lines</b></span><span class="why">the file that makes the claim checkable</span></div><pre><code data-lang="json"><span class="o">{</span>
+ <span class="s">&quot;git&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;commit&quot;</span><span class="o">:</span> <span class="s">&quot;10ea3876&quot;</span><span class="o">,</span> <span class="s">&quot;dirty&quot;</span><span class="o">:</span> <span class="k">true</span><span class="o">,</span> <span class="s">&quot;branch&quot;</span><span class="o">:</span> <span class="s">&quot;ladder/tiny-tpu-to-opentpu&quot;</span><span class="o">}</span><span class="o">,</span>
+ <span class="s">&quot;command&quot;</span><span class="o">:</span> <span class="s">&quot;python3 ladder/run.py step 1&quot;</span><span class="o">,</span>
+ <span class="s">&quot;toolchain&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;iverilog&quot;</span><span class="o">:</span> <span class="s">&quot;Icarus Verilog 13&quot;</span><span class="o">,</span> <span class="s">&quot;python&quot;</span><span class="o">:</span> <span class="s">&quot;3.14.8&quot;</span><span class="o">,</span>
+               <span class="s">&quot;numpy&quot;</span><span class="o">:</span> <span class="s">&quot;2.4.6&quot;</span><span class="o">,</span> <span class="s">&quot;thermal_c&quot;</span><span class="o">:</span> <span class="n">61.5</span><span class="o">,</span> <span class="s">&quot;nproc&quot;</span><span class="o">:</span> <span class="n">8</span><span class="o">}</span><span class="o">,</span>
+ <span class="s">&quot;tests&quot;</span><span class="o">:</span> <span class="o">[</span><span class="o">{</span><span class="s">&quot;test&quot;</span><span class="o">:</span> <span class="s">&quot;ladder/tests/test_step01_harness.py::test_runner_table_matches_roadmap&quot;</span><span class="o">,</span>
+            <span class="s">&quot;status&quot;</span><span class="o">:</span> <span class="s">&quot;PASSED&quot;</span><span class="o">}</span><span class="o">,</span> ...<span class="o">]</span><span class="o">,</span>
+ <span class="s">&quot;summary&quot;</span><span class="o">:</span> <span class="s">&quot;PASS&quot;</span><span class="o">,</span> <span class="s">&quot;passed&quot;</span><span class="o">:</span> <span class="n">10</span><span class="o">,</span> <span class="s">&quot;failed&quot;</span><span class="o">:</span> <span class="n">0</span><span class="o">,</span> <span class="s">&quot;skipped&quot;</span><span class="o">:</span> <span class="n">0</span><span class="o">,</span>
+ <span class="s">&quot;duration_s&quot;</span><span class="o">:</span> <span class="n">5.664</span>
+<span class="o">}</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 116" role="img" aria-label="The runner: make step, pytest, receipt JSON, evidence check"><defs><marker id="s1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="116" fill="transparent"/><rect x="20" y="34" width="150" height="48" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="95.0" y="54.925" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">make step NN</text>
+<text x="95.0" y="68.425" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">toy · mini · production tiers</text>
+<line x1="172" y1="58" x2="204" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s1a)"/>
+<rect x="208" y="28" width="170" height="60" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="293.0" y="54.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">per-rung pytest</text>
+<text x="293.0" y="68.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">light tier first</text>
+<line x1="380" y1="58" x2="412" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s1a)"/>
+<rect x="416" y="20" width="220" height="76" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="526.0" y="48.0" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">receipt JSON</text>
+<text x="526.0" y="61.5" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">commit · command · toolchain</text>
+<text x="526.0" y="75.0" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">per-test verdicts · thermal</text>
+<line x1="638" y1="58" x2="670" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s1a)"/>
+<rect x="674" y="38" width="166" height="40" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="757.0" y="61.675" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">evidence-check ✓</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s2">
+    <p class="step-kicker" style="color:#b0b8c4">rung 02 · toy</p>
+    <h2>Step 2 · the scoreboard, and the bug it found</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>9 tests</strong></p>
+  <p>Then our own testbench got caught lying. The imported XOR test had no scoreboard; it pulsed <code>sys_switch_in</code> one cycle too early, so both rows of the systolic array latched the same weight, and the network quietly computed <code>(x0 + x1) · w</code> instead of a dot product. It had been “passing” forever, because a test with no scoreboard can’t fail — it just draws a waveform that nobody reads.</p>
+  <p>We fixed the timing, then built a scoreboard: golden vectors from a tiny independent Q8.8 model at every stage boundary, plus a mutation test that breaks one module at a time and demands that the bench fail. Five modules that had been smoke-tested forever became genuinely tested — 5/5 mutations caught.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 7 files · <b style="color:#7fce9a">+1565</b> / <b style="color:#e08f8f">−15</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/bench/toy_golden.py</span> <span class="delta"><b>+143</b> lines</span><span class="why">this is what caught the one-cycle-early bug</span></div><pre><code data-lang="py"><span class="c"># ladder/bench/toy_golden.py — the independent Q8.8 model the bench checks</span>
+<span class="k">def</span> fmul<span class="o">(</span>a<span class="o">,</span> b<span class="o">)</span><span class="o">:</span>
+    prod <span class="o">=</span> a <span class="o">*</span> b                 <span class="c"># Q16.16</span>
+    r <span class="o">=</span> prod <span class="o">&gt;</span><span class="o">&gt;</span> <span class="n">8</span>                <span class="c"># floor to Q8.8</span>
+    <span class="k">if</span> <span class="o">(</span>prod <span class="o">&gt;</span><span class="o">&gt;</span> <span class="n">7</span><span class="o">)</span> <span class="o">&amp;</span> <span class="n">1</span> <span class="k">and</span> <span class="o">(</span>r <span class="o">&amp;</span> <span class="n">0</span>x7FFFFF<span class="o">)</span> <span class="o">!</span><span class="o">=</span> <span class="n">0</span>x7FFFFF<span class="o">:</span>
+        r <span class="o">+</span><span class="o">=</span> <span class="n">1</span>                   <span class="c"># round-half-up, exactly like fxp_zoom</span>
+    <span class="k">return</span> clip16<span class="o">(</span>r<span class="o">)</span>
+
+<span class="k">def</span> fadd<span class="o">(</span>a<span class="o">,</span> b<span class="o">)</span><span class="o">:</span>  <span class="k">return</span> clip16<span class="o">(</span>a <span class="o">+</span> b<span class="o">)</span>
+<span class="k">def</span> leaky<span class="o">(</span>x<span class="o">,</span> leak<span class="o">)</span><span class="o">:</span>  <span class="k">return</span> x <span class="k">if</span> x <span class="o">&gt;</span><span class="o">=</span> <span class="n">0</span> <span class="k">else</span> fmul<span class="o">(</span>x<span class="o">,</span> leak<span class="o">)</span></code></pre></div>
+    <figure class="wide">
+    <svg viewBox="0 0 860 300" role="img" aria-labelledby="f4t f4d">
+      <title id="f4t">What the buggy testbench actually computed</title>
+      <desc id="f4d">Two cases: intended straightforward computation where two rows latch different weights and produce a dot product, versus the imported testbench where the switch pulse arrives early and both rows latch the same weight so the array computes the sum times one weight.</desc>
+      <defs>
+        <marker id="f4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/>
+        </marker>
+      </defs>
+      <text x="30" y="30" font-size="12" font-weight="700" fill="#94d0ad">what the testbench thought it was doing</text>
+      <g font-size="11" fill="#d6d3cc">
+        <rect x="30" y="46" width="70" height="30" rx="5" fill="#12211a" stroke="#233d2c"/><text x="65" y="66" text-anchor="middle">x0 · w0</text>
+        <rect x="112" y="46" width="70" height="30" rx="5" fill="#12211a" stroke="#233d2c"/><text x="147" y="66" text-anchor="middle">x1 · w1</text>
+        <line x1="184" y1="61" x2="212" y2="61" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f4a)"/>
+        <rect x="216" y="46" width="70" height="30" rx="5" fill="#1b2029" stroke="#33312a"/><text x="251" y="66" text-anchor="middle">add</text>
+        <line x1="288" y1="61" x2="316" y2="61" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f4a)"/>
+        <rect x="320" y="46" width="110" height="30" rx="5" fill="#12211a" stroke="#2f5a3f"/><text x="375" y="66" text-anchor="middle">a real dot product</text>
+      </g>
+      <text x="30" y="122" font-size="11.5" fill="#b0b8c4">both rows latch a <tspan font-weight="700">different</tspan> weight; partial sums flow down</text>
+
+      <line x1="30" y1="140" x2="830" y2="140" stroke="#262b33" stroke-dasharray="4 4"/>
+
+      <text x="30" y="176" font-size="12" font-weight="700" fill="#e58c8c">what the imported test actually did</text>
+      <g font-size="11" fill="#d6d3cc">
+        <rect x="30" y="192" width="70" height="30" rx="5" fill="#241416" stroke="#4a2a2a"/><text x="65" y="212" text-anchor="middle">x0 · w0</text>
+        <rect x="112" y="192" width="70" height="30" rx="5" fill="#241416" stroke="#4a2a2a"/><text x="147" y="212" text-anchor="middle">x1 · w0</text>
+        <line x1="184" y1="207" x2="212" y2="207" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f4a)"/>
+        <rect x="216" y="192" width="70" height="30" rx="5" fill="#1b2029" stroke="#33312a"/><text x="251" y="212" text-anchor="middle">add</text>
+        <line x1="288" y1="207" x2="316" y2="207" stroke="#98a2b3" stroke-width="1.4" marker-end="url(#f4a)"/>
+        <rect x="320" y="192" width="180" height="30" rx="5" fill="#241416" stroke="#4a2a2a"/><text x="410" y="212" text-anchor="middle">(x0 + x1) · w0 — plausible-looking!</text>
+        <rect x="516" y="192" width="200" height="30" rx="5" fill="#1b2029" stroke="#4a2a2a" stroke-dasharray="4 3"/>
+        <text x="616" y="212" text-anchor="middle" fill="#e58c8c">switched one cycle too early</text>
+      </g>
+      <text x="30" y="252" font-size="11" fill="#8b93a0">the scoreboard that caught it compares every stage boundary against a tiny Q8.8 Python model,</text>
+      <text x="30" y="270" font-size="11" fill="#8b93a0">then mutates each module in turn and demands that the bench fails — 5/5 mutations detected</text>
+    </svg>
+    <figcaption><strong>The bug our own testbench hid.</strong> No scoreboard, no failure — just a waveform nobody reads. This is why every later rung ships tests with golden vectors, not screenshots.</figcaption>
+  </figure>
+
+  </section>
+
+<section class="step" id="s3">
+    <p class="step-kicker" style="color:#8db8e0">rung 03 · contract</p>
+    <h2>Step 3 · sign the contract before writing RTL</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>61 tests</strong></p>
+  <p>Before writing a single line of new hardware description, we imported the openTPU ISA document, instruction encoder, bit-exact simulator, fp32 arithmetic model and quantizer — byte-identically. That is the contract: encodings, arithmetic semantics and the memory model. From this rung on, every hardware decision had a Python referee. If the RTL and the simulator disagree by one word, the RTL is wrong.</p>
+  <p>It feels backwards to start a hardware project by importing software. It’s the best decision we made.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 14 files · <b style="color:#7fce9a">+4280</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">opentpu/isa.py · opentpu/isasim.py</span> <span class="delta"><b>+486</b> lines</span><span class="why">4,280 lines of referee imported byte-identically</span></div><pre><code data-lang="py"><span class="c"># opentpu/isa.py — the contract, and the only encoder anyone may use</span>
+<span class="k">def</span> encode<span class="o">(</span><span class="k">self</span><span class="o">)</span> <span class="o">-</span><span class="o">&gt;</span> <span class="b">list</span><span class="o">[</span><span class="b">int</span><span class="o">]</span><span class="o">:</span>
+    w0 <span class="o">=</span> <span class="o">(</span><span class="k">self</span><span class="o">.</span>op <span class="o">&amp;</span> <span class="n">0</span>xFF<span class="o">)</span> <span class="o">|</span> <span class="o">(</span><span class="k">self</span><span class="o">.</span>ra <span class="o">&lt;</span><span class="o">&lt;</span> <span class="n">8</span><span class="o">)</span> <span class="o">|</span> <span class="o">(</span><span class="k">self</span><span class="o">.</span>rb <span class="o">&lt;</span><span class="o">&lt;</span> <span class="n">12</span><span class="o">)</span> \
+        <span class="o">|</span> <span class="o">(</span><span class="k">self</span><span class="o">.</span>rc <span class="o">&lt;</span><span class="o">&lt;</span> <span class="n">16</span><span class="o">)</span> <span class="o">|</span> <span class="o">(</span><span class="k">self</span><span class="o">.</span>rd <span class="o">&lt;</span><span class="o">&lt;</span> <span class="n">20</span><span class="o">)</span> <span class="o">|</span> <span class="o">(</span><span class="o">(</span><span class="k">self</span><span class="o">.</span>flags <span class="o">&amp;</span> <span class="n">0</span>xFF<span class="o">)</span> <span class="o">&lt;</span><span class="o">&lt;</span> <span class="n">24</span><span class="o">)</span>
+    <span class="k">return</span> <span class="o">[</span>u32<span class="o">(</span>w0<span class="o">)</span><span class="o">]</span> <span class="o">+</span> <span class="o">[</span>u32<span class="o">(</span>x<span class="o">)</span> <span class="k">for</span> x <span class="k">in</span> <span class="k">self</span><span class="o">.</span>w<span class="o">]</span>      <span class="c"># 8 × 32 = 256 bits</span>
+
+<span class="c"># and the oracle: opentpu/isasim.py — every instruction, cycle semantics</span>
+<span class="c"># included, pure Python.  From here on, &quot;correct&quot; means &quot;isasim agrees&quot;.</span></code></pre></div>
+    <div class="codebox"><div class="codebox-head"><span class="fname">opentpu/isasim.py</span><span class="delta"><b>+866 lines</b></span><span class="why">the oracle: every instruction, pure Python</span></div><pre><code data-lang="py"><span class="c"># opentpu/isasim.py — the machine whose state defines &quot;correct&quot;</span>
+<span class="k">class</span> Machine<span class="o">:</span>
+    <span class="k">def</span> __init__<span class="o">(</span><span class="k">self</span><span class="o">,</span> cfg<span class="o">:</span> Config<span class="o">)</span><span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span>
+    <span class="k">def</span> run<span class="o">(</span><span class="k">self</span><span class="o">,</span> prog<span class="o">,</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span><span class="o">)</span> <span class="o">-</span><span class="o">&gt;</span> <span class="b">dict</span><span class="o">:</span>
+        <span class="s">&quot;&quot;&quot;Execute the 8-word instructions; return {&quot;tmem&quot;, &quot;dram&quot;, &quot;cycles&quot;, &quot;icount&quot;}.&quot;&quot;&quot;</span>
+        <span class="k">while</span> <span class="k">not</span> <span class="k">self</span><span class="o">.</span>halted <span class="k">and</span> <span class="k">self</span><span class="o">.</span>icount <span class="o">&lt;</span> <span class="k">self</span><span class="o">.</span>max_instr<span class="o">:</span>
+            ins <span class="o">=</span> <span class="k">self</span><span class="o">.</span>fetch<span class="o">(</span><span class="o">)</span>            <span class="c"># PC -&gt; 8 × 32-bit words</span>
+            <span class="k">self</span><span class="o">.</span>execute<span class="o">(</span>ins<span class="o">)</span>             <span class="c"># OP_LI/ADDI/LOOP/LD/ST/VOP/QACT/QST/MM/...</span>
+        <span class="k">return</span> <span class="k">self</span><span class="o">.</span>state<span class="o">(</span><span class="o">)</span>
+
+<span class="c"># every later rung compares: RTL.tmem == isa.tmem and RTL.dram == isa.dram, byte for byte</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 150" role="img" aria-label="openTPU instruction contract: eight 32-bit words, one ISA, isasim, fp32 and quant models"><defs><marker id="s3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="150" fill="transparent"/><text x="20" y="20" font-size="10" fill="#e8e5df" text-anchor="start" font-weight="600" font-family="Lora, Georgia, serif">one 256-bit instruction = 8 × 32-bit words</text>
+<rect x="20" y="28" width="190" height="9" rx="2" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="20" y="40" width="190" height="9" rx="2" fill="#22384d" stroke="#5b8bb5"/>
+<rect x="20" y="52" width="190" height="9" rx="2" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="20" y="64" width="190" height="9" rx="2" fill="#22384d" stroke="#5b8bb5"/>
+<rect x="20" y="76" width="190" height="9" rx="2" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="20" y="88" width="190" height="9" rx="2" fill="#22384d" stroke="#5b8bb5"/>
+<rect x="20" y="100" width="190" height="9" rx="2" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="20" y="112" width="190" height="9" rx="2" fill="#22384d" stroke="#5b8bb5"/>
+<text x="215" y="52" font-size="9" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Roboto Mono, monospace">op</text>
+<text x="215" y="86" font-size="9" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Roboto Mono, monospace">a · b · c</text>
+<text x="215" y="118" font-size="9" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Roboto Mono, monospace">imm</text>
+<line x1="214" y1="88" x2="246" y2="88" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s3a)"/>
+<rect x="250" y="22" width="132" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="316.0" y="40.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Roboto Mono, monospace">isa.py</text>
+<rect x="392" y="22" width="132" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="458.0" y="40.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Roboto Mono, monospace">isasim.py</text>
+<rect x="534" y="22" width="132" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="600.0" y="40.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Roboto Mono, monospace">fp32.py</text>
+<rect x="676" y="22" width="132" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="742.0" y="40.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Roboto Mono, monospace">quant.py</text>
+<line x1="316" y1="54" x2="316" y2="74" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s3a)"/>
+<line x1="458" y1="54" x2="458" y2="74" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s3a)"/>
+<line x1="600" y1="54" x2="600" y2="74" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s3a)"/>
+<line x1="742" y1="54" x2="742" y2="74" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s3a)"/>
+<line x1="316" y1="74" x2="742" y2="74" stroke="#98a2b3" stroke-width="1.1"/>
+<rect x="250" y="84" width="558" height="38" rx="6" fill="#211b13" stroke="#3d3121"/>
+<text x="529.0" y="106.5" font-size="10" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">one contract: encodings · arithmetic semantics · memory model</text>
+<text x="430" y="142" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">imported byte-identically — the referee for every later rung</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s4">
+    <p class="step-kicker" style="color:#7fce9a">rung 04 · mini-core</p>
+    <h2>Step 4 · a machine with a program</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>7 tests</strong></p>
+  <p>Now a machine instead of a pile of datapaths: a small, readable openTPU-ISA core — one slice, fetch-execute, one instruction at a time. Instruction memory, a program counter, sixteen registers and a depth-four loop stack; tile memory and DRAM; loads, stores, remote loads and loops.</p>
+  <p>It is not fast, and it does not need to be: the ISA contract is about state, not cycles, so a machine this simple can already be <strong>bit-exact</strong>. Seven tests, every one a whole-state comparison.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 10 files · <b style="color:#7fce9a">+1658</b> / <b style="color:#e08f8f">−3</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/mini-core/rtl/mini_top.sv</span> <span class="delta"><b>+377</b> lines</span><span class="why">the whole machine: 377 lines, one slice</span></div><pre><code data-lang="sv"><span class="c">// ladder/mini-core/rtl/mini_top.sv — fetch eight words, execute to completion</span>
+ST_FETCH<span class="o">:</span> <span class="k">begin</span>
+  cur<span class="o">[</span>fidx<span class="o">]</span> <span class="o">&lt;</span><span class="o">=</span> imem_rdata<span class="o">;</span>                       <span class="c">// one word of the instruction</span>
+  fidx <span class="o">&lt;</span><span class="o">=</span> fidx <span class="o">+</span> <span class="n">1</span><span class="o">;</span>
+  <span class="k">if</span> <span class="o">(</span>fidx <span class="o">=</span><span class="o">=</span> <span class="n">3&#x27;d7</span><span class="o">)</span> st <span class="o">&lt;</span><span class="o">=</span> ST_EXEC<span class="o">;</span>               <span class="c">// 8 words = one instruction</span>
+<span class="k">end</span>
+ST_EXEC<span class="o">:</span> <span class="k">begin</span>
+  icnt <span class="o">&lt;</span><span class="o">=</span> icnt <span class="o">+</span> <span class="n">32&#x27;d1</span><span class="o">;</span>                          <span class="c">// isasim counts before errors</span>
+  <span class="k">case</span> <span class="o">(</span>op<span class="o">)</span>
+    OP_LI<span class="o">:</span>   <span class="k">if</span> <span class="o">(</span>rd <span class="o">!</span><span class="o">=</span> <span class="n">4&#x27;d0</span><span class="o">)</span> <span class="k">begin</span> R<span class="o">[</span>rd<span class="o">]</span> <span class="o">&lt;</span><span class="o">=</span> w1<span class="o">;</span> st <span class="o">&lt;</span><span class="o">=</span> ST_ADV<span class="o">;</span> <span class="k">end</span>
+    OP_ADDI<span class="o">:</span> <span class="k">if</span> <span class="o">(</span>rd <span class="o">!</span><span class="o">=</span> <span class="n">4&#x27;d0</span><span class="o">)</span> <span class="k">begin</span> R<span class="o">[</span>rd<span class="o">]</span> <span class="o">&lt;</span><span class="o">=</span> rget<span class="o">(</span>ra<span class="o">)</span> <span class="o">+</span> w1<span class="o">;</span> st <span class="o">&lt;</span><span class="o">=</span> ST_ADV<span class="o">;</span> <span class="k">end</span>
+    OP_LOOP<span class="o">:</span> <span class="o">.</span><span class="o">.</span><span class="o">.</span>                                 <span class="c">// range + depth-4 stack</span>
+    OP_LD <span class="o">/</span> OP_ST<span class="o">:</span>  serial <span class="t">byte</span> engine            <span class="c">// rtype/etype/stride</span></code></pre></div>
+    <figure class="wide">
+    <svg viewBox="0 0 860 470" role="img" aria-labelledby="f5t f5d">
+      <title id="f5t">The mini-core data-path</title>
+      <desc id="f5d">An instruction memory feeds a sequencer with registers and loops; the sequencer drives vector, quantizer, matrix, reduction and DMA units, which read and write TMEM, ACT RAM and DRAM. Every instruction's resulting state is compared against the ISA simulator.</desc>
+      <defs>
+        <marker id="f5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8b93a0"/>
+        </marker>
+      </defs>
+      <!-- imem -->
+      <rect x="26" y="70" width="118" height="120" rx="8" fill="#151920" stroke="#33312a"/>
+      <text x="85" y="94" font-size="11.5" font-weight="700" fill="#e8e5df" text-anchor="middle">instruction</text>
+      <text x="85" y="110" font-size="11.5" font-weight="700" fill="#e8e5df" text-anchor="middle">memory</text>
+      <text x="85" y="132" font-size="9.5" font-family="Roboto Mono, monospace" fill="#8b93a0" text-anchor="middle">8 × 32-bit</text>
+      <text x="85" y="147" font-size="9.5" font-family="Roboto Mono, monospace" fill="#8b93a0" text-anchor="middle">words / instr</text>
+      <text x="85" y="170" font-size="9.5" fill="#8b93a0" text-anchor="middle">LI · ADDI · LOOP</text>
+      <text x="85" y="182" font-size="9.5" fill="#8b93a0" text-anchor="middle">LD · ST · MM · VOP …</text>
+      <line x1="148" y1="130" x2="176" y2="130" stroke="#8b93a0" stroke-width="1.4" marker-end="url(#f5a)"/>
+
+      <!-- sequencer -->
+      <rect x="180" y="86" width="132" height="94" rx="8" fill="#131c28" stroke="#26303d"/>
+      <text x="246" y="112" font-size="12" font-weight="700" fill="#9cc2e8" text-anchor="middle">sequencer</text>
+      <text x="246" y="132" font-size="10" fill="#8fa8c2" text-anchor="middle">PC · R0–R15</text>
+      <text x="246" y="148" font-size="10" fill="#8fa8c2" text-anchor="middle">loop stack (depth 4)</text>
+      <text x="246" y="166" font-size="9.5" fill="#8b93a0" text-anchor="middle">one instruction at a time</text>
+
+      <!-- fan-out lines -->
+      <line x1="312" y1="104" x2="352" y2="78" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="312" y1="120" x2="352" y2="120" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="312" y1="138" x2="352" y2="162" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="312" y1="156" x2="352" y2="204" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="312" y1="174" x2="352" y2="246" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+
+      <!-- units -->
+      <g font-size="10.5" fill="#94d0ad">
+        <rect x="356" y="60" width="160" height="36" rx="6" fill="#12211a" stroke="#233d2c"/><text x="436" y="83" text-anchor="middle">VPU · 14 fp32 ops · 4 B-modes</text>
+        <rect x="356" y="102" width="160" height="36" rx="6" fill="#12211a" stroke="#233d2c"/><text x="436" y="125" text-anchor="middle">quantizer · QACT / QST</text>
+        <rect x="356" y="144" width="160" height="36" rx="6" fill="#12211a" stroke="#233d2c"/><text x="436" y="167" text-anchor="middle">MXU · int8 · scales · epilogue</text>
+        <rect x="356" y="186" width="160" height="36" rx="6" fill="#12211a" stroke="#233d2c"/><text x="436" y="209" text-anchor="middle">reductions · argmax · outer</text>
+        <rect x="356" y="228" width="160" height="36" rx="6" fill="#12211a" stroke="#233d2c"/><text x="436" y="251" text-anchor="middle">DMA · LD / ST / RLD</text>
+      </g>
+
+      <!-- memories -->
+      <g font-size="10.5" fill="#9cc2e8">
+        <rect x="596" y="60" width="150" height="44" rx="6" fill="#131c28" stroke="#26303d"/>
+        <text x="671" y="79" text-anchor="middle" font-weight="700">TMEM</text><text x="671" y="94" text-anchor="middle">fp32 words</text>
+        <rect x="596" y="120" width="150" height="44" rx="6" fill="#131c28" stroke="#26303d"/>
+        <text x="671" y="139" text-anchor="middle" font-weight="700">ACT RAM</text><text x="671" y="154" text-anchor="middle">int8 + Sa / da</text>
+        <rect x="596" y="180" width="150" height="44" rx="6" fill="#131c28" stroke="#26303d"/>
+        <text x="671" y="199" text-anchor="middle" font-weight="700">DRAM</text><text x="671" y="214" text-anchor="middle">weights + image</text>
+        <rect x="596" y="240" width="150" height="44" rx="6" fill="#131c28" stroke="#26303d"/>
+        <text x="671" y="259" text-anchor="middle" font-weight="700">results</text><text x="671" y="274" text-anchor="middle">read back by tests</text>
+      </g>
+      <line x1="516" y1="78" x2="592" y2="78" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="516" y1="120" x2="592" y2="140" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="516" y1="162" x2="592" y2="200" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="516" y1="204" x2="592" y2="82" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+      <line x1="516" y1="246" x2="592" y2="142" stroke="#8b93a0" stroke-width="1.2" marker-end="url(#f5a)"/>
+
+      <!-- compare band -->
+      <rect x="26" y="322" width="820" height="58" rx="9" fill="#211b13" stroke="#3d3121"/>
+      <text x="48" y="346" font-size="12" font-weight="700" fill="#d6b083">the seatbelt:</text>
+      <text x="150" y="346" font-size="11" fill="#b8a99c">after every program, the mini-core’s entire TMEM + DRAM + instruction count is compared with</text>
+      <text x="150" y="365" font-size="11" fill="#b8a99c">the bit-exact ISA simulator — <tspan font-family="Roboto Mono, monospace" font-size="10">opentpu/isasim.py</tspan> — and must be identical, word for word.</text>
+      <text x="26" y="412" font-size="10.5" fill="#8b93a0">≈ 2,000 lines of SystemVerilog in the mini-core. 120 tests. It is dead code by step 9 — that was always the plan.</text>
+      <text x="26" y="438" font-size="10.5" fill="#8b93a0">Its job was to make 55,000 lines of production SystemVerilog feel readable.</text>
+    </svg>
+    <figcaption><strong>The mini-core.</strong> Write the small machine yourself, unit by unit, and let the simulator hold the seatbelt. Then the production core has something to be compared against — and something to inherit.</figcaption>
+  </figure>
+
+  </section>
+
+<section class="step" id="s5">
+    <p class="step-kicker" style="color:#7fce9a">rung 05 · mini-core</p>
+    <h2>Step 5 · the fp32 vector unit</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>22 tests</strong></p>
+  <p>The first unit we could not responsibly hand-write was the vector unit. IEEE addition and multiplication are a swamp of rounding modes, denormals and NaN payloads, so we imported the production fp32 package verbatim and spent our effort on <em>behaviour</em> instead: fourteen ops, four B broadcast modes, and a set of corner words (sNaN, qNaN, ±0, denormals). That is where we learned that canonicalising a signaling NaN changes a bit downstream.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 9 files · <b style="color:#7fce9a">+1284</b> / <b style="color:#e08f8f">−30</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/mini-core/rtl/mini_vpu.sv</span> <span class="delta"><b>+242</b> lines</span><span class="why">+ otpu_fp.sv imported verbatim (536 lines)</span></div><pre><code data-lang="sv"><span class="c">// ladder/mini-core/rtl/mini_top.sv — VOP operand decode (w1..w7 of the instruction)</span>
+v_dst   <span class="o">=</span> rget<span class="o">(</span>ra<span class="o">)</span> <span class="o">+</span> w1<span class="o">;</span>    v_a <span class="o">=</span> rget<span class="o">(</span>rb<span class="o">)</span> <span class="o">+</span> w2<span class="o">;</span>    v_b <span class="o">=</span> rget<span class="o">(</span>rc<span class="o">)</span> <span class="o">+</span> w3<span class="o">;</span>
+v_rows  <span class="o">=</span> w4<span class="o">[</span><span class="n">15</span><span class="o">:</span><span class="n">0</span><span class="o">]</span><span class="o">;</span>  v_cols <span class="o">=</span> w4<span class="o">[</span><span class="n">31</span><span class="o">:</span><span class="n">16</span><span class="o">]</span><span class="o">;</span>             <span class="c">// shape</span>
+v_drs   <span class="o">=</span> w5<span class="o">[</span><span class="n">15</span><span class="o">:</span><span class="n">0</span><span class="o">]</span><span class="o">;</span>  v_ars  <span class="o">=</span> w5<span class="o">[</span><span class="n">31</span><span class="o">:</span><span class="n">16</span><span class="o">]</span><span class="o">;</span>             <span class="c">// strides</span>
+v_brs   <span class="o">=</span> w6<span class="o">[</span><span class="n">15</span><span class="o">:</span><span class="n">0</span><span class="o">]</span><span class="o">;</span>  v_func <span class="o">=</span> w6<span class="o">[</span><span class="n">23</span><span class="o">:</span><span class="n">16</span><span class="o">]</span><span class="o">;</span>  v_bmode <span class="o">=</span> w6<span class="o">[</span><span class="n">25</span><span class="o">:</span><span class="n">24</span><span class="o">]</span><span class="o">;</span>
+v_imm   <span class="o">=</span> rget<span class="o">(</span>rd<span class="o">)</span> <span class="o">+</span> w7<span class="o">;</span>                             <span class="c">// last word, register-relative</span>
+
+<span class="c">// 14 ops, 4 B modes — FULL / ROW / COL / SCALAR — in mini_vpu.sv,</span>
+<span class="c">// arithmetic from the imported otpu_fp package, so corners match isasim</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 140" role="img" aria-label="Vector unit: eight a lanes and four broadcast modes for b"><defs><marker id="s5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="140" fill="transparent"/><text x="20" y="16" font-size="9" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Roboto Mono, monospace">a[0…7]</text>
+<rect x="20" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="58" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="96" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="134" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="172" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="210" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="248" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<rect x="286" y="22" width="34" height="26" rx="3" fill="#1a2530" stroke="#3f5f7f"/>
+<text x="430" y="16" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">b — four broadcast modes</text>
+<rect x="20" y="56" width="196" height="58" rx="6" fill="#1b2029" stroke="#333a45"/>
+<rect x="232" y="56" width="196" height="58" rx="6" fill="#1b2029" stroke="#333a45"/>
+<rect x="444" y="56" width="196" height="58" rx="6" fill="#1b2029" stroke="#333a45"/>
+<rect x="656" y="56" width="196" height="58" rx="6" fill="#1b2029" stroke="#333a45"/>
+<circle cx="44" cy="85" r="5" fill="#7fce9a"/>
+<text x="44" y="105" font-size="9" fill="#e8e5df" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">scalar</text>
+<circle cx="246" cy="85" r="5" fill="#7fce9a"/>
+<circle cx="268" cy="85" r="5" fill="#7fce9a"/>
+<circle cx="290" cy="85" r="5" fill="#7fce9a"/>
+<circle cx="312" cy="85" r="5" fill="#7fce9a"/>
+<text x="290" y="105" font-size="9" fill="#e8e5df" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">row</text>
+<circle cx="458" cy="72" r="4" fill="#7fce9a"/>
+<circle cx="458" cy="82" r="4" fill="#7fce9a"/>
+<circle cx="458" cy="92" r="4" fill="#7fce9a"/>
+<text x="502" y="105" font-size="9" fill="#e8e5df" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">column</text>
+<circle cx="670" cy="78" r="4" fill="#7fce9a"/>
+<circle cx="686" cy="78" r="4" fill="#7fce9a"/>
+<circle cx="670" cy="90" r="4" fill="#7fce9a"/>
+<circle cx="686" cy="90" r="4" fill="#7fce9a"/>
+<text x="746" y="105" font-size="9" fill="#e8e5df" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">pair</text>
+<text x="430" y="132" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">14 elementwise fp32 ops · ADD SUB RSUB MUL MIN MAX ABS COPY FILL …</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s6">
+    <p class="step-kicker" style="color:#7fce9a">rung 06 · mini-core</p>
+    <h2>Step 6 · quantization, exactly</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>27 tests</strong></p>
+  <p>Quantization is where an accelerator stops being arithmetic and starts being a data format. Per row: compute <code>amax</code>, derive <code>S = amax/127</code>, apply the per-group power-of-two scale, round half-to-even, saturate to int8. The scale row (<code>Sa</code>/<code>da</code>) travels beside the data in the activation RAM. The corner that cost us the most was <code>0 × inf = NaN → 0</code>.</p>
+  <p>27 tests, and every output word had to equal the simulator’s — scales included.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 10 files · <b style="color:#7fce9a">+1206</b> / <b style="color:#e08f8f">−19</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/mini-core/rtl/mini_quant.sv</span> <span class="delta"><b>+515</b> lines</span><span class="why">scale row + int8 bytes travel together</span></div><pre><code data-lang="sv"><span class="c">// ladder/mini-core/rtl/mini_quant.sv — quantizer pass 2, exactly isasim&#x27;s rule</span>
+<span class="c">// pass 1: ftz, apply RSCALE/CSCALE, track the row amax and each group&#x27;s a</span>
+<span class="c">// pass 2: re-read x (same bits), q = otpu_fp::q8(x * invg), write the byte</span>
+q_byte <span class="o">=</span> q8<span class="o">(</span>fp_mul<span class="o">(</span>scale_x<span class="o">(</span>tmem_rdata0<span class="o">)</span><span class="o">,</span> invg<span class="o">[</span>cfg_qst <span class="o">?</span> <span class="o">(</span>c <span class="o">/</span> D<span class="o">)</span> <span class="o">:</span> <span class="o">(</span>c <span class="o">/</span> gsize<span class="o">)</span><span class="o">]</span><span class="o">)</span><span class="o">;</span>
+
+<span class="c">// isasim&#x27;s mx_offset(): (exp(amax) - exp(a)) - (mant(a) &gt; mant(amax)), clipped [0,31]</span>
+d <span class="o">=</span> $signed<span class="o">(</span><span class="o">{</span><span class="n">24&#x27;d0</span><span class="o">,</span> amax_bits<span class="o">[</span><span class="n">30</span><span class="o">:</span><span class="n">23</span><span class="o">]</span><span class="o">}</span><span class="o">)</span> <span class="o">-</span> $signed<span class="o">(</span><span class="o">{</span><span class="n">24&#x27;d0</span><span class="o">,</span> a_bits<span class="o">[</span><span class="n">30</span><span class="o">:</span><span class="n">23</span><span class="o">]</span><span class="o">}</span><span class="o">)</span>
+    <span class="o">-</span> <span class="o">(</span><span class="o">(</span>a_bits<span class="o">[</span><span class="n">22</span><span class="o">:</span><span class="n">0</span><span class="o">]</span> <span class="o">&gt;</span> amax_bits<span class="o">[</span><span class="n">22</span><span class="o">:</span><span class="n">0</span><span class="o">]</span><span class="o">)</span> <span class="o">?</span> <span class="n">32</span><span class="s">&#x27;sd1 : 32&#x27;</span>sd0<span class="o">)</span><span class="o">;</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 130" role="img" aria-label="Quantizer: find amax, compute the scale, round and saturate to int8, write the scale row"><defs><marker id="s6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="130" fill="transparent"/><rect x="20" y="42" width="140" height="42" rx="6" fill="#211b13" stroke="#3d3121"/>
+<text x="90.0" y="66.675" font-size="10.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">fp32 row</text>
+<line x1="162" y1="54" x2="192" y2="40" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s6a)"/>
+<line x1="162" y1="74" x2="192" y2="88" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s6a)"/>
+<rect x="196" y="24" width="124" height="28" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="258.0" y="41.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">amax</text>
+<rect x="196" y="76" width="124" height="28" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="258.0" y="93.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Roboto Mono, monospace">S = amax / 127</text>
+<line x1="322" y1="38" x2="348" y2="54" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s6a)"/>
+<line x1="322" y1="90" x2="348" y2="74" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s6a)"/>
+<rect x="352" y="28" width="236" height="64" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="470.0" y="50.0" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">group power-of-two</text>
+<text x="470.0" y="63.5" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">round half-to-even</text>
+<text x="470.0" y="77.0" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">saturate to int8</text>
+<line x1="590" y1="60" x2="618" y2="60" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s6a)"/>
+<rect x="622" y="34" width="132" height="50" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="688.0" y="55.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">int8 row</text>
+<text x="688.0" y="69.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ Sa / da</text>
+<text x="430" y="124" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">the scale row travels beside the data — every word must match isasim</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s7">
+    <p class="step-kicker" style="color:#7fce9a">rung 07 · mini-core</p>
+    <h2>Step 7 · the matrix unit</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>31 tests</strong></p>
+  <p>The matrix unit is the scary one. Exact integer accumulation over D-byte blocks, then a window of shifts <code>sh = 16 − dw − da</code> — which is <em>signed</em>, can be −494, and then whole groups get dropped — then an fp32 epilogue with three multiplies in a very specific association. The generic int→fp32 converter truncated, so we built a 48-bit one.</p>
+  <p>Thirty-one tests, bit for bit.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 8 files · <b style="color:#7fce9a">+1092</b> / <b style="color:#e08f8f">−19</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/mini-core/rtl/mini_mxu.sv</span> <span class="delta"><b>+530</b> lines</span><span class="why">the hardest 530 lines of the ladder</span></div><pre><code data-lang="sv"><span class="c">// ladder/mini-core/rtl/mini_mxu.sv — the exact-int matmul and the fp32 epilogue</span>
+<span class="c">//   acc = 0</span>
+<span class="c">//   for k:  acc += c1[j][k] * c0[n][k]                  exact, signed 48-bit (&lt; 2^47)</span>
+<span class="c">//   for k:  sh = 16 - dw[n][k0+k] - da[j][ab+k][g]      dw, da unsigned bytes</span>
+<span class="c">//   acc += (sh &gt;= 0) ? c &lt;&lt; sh : 0                      groups past W=16 window drop</span>
+<span class="c">//   y = fp_mul(fp_mul(i2f48(acc), Sw[n]), fp_mul(Sa[j][ab], 2^-16))</span>
+<span class="c">// three rounded multiplies in isasim&#x27;s association, not one fused one</span>
+<span class="t">logic</span> <span class="t">signed</span> <span class="o">[</span><span class="n">47</span><span class="o">:</span><span class="n">0</span><span class="o">]</span> acc<span class="o">;</span>              <span class="c">// 48-bit so i2f48 round-to-even is exact</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 142" role="img" aria-label="Matrix unit: int8 blocks with scales, a signed shift window, an fp32 epilogue"><defs><marker id="s7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="142" fill="transparent"/><rect x="20" y="18" width="160" height="34" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="100.0" y="31.925" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">int8 weights</text>
+<text x="100.0" y="45.425" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">blocks × D</text>
+<rect x="20" y="80" width="160" height="34" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="100.0" y="93.925" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">int8 activations</text>
+<text x="100.0" y="107.425" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">D per block</text>
+<line x1="182" y1="38" x2="214" y2="52" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s7a)"/>
+<line x1="182" y1="96" x2="214" y2="82" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s7a)"/>
+<rect x="218" y="44" width="180" height="46" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="308.0" y="63.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">exact int accumulate</text>
+<text x="308.0" y="77.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">48-bit</text>
+<line x1="400" y1="66" x2="430" y2="66" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s7a)"/>
+<rect x="434" y="32" width="210" height="68" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="539.0" y="55.825" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">signed shift window</text>
+<text x="539.0" y="69.325" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">sh = 16 − dw − da</text>
+<text x="539.0" y="82.825" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">(can be negative: groups drop)</text>
+<line x1="646" y1="66" x2="676" y2="66" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s7a)"/>
+<rect x="680" y="30" width="160" height="72" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="760.0" y="55.825" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">fp32 epilogue</text>
+<text x="760.0" y="69.325" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">i2f48</text>
+<text x="760.0" y="82.825" font-size="9.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ 3 multiplies</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s8">
+    <p class="step-kicker" style="color:#7fce9a">rung 08 · mini-core</p>
+    <h2>Step 8 · reductions, argmax, outer</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>33 tests</strong></p>
+  <p>Reductions look trivial until you need the same bits as the hardware: row sums are sixty-four interleaved partials, with <code>+0</code> padding actually added, folded by a tree of exactly 63 adds. A flat sum is not bit-identical, and softmax does not forgive. Add argmax and the outer product and the attention ingredient list is complete.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 6 files · <b style="color:#7fce9a">+929</b> / <b style="color:#e08f8f">−15</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/mini-core/rtl/mini_reduce.sv</span> <span class="delta"><b>+488</b> lines</span><span class="why">a flat sum is not bit-identical</span></div><pre><code data-lang="sv"><span class="c">// ladder/mini-core/rtl/mini_reduce.sv — reductions in the hardware&#x27;s order</span>
+<span class="c">// RSUM/RSSQ/RDOT = fp32.interleaved_sum(P=64):</span>
+<span class="c">//   64 partial chains started at +0, elements in steps of 64,</span>
+<span class="c">//   the row padded to a multiple of 64 with *added* +0 terms,</span>
+<span class="c">//   then a folding tree x[i] = fp_add(x[i], x[i+32/16/...])  (63 adds)</span>
+c_pad <span class="o">=</span> <span class="o">(</span><span class="o">(</span><span class="o">{</span><span class="n">16&#x27;d0</span><span class="o">,</span> f_cols<span class="o">}</span> <span class="o">+</span> P <span class="o">-</span> <span class="n">1</span><span class="o">)</span> <span class="o">/</span> P<span class="o">)</span> <span class="o">*</span> P<span class="o">;</span>      <span class="c">// padding is part of the value</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 124" role="img" aria-label="Reductions: sixty-four interleaved partials, padded zeros, a folding tree and argmax"><defs><marker id="s8a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="124" fill="transparent"/><rect x="20" y="26" width="170" height="36" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="105.0" y="47.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">64 interleaved partials</text>
+<line x1="192" y1="44" x2="220" y2="44" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s8a)"/>
+<rect x="224" y="26" width="150" height="36" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="299.0" y="40.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ 0 padding</text>
+<text x="299.0" y="54.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">added, not skipped</text>
+<line x1="376" y1="44" x2="404" y2="44" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s8a)"/>
+<rect x="408" y="26" width="190" height="36" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="503.0" y="47.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">folding tree · 63 adds</text>
+<line x1="600" y1="44" x2="628" y2="44" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s8a)"/>
+<rect x="632" y="26" width="100" height="36" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="682.0" y="47.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">sum</text>
+<rect x="20" y="80" width="180" height="32" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="110.0" y="99.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">argmax</text>
+<rect x="216" y="80" width="180" height="32" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="306.0" y="99.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">outer product</text>
+<rect x="412" y="80" width="364" height="32" rx="6" fill="#211b13" stroke="#3d3121"/>
+<text x="594.0" y="99.325" font-size="9.5" fill="#d6b083" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">row order is part of the contract — a flat sum is not bit-identical</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s9">
+    <p class="step-kicker" style="color:#8db8e0">rung 09 · production</p>
+    <h2>Step 9 · cheat, but honestly</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>12 tests</strong></p>
+  <p>At this point we did the honest cheat: the mini-core had proved the contract, so we imported the production RTL and switched the harness from Icarus to Verilator. But we kept every mini-core program and replayed all of them on the real design — control flow, loads and stores, every vector mode, the quantizer, the matmul, the reductions. If the production core disagreed with the simulator by one word, our little programs would say so. They didn’t: twelve replays, zero differing words.</p>
+  <p>The mini-core’s real job was to become the test corpus.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 120 files · <b style="color:#7fce9a">+56342</b> / <b style="color:#e08f8f">−6</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/harness/prod.py</span> <span class="delta"><b>+130</b> lines</span><span class="why">120 files imported verbatim: 56,342 lines of production RTL</span></div><pre><code data-lang="py"><span class="c"># ladder/harness/prod.py — the tolerance-free comparison, reused by every later rung</span>
+<span class="k">def</span> assert_matches_isasim<span class="o">(</span>prog<span class="o">,</span> dram<span class="o">=</span><span class="k">None</span><span class="o">,</span> args<span class="o">=</span><span class="k">None</span><span class="o">,</span> max_cycles<span class="o">=</span>MAX_CYCLES<span class="o">,</span>
+                          check_icount<span class="o">=</span><span class="k">True</span><span class="o">)</span> <span class="o">-</span><span class="o">&gt;</span> <span class="b">dict</span><span class="o">:</span>
+    out    <span class="o">=</span> run<span class="o">(</span>prog<span class="o">,</span> dram<span class="o">=</span>dram<span class="o">,</span> args<span class="o">=</span>args<span class="o">,</span> max_cycles<span class="o">=</span>max_cycles<span class="o">)</span>   <span class="c"># production RTL</span>
+    golden <span class="o">=</span> run_isasim<span class="o">(</span>prog<span class="o">,</span> dram<span class="o">=</span>dram<span class="o">,</span> args<span class="o">=</span>args<span class="o">)</span>                   <span class="c"># the oracle</span>
+    problems <span class="o">=</span> compare<span class="o">(</span>out<span class="o">,</span> golden<span class="o">,</span> check_icount<span class="o">=</span>check_icount<span class="o">)</span>
+    <span class="k">if</span> problems<span class="o">:</span>
+        <span class="k">raise</span> AssertionError<span class="o">(</span><span class="s">&quot;production RTL != isasim:\n&quot;</span> <span class="o">+</span> <span class="s">&quot;\n&quot;</span><span class="o">.</span>join<span class="o">(</span>problems<span class="o">)</span><span class="o">)</span>
+    <span class="k">return</span> out</code></pre></div>
+    <div class="codebox"><div class="codebox-head"><span class="fname">ladder/tests/test_step09_production_rtl.py</span><span class="delta"><b>+420 lines</b></span><span class="why">12 mini-core programs replayed on the production core</span></div><pre><code data-lang="py"><span class="c"># ladder/tests/test_step09_production_rtl.py — the mini-core&#x27;s programs on the real core</span>
+<span class="m">@pytest</span><span class="o">.</span>mark<span class="o">.</span>parametrize<span class="o">(</span><span class="s">&quot;prog&quot;</span><span class="o">,</span> MINI_CORE_PROGRAMS<span class="o">)</span>   <span class="c"># control, LD/ST, VOPs, QACT, MM, reduce</span>
+<span class="k">def</span> test_mini_core_program_is_bit_exact<span class="o">(</span>prog<span class="o">)</span><span class="o">:</span>
+    out <span class="o">=</span> prod<span class="o">.</span>assert_matches_isasim<span class="o">(</span>prog<span class="o">)</span>             <span class="c"># RTL vs isasim, whole state</span>
+    <span class="k">assert</span> out<span class="o">[</span><span class="s">&quot;icount&quot;</span><span class="o">]</span> <span class="o">=</span><span class="o">=</span> expected_icount<span class="o">(</span>prog<span class="o">)</span>      <span class="c"># plus the retired count</span>
+
+<span class="c"># if 56,342 lines of production RTL disagreed by one word, one of these would fail</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 134" role="img" aria-label="Mini-core programs replayed on the production RTL and on isasim"><defs><marker id="s9a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="134" fill="transparent"/><rect x="20" y="42" width="180" height="50" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="110.0" y="63.575" font-size="9.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">12 mini-core programs</text>
+<text x="110.0" y="77.075" font-size="9.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">loops · VOPs · MM · reduce</text>
+<line x1="202" y1="52" x2="232" y2="34" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s9a)"/>
+<line x1="202" y1="80" x2="232" y2="96" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s9a)"/>
+<rect x="236" y="16" width="240" height="36" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="356.0" y="30.925" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">production RTL — Verilator</text>
+<text x="356.0" y="44.425" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">tb_top · real design</text>
+<rect x="236" y="82" width="240" height="36" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="356.0" y="96.925" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">bit-exact ISA simulator</text>
+<text x="356.0" y="110.425" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">the golden model</text>
+<line x1="478" y1="34" x2="512" y2="54" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s9a)"/>
+<line x1="478" y1="100" x2="512" y2="78" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s9a)"/>
+<rect x="516" y="44" width="180" height="46" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="606.0" y="63.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">whole DRAM + TMEM</text>
+<text x="606.0" y="77.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">equal, word for word</text>
+<line x1="698" y1="66" x2="724" y2="66" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s9a)"/>
+<rect x="728" y="46" width="112" height="40" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="784.0" y="62.925" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">0 differing</text>
+<text x="784.0" y="76.425" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">words</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s10">
+    <p class="step-kicker" style="color:#8db8e0">rung 10 · production</p>
+    <h2>Step 10 · let people write Python again</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>102 tests (+2 env skips)</strong></p>
+  <p>Hand-assembling programs is a great way to learn and a terrible way to live. Next came the adult software stack: the <code>ol</code> language (Triton-ish, but you say where tensors live), the compiler, and the kernels. A compiled MLP and an attention decode now run <strong>bit-identically</strong> on the ISA simulator and on the RTL, and the examples suite passes fourteen operations against numpy.</p>
+  <p>(Two example cases skip without the host transport that arrives at step 11 — they run there.)</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 32 files · <b style="color:#7fce9a">+7416</b> / <b style="color:#e08f8f">−5</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">ladder/examples/gemm.py</span> <span class="delta"><b>+56</b> lines <i>+2111</i></span><span class="why">compiler 32 files · examples 14 ops vs numpy</span></div><pre><code data-lang="py"><span class="c"># ladder/examples/gemm.py — the language people actually write</span>
+<span class="m">@ol</span><span class="o">.</span>jit
+<span class="k">def</span> gemm<span class="o">(</span>a<span class="o">,</span> weights<span class="o">,</span> out<span class="o">)</span><span class="o">:</span>
+    ol<span class="o">.</span>store<span class="o">(</span>out<span class="o">,</span> ol<span class="o">.</span>dot<span class="o">(</span>ol<span class="o">.</span>load<span class="o">(</span>a<span class="o">)</span><span class="o">,</span> weights<span class="o">)</span><span class="o">)</span>
+
+<span class="c"># ... compiles to: QACT the A rows, stream the int8 weights through the MXU,</span>
+<span class="c"># QST the result.  The same program runs on isasim and on the RTL, bit-identically.</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 118" role="img" aria-label="Compiler pipeline: ol source to image and program, run on ISA and RTL"><defs><marker id="s10a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="118" fill="transparent"/><rect x="20" y="36" width="120" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="80.0" y="61.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">ol source</text>
+<line x1="142" y1="58" x2="172" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s10a)"/>
+<rect x="176" y="36" width="120" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="236.0" y="61.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">compiler</text>
+<line x1="298" y1="58" x2="328" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s10a)"/>
+<rect x="332" y="36" width="150" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="407.0" y="61.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">image + program</text>
+<line x1="484" y1="58" x2="514" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s10a)"/>
+<rect x="518" y="36" width="150" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="593.0" y="61.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">ISA / RTL run</text>
+<line x1="670" y1="58" x2="700" y2="58" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s10a)"/>
+<rect x="704" y="38" width="136" height="40" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="772.0" y="54.575" font-size="9.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">14 examples</text>
+<text x="772.0" y="68.075" font-size="9.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">== numpy</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s11">
+    <p class="step-kicker" style="color:#8db8e0">rung 11 · production</p>
+    <h2>Step 11 · the board shell and host interface</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>23 tests</strong></p>
+  <p>Then the rung that makes it look like a card: control registers, a program loader, two memory channels with their interleave, and an identity handshake that refuses a bitstream whose config hash doesn’t match. We drive a simulated <code>tb_board</code> exactly the way a host does, and demand that the demo program’s output DRAM equals the simulator’s machine — down to partial beats and channel counters.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 15 files · <b style="color:#7fce9a">+5683</b> / <b style="color:#e08f8f">−8</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">opentpu/host/board.py</span> <span class="delta"><b>+2098</b> lines</span><span class="why">9 host modules imported, identity handshake included</span></div><pre><code data-lang="py"><span class="c"># opentpu/host/board.py — the host protocol, modelled without a card</span>
+<span class="k">class</span> SimTransport<span class="o">:</span>
+    <span class="s">&quot;&quot;&quot;The Verilator model of tb_board.sv: memory lives here as the channels&#x27;
+    physical images; register ops are queued and replayed when a result is needed.
+    Every flush is a fresh simulation: DRAM persists, registers/IMEM/TMEM reset.&quot;&quot;&quot;</span>
+    batched <span class="o">=</span> <span class="k">True</span>
+    devname <span class="o">=</span> <span class="k">None</span>          <span class="c"># private to this process: no device lock</span>
+    keeps_state <span class="o">=</span> <span class="k">False</span>     <span class="c"># IMEM and ARG registers start from reset every flush</span>
+
+board<span class="o">.</span>load<span class="o">(</span>PROG_AT<span class="o">,</span> prog<span class="o">)</span>   <span class="c"># write the program into DRAM</span>
+board<span class="o">.</span>run<span class="o">(</span><span class="o">)</span>                 <span class="c"># STATUS.HALTED / ICOUNT / CYCLES</span>
+<span class="c"># then: every DRAM byte below PROG_AT must equal isasim&#x27;s machine</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 130" role="img" aria-label="Board shell and host interface, driven the way a card is driven"><defs><marker id="s11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="130" fill="transparent"/><rect x="20" y="38" width="130" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="85.0" y="63.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">host driver</text>
+<line x1="152" y1="60" x2="180" y2="60" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s11a)"/>
+<rect x="184" y="38" width="140" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="254.0" y="63.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">SimTransport</text>
+<line x1="326" y1="60" x2="356" y2="60" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s11a)"/>
+<rect x="360" y="20" width="230" height="96" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="475.0" y="51.25" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">tb_board</text>
+<text x="475.0" y="64.75" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">regs · loader</text>
+<text x="475.0" y="78.25" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">ch0 / ch1 DMA</text>
+<text x="475.0" y="91.75" font-size="10" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">partial beats · counters</text>
+<line x1="592" y1="60" x2="620" y2="60" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s11a)"/>
+<rect x="624" y="38" width="196" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="722.0" y="63.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">cores + memories</text>
+<text x="430" y="126" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">every DRAM byte below PROG_AT must equal isasim</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s12">
+    <p class="step-kicker" style="color:#e08f8f">rung 12 · silicon · blocked</p>
+    <h2>Step 12 · the FPGA image</h2>
+    <p class="step-meta"><span class="chip blocked">BLOCKED</span><strong>probe-gated</strong></p>
+  <p>Building a bitstream is a different sport: Vivado, timing constraints, a generated LiteDRAM core with its own calibration firmware, a block design with PCIe. The flow imports cleanly and is tested in simulation; the honest part is that a full image is a <strong>1.5–4 hour</strong> build and the card is not attached to this laptop. The rung says <code>BLOCKED</code> with a probed reason (<code>no DLC10 cable</code>) instead of a fake pass.</p>
+  <p>House rule while we were there: every image carries <strong>both JTAG and PCIe</strong> runtime interfaces. A bitstream that can’t be driven both ways isn’t a product, it’s a demo.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 99 files · <b style="color:#7fce9a">+126136</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">boards/ypcb-00338/Makefile</span> <span class="delta"><b>+95</b> lines</span><span class="why">LiteDRAM core + XDMA block design imported (99 files)</span></div><pre><code data-lang="mk"><span class="c"># boards/ypcb-00338/Makefile — the FPGA flow this branch can build</span>
+<span class="c">#   make lint       offline: Tcl syntax, XDC ports vs the top, Verilator lint</span>
+<span class="c">#   make sim-jtag   offline: USER2 mailbox, AXI bridge, serial-to-DDR path benches</span>
+<span class="c">#   make bit        Vivado batch build -&gt; build/vivado/otpu.bit  (1.5–4 h)</span>
+<span class="c">#   make program    JTAG load (openFPGALoader, BIT=...)      &lt;- needs the cable</span>
+<span class="c">#   make flash      BPI flash write (permanent; MCS=...)     &lt;- needs approval</span>
+<span class="k">TARGET</span>  <span class="o">?=</span> ypcb-00338<span class="o">:</span>m8     <span class="c"># 8 MXU columns, 128K TMEM words</span>
+<span class="k">CORE_MHZ</span><span class="o">?=</span> 133.33            <span class="c"># 800/6, matches both DDR3-1066 channels (17 GB/s)</span></code></pre></div>
+    <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 140" role="img" aria-label="FPGA flow: RTL to Vivado bitstream and package, blocked at the cable"><defs><marker id="s12a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="140" fill="transparent"/><rect x="20" y="26" width="250" height="52" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="145.0" y="48.925" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">rtl + constraints</text>
+<text x="145.0" y="62.425" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ generated LiteDRAM</text>
+<line x1="272" y1="52" x2="302" y2="52" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s12a)"/>
+<rect x="306" y="26" width="190" height="52" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="401.0" y="48.925" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">Vivado build</text>
+<text x="401.0" y="62.425" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">1.5–4 hours</text>
+<line x1="498" y1="52" x2="528" y2="52" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s12a)"/>
+<rect x="532" y="26" width="200" height="52" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="632.0" y="48.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">bitstream + package</text>
+<text x="632.0" y="62.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ manifest</text>
+<line x1="734" y1="52" x2="762" y2="52" stroke="#e58c8c" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#s12a)"/>
+<rect x="766" y="36" width="80" height="32" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="806.0" y="55.675" font-size="10.5" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">card</text>
+<rect x="20" y="100" width="320" height="30" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="180.0" y="118.5" font-size="10" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">probe: no DLC10 / no 10ee PCIe</text>
+<text x="344" y="120" font-size="9.5" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Lora, Georgia, serif">blocked honestly — flow imported and tested in simulation</text></svg></div></figure>
+
+  </section>
+
+<section class="step" id="s13">
+    <p class="step-kicker" style="color:#e08f8f">rung 13 · silicon · blocked</p>
+    <h2>Step 13 · JTAG/XVC: poke the chip over a cable</h2>
+    <p class="step-meta"><span class="chip blocked">BLOCKED</span><strong>probe-gated</strong></p>
+  <p>The last host-side piece is JTAG: an XVC server, a DLC10 cable, and a small runtime to poke card registers, upload an image and read results back. The tooling is imported and the transport is tested in simulation; the cable isn’t here, so the milestone is <code>BLOCKED</code> and the acceptance runbook waits in <code>ladder/docs/oncard-jtag.md</code>.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 15 files · <b style="color:#7fce9a">+2610</b> / <b style="color:#e08f8f">−1</b> lines</p><div class="codebox"><div class="codebox-head"><span class="fname">tests/test_xvc_transport.py</span><span class="delta"><b>+154</b> / <b>+467</b> lines</span><span class="why">XVC transport test + run/repeat/verify tools</span></div><pre><code data-lang="py"><span class="c"># tests/test_xvc_transport.py — the real XVC client against a local USER2/IDCODE endpoint</span>
+<span class="k">def</span> test_xvc_tcp_idcode_user2_register_and_top_channel_ddr_round_trip<span class="o">(</span><span class="o">)</span><span class="o">:</span>
+    link <span class="o">=</span> Xvc<span class="o">(</span><span class="s">&quot;127.0.0.1&quot;</span><span class="o">,</span> server<span class="o">.</span>server_address<span class="o">[</span><span class="n">1</span><span class="o">]</span><span class="o">,</span> timeout<span class="o">=</span><span class="n">2.0</span><span class="o">)</span>
+    transport <span class="o">=</span> JtagTransport<span class="o">(</span>link<span class="o">=</span>link<span class="o">,</span> timeout<span class="o">=</span><span class="n">2.0</span><span class="o">)</span>   <span class="c"># registers, image upload, DMA</span>
+    <span class="c"># ... asserts the IDCODE scan, a USER2 register write/read and a</span>
+    <span class="c">#     top-channel DDR round trip, all through opentpu/host/jtag.py</span>
+    <span class="c">#     (imported with step 12&#x27;s flow; this rung proves the transport)</span>
+
+<span class="c"># tools/verify_tinystories_shared_jtag.py — the acceptance checker, arrow-pinned</span>
+<span class="k">assert</span> run<span class="o">.</span>get<span class="o">(</span><span class="s">&#x27;status&#x27;</span><span class="o">)</span> <span class="k">in</span> <span class="o">(</span><span class="s">&#x27;PASS_PHYSICAL_JTAG_TINYSTORIES_INT8_EXACT_ISA_TOKENS&#x27;</span><span class="o">,</span>
+                             <span class="s">&#x27;PASS_WARM_REPEAT_PHYSICAL_JTAG_TINYSTORIES_EXACT_ISA_TOKENS&#x27;</span><span class="o">)</span>
+<span class="k">assert</span> run<span class="o">.</span>get<span class="o">(</span><span class="s">&#x27;actual_token_ids&#x27;</span><span class="o">)</span> <span class="o">=</span><span class="o">=</span> oracle<span class="o">[</span><span class="s">&#x27;expected_token_ids&#x27;</span><span class="o">]</span>   <span class="c"># the 8 tokens</span></code></pre></div>
+
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 136" role="img" aria-label="JTAG runtime: host to XVC server to cable to card, blocked at the cable"><defs><marker id="s13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="136" fill="transparent"/><rect x="20" y="34" width="140" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="90.0" y="59.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">host tooling</text>
+<line x1="162" y1="56" x2="192" y2="56" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s13a)"/>
+<rect x="196" y="34" width="160" height="44" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="276.0" y="59.675" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">XVC server :3721</text>
+<line x1="358" y1="56" x2="386" y2="56" stroke="#e58c8c" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#s13a)"/>
+<rect x="390" y="34" width="150" height="44" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="465.0" y="59.675" font-size="10.5" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">DLC10 · JTAG</text>
+<line x1="542" y1="56" x2="570" y2="56" stroke="#e58c8c" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#s13a)"/>
+<rect x="574" y="34" width="150" height="44" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="649.0" y="59.675" font-size="10.5" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">card regs / DMA</text>
+<rect x="20" y="100" width="320" height="30" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="180.0" y="118.5" font-size="10" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">cable absent → BLOCKED</text>
+<text x="344" y="120" font-size="9.5" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Lora, Georgia, serif">transport tested in simulation; tooling imported verbatim</text></svg></div></figure>
+</section>
+
+<section class="step" id="s14">
+    <p class="step-kicker" style="color:#b3a6de">rung 14 · llm</p>
+    <h2>Step 14 · an LLM that fits on a napkin</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>3 tests</strong></p>
+  <p>And then the fun one. openTPU’s simulator can run real transformers; so can the RTL. But checkpoints are gigabytes and this host has no torch — so we build a <em>tiny</em> Qwen3 with numpy: 256 hidden, two layers, four query / two KV heads, head_dim 128, vocab 1000, <code>default_rng(0)</code>. No tokenizer, no checkpoint, no GPU. It produces a 2.2 MB image, and the prompt <code>[811, 85, 179, 236, 181]</code> greedily continues as <code>[181, 181, 181, 564, 564, 564]</code> — the same six tokens on the simulator and on the production RTL, with logits and the whole DRAM image equal bit for bit.</p>
+  <p>That’s the moment the ladder reaches “LLM inference,” on a machine nobody would call a computer.</p>
+  <figure class="wide"><svg viewBox="0 0 900 360" role="img" aria-labelledby="f6t f6d">
+      <title id="f6t">One prompt, two machines, identical tokens</title>
+      <desc id="f6d">The prompt token ids go into the tiny Qwen3 engine twice: once on the bit-exact ISA simulator and once through the production RTL backend. Both produce the same logits and the same greedy tokens 181,181,181,564,564,564.</desc>
+      <defs>
+        <marker id="f6x" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#8b93a0"/>
+        </marker>
+      </defs>
+
+      <!-- lane A -->
+      <text x="26" y="30" font-size="12" font-weight="700" fill="#94d0ad">lane A · the oracle</text>
+      <g font-family="Roboto Mono, monospace" font-size="9.5">
+        <rect x="26" y="44" width="178" height="32" rx="5" fill="#12211a" stroke="#233d2c"/>
+        <text x="115" y="64" text-anchor="middle">811 · 85 · 179 · 236 · 181</text>
+        <line x1="206" y1="60" x2="232" y2="60" stroke="#8b93a0" stroke-width="1.4" marker-end="url(#f6x)"/>
+        <rect x="236" y="40" width="190" height="40" rx="6" fill="#1b2029" stroke="#233d2c"/>
+        <text x="331" y="57" text-anchor="middle" font-family="Lora, Georgia, serif" font-size="10.5" font-weight="600">tiny Qwen3 engine</text>
+        <text x="331" y="72" text-anchor="middle" font-family="Lora, Georgia, serif" font-size="9.5" fill="#8b93a0">pure numpy · ISA simulator</text>
+        <line x1="428" y1="60" x2="454" y2="60" stroke="#8b93a0" stroke-width="1.4" marker-end="url(#f6x)"/>
+        <rect x="458" y="44" width="246" height="32" rx="5" fill="#12211a" stroke="#2f5a3f"/>
+        <text x="581" y="64" text-anchor="middle">181 · 181 · 181 · 564 · 564 · 564</text>
+      </g>
+
+      <!-- lane B -->
+      <text x="26" y="192" font-size="12" font-weight="700" fill="#9cc2e8">lane B · the silicon</text>
+      <g font-family="Roboto Mono, monospace" font-size="9.5">
+        <rect x="26" y="206" width="178" height="32" rx="5" fill="#131c28" stroke="#26303d"/>
+        <text x="115" y="226" text-anchor="middle">811 · 85 · 179 · 236 · 181</text>
+        <line x1="206" y1="222" x2="232" y2="222" stroke="#8b93a0" stroke-width="1.4" marker-end="url(#f6x)"/>
+        <rect x="236" y="202" width="190" height="40" rx="6" fill="#1b2029" stroke="#26303d"/>
+        <text x="331" y="219" text-anchor="middle" font-family="Lora, Georgia, serif" font-size="10.5" font-weight="600">RtlBackend</text>
+        <text x="331" y="234" text-anchor="middle" font-family="Lora, Georgia, serif" font-size="9.5" fill="#8b93a0">Verilator tb_top · D=128</text>
+        <line x1="428" y1="222" x2="454" y2="222" stroke="#8b93a0" stroke-width="1.4" marker-end="url(#f6x)"/>
+        <rect x="458" y="206" width="246" height="32" rx="5" fill="#131c28" stroke="#334a63"/>
+        <text x="581" y="226" text-anchor="middle">181 · 181 · 181 · 564 · 564 · 564</text>
+      </g>
+
+      <!-- equality box and connectors -->
+      <line x1="708" y1="60" x2="762" y2="118" stroke="#8b93a0" stroke-width="1.3" marker-end="url(#f6x)"/>
+      <line x1="708" y1="222" x2="762" y2="196" stroke="#8b93a0" stroke-width="1.3" marker-end="url(#f6x)"/>
+      <rect x="766" y="104" width="118" height="106" rx="12" fill="#211b13" stroke="#3d3121"/>
+      <text x="825" y="140" font-size="26" font-weight="700" fill="#d6b083" text-anchor="middle">=</text>
+      <text x="825" y="162" font-size="9.5" fill="#b8a99c" text-anchor="middle">logits · whole DRAM</text>
+      <text x="825" y="178" font-size="9.5" fill="#b8a99c" text-anchor="middle">token ids — identical</text>
+      <text x="825" y="196" font-size="8" font-family="Roboto Mono, monospace" fill="#8b93a0" text-anchor="middle">sha 3621798a…</text>
+
+      <text x="26" y="296" font-size="10.5" fill="#8b93a0">the prompt ids are not text yet — no tokenizer, no checkpoint. A deterministic numpy model is enough to prove the whole path.</text>
+      <text x="26" y="318" font-size="10.5" fill="#8b93a0">the tokens are not Shakespeare. But they are the same six tokens on both machines, which is the entire point.</text>
+    </svg><figcaption><strong>A token that can’t drift.</strong> Prompt <code>[811, 85, 179, 236, 181]</code> → greedy <code>[181, 181, 181, 564, 564, 564]</code>, identical on the ISA simulator and the production RTL. Bit-exactness is not a metaphor here.</figcaption></figure>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 26 files · <b style="color:#7fce9a">+20555</b> / <b style="color:#e08f8f">−1</b> lines</p>
+  <div class="codebox"><div class="codebox-head"><span class="fname">ladder/harness/llm.py</span><span class="delta"><b>+293</b> lines</span><span class="why">a numpy Qwen3: no checkpoint, no torch, no GPU</span></div><pre><code data-lang="py"><span class="c"># ladder/harness/llm.py — one token, proof-carrying</span>
+<span class="k">for</span> k <span class="k">in</span> <span class="b">range</span><span class="o">(</span>steps<span class="o">)</span><span class="o">:</span>
+    drams <span class="o">=</span> dram_state<span class="o">(</span>isa<span class="o">,</span> n<span class="o">)</span>                    <span class="c"># DRAM before this token</span>
+    want  <span class="o">=</span> isa<span class="o">.</span>step<span class="o">(</span>t<span class="o">)</span>                           <span class="c"># ISA oracle step</span>
+    rtl   <span class="o">=</span> RtlBackend<span class="o">(</span>isa<span class="o">.</span>cfg<span class="o">,</span> drams<span class="o">,</span> axi<span class="o">=</span><span class="k">False</span><span class="o">,</span> boot<span class="o">=</span><span class="k">False</span><span class="o">)</span>
+    got   <span class="o">=</span> isa<span class="o">.</span>step<span class="o">(</span>t<span class="o">)</span> on the RTL                <span class="c"># same token, production RTL</span>
+    <span class="k">assert</span> logits_bits<span class="o">(</span>want<span class="o">)</span> <span class="o">=</span><span class="o">=</span> logits_bits<span class="o">(</span>got<span class="o">)</span>  <span class="c"># uint32 logits, identical</span>
+    <span class="k">assert</span> dram<span class="o">[</span><span class="o">:</span>n<span class="o">]</span> identical on every slice      <span class="c"># whole image, bit for bit</span>
+
+PROMPT <span class="o">=</span> <span class="o">[</span><span class="n">811</span><span class="o">,</span> <span class="n">85</span><span class="o">,</span> <span class="n">179</span><span class="o">,</span> <span class="n">236</span><span class="o">,</span> <span class="n">181</span><span class="o">]</span>     <span class="c"># -&gt; greedy [181,181,181,564,564,564]</span>
+SPEC   <span class="o">=</span> <span class="b">dict</span><span class="o">(</span>hidden<span class="o">=</span><span class="n">256</span><span class="o">,</span> layers<span class="o">=</span><span class="n">2</span><span class="o">,</span> n_q<span class="o">=</span><span class="n">4</span><span class="o">,</span> n_kv<span class="o">=</span><span class="n">2</span><span class="o">,</span> head_dim<span class="o">=</span><span class="n">128</span><span class="o">,</span> ffn<span class="o">=</span><span class="n">512</span><span class="o">,</span> vocab<span class="o">=</span><span class="n">1000</span><span class="o">)</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 140" role="img" aria-label="Tiny Qwen3 in numpy: same tokens on the ISA simulator and the production RTL"><defs><marker id="s14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="140" fill="transparent"/><rect x="20" y="44" width="150" height="46" rx="6" fill="#1a1626" stroke="#332b4a"/>
+<text x="95.0" y="63.575" font-size="9.5" fill="#b7a8e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">numpy tiny Qwen3</text>
+<text x="95.0" y="77.075" font-size="9.5" fill="#b7a8e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">256 · 2 layers · vocab 1000</text>
+<line x1="172" y1="67" x2="200" y2="67" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s14a)"/>
+<rect x="204" y="56" width="132" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="270.0" y="74.325" font-size="9.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">2.2 MB image</text>
+<line x1="338" y1="71" x2="368" y2="40" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s14a)"/>
+<line x1="338" y1="71" x2="368" y2="102" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s14a)"/>
+<rect x="372" y="16" width="180" height="30" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="462.0" y="34.5" font-size="10" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">ISA simulator</text>
+<rect x="372" y="86" width="180" height="30" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="462.0" y="104.5" font-size="10" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">production RTL</text>
+<line x1="554" y1="31" x2="586" y2="52" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s14a)"/>
+<line x1="554" y1="101" x2="586" y2="82" stroke="#98a2b3" stroke-width="1.3" marker-end="url(#s14a)"/>
+<rect x="590" y="44" width="250" height="46" rx="6" fill="#1a1626" stroke="#332b4a"/>
+<text x="715.0" y="63.575" font-size="9.5" fill="#b7a8e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">181 · 181 · 181 · 564 · 564 · 564</text>
+<text x="715.0" y="77.075" font-size="9.5" fill="#b7a8e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">same logits &amp; DRAM</text>
+<text x="430" y="136" font-size="9.5" fill="#8b93a0" text-anchor="middle" font-weight="400" font-family="Lora, Georgia, serif">no tokenizer · no checkpoint · no GPU</text></svg></div></figure>
+</section>
+
+<section class="step" id="s15">
+    <p class="step-kicker" style="color:#e08f8f">rung 15 · silicon · blocked</p>
+    <h2>Step 15 · the actual card</h2>
+    <p class="step-meta"><span class="chip blocked">BLOCKED</span><strong>probe-gated</strong></p>
+  <p>The production tree has already proven the real thing: TinyStories-15M int8 on the YPCB-00338 card, prompt “Once upon a time”, eight greedy tokens <code>[29892, 727, 471, 263, 2217, 7826, 4257, 365]</code>, identical to the ISA oracle. Our rung imports that acceptance — image hashes, calibration guard, structural preflight, warm repeat — and gates it behind a read-only probe. While the cable is missing the rung says <code>BLOCKED</code>; when it appears, one command runs the whole acceptance. No cheating.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 6 files · <b style="color:#7fce9a">+605</b> lines</p>
+  <div class="codebox"><div class="codebox-head"><span class="fname">ladder/harness/hardware.py</span><span class="delta"><b>+54</b> lines</span><span class="why">the gate skips with a probed reason, never fakes a pass</span></div><pre><code data-lang="py"><span class="c"># ladder/harness/hardware.py — the acceptance, pinned before the cable arrives</span>
+LLM_ACCEPTANCE <span class="o">=</span> <span class="o">{</span>
+  <span class="s">&quot;prompt&quot;</span><span class="o">:</span> <span class="s">&quot;Once upon a time&quot;</span><span class="o">,</span>
+  <span class="s">&quot;expected_token_ids&quot;</span><span class="o">:</span> <span class="o">[</span><span class="n">29892</span><span class="o">,</span> <span class="n">727</span><span class="o">,</span> <span class="n">471</span><span class="o">,</span> <span class="n">263</span><span class="o">,</span> <span class="n">2217</span><span class="o">,</span> <span class="n">7826</span><span class="o">,</span> <span class="n">4257</span><span class="o">,</span> <span class="n">365</span><span class="o">]</span><span class="o">,</span>
+  <span class="s">&quot;image_bytes&quot;</span><span class="o">:</span> <span class="n">29_226_624</span><span class="o">,</span>  <span class="s">&quot;image_sha256&quot;</span><span class="o">:</span> <span class="s">&quot;d32fd284...&quot;</span><span class="o">,</span>
+  <span class="s">&quot;bitstream_sha256&quot;</span><span class="o">:</span> <span class="s">&quot;3b804b81...&quot;</span><span class="o">,</span>  <span class="s">&quot;model_sha256&quot;</span><span class="o">:</span> <span class="s">&quot;9f74baf7...&quot;</span><span class="o">,</span>
+  <span class="s">&quot;preflight&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;program_fetch_instructions&quot;</span><span class="o">:</span> <span class="n">1371</span><span class="o">,</span> <span class="s">&quot;program_fetch_words_compared&quot;</span><span class="o">:</span> <span class="n">65</span><span class="o">,</span>
+                <span class="s">&quot;matmul_instructions&quot;</span><span class="o">:</span> <span class="n">5</span><span class="o">,</span> <span class="s">&quot;program_readbacks&quot;</span><span class="o">:</span> <span class="n">13</span><span class="o">}</span><span class="o">,</span>
+  <span class="s">&quot;required&quot;</span><span class="o">:</span> <span class="o">{</span><span class="s">&quot;tokens_exact&quot;</span><span class="o">:</span> <span class="k">True</span><span class="o">,</span> <span class="s">&quot;image_sha256_match&quot;</span><span class="o">:</span> <span class="k">True</span><span class="o">,</span>
+               <span class="s">&quot;calibration_unchanged&quot;</span><span class="o">:</span> <span class="k">True</span><span class="o">,</span> <span class="s">&quot;ecc_clean&quot;</span><span class="o">:</span> <span class="k">True</span><span class="o">,</span>
+               <span class="s">&quot;flash_written&quot;</span><span class="o">:</span> <span class="k">False</span><span class="o">}</span><span class="o">,</span>
+<span class="o">}</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 140" role="img" aria-label="TinyStories acceptance on the card, blocked at the cable"><defs><marker id="s15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="140" fill="transparent"/><rect x="20" y="26" width="220" height="52" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="130.0" y="48.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">image + package</text>
+<text x="130.0" y="62.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">+ manifest hashes</text>
+<line x1="242" y1="52" x2="272" y2="52" stroke="#e58c8c" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#s15a)"/>
+<rect x="276" y="26" width="170" height="52" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="361.0" y="55.675" font-size="10.5" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">JTAG load</text>
+<line x1="448" y1="52" x2="478" y2="52" stroke="#e58c8c" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#s15a)"/>
+<rect x="482" y="26" width="240" height="52" rx="6" fill="#1b2029" stroke="#333a45"/>
+<text x="602.0" y="48.925" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">TinyStories tokens</text>
+<text x="602.0" y="62.425" font-size="10.5" fill="#e8e5df" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">8 / 8 match the oracle</text>
+<rect x="20" y="100" width="340" height="30" rx="6" fill="#241416" stroke="#4a2a2a"/>
+<text x="190.0" y="118.5" font-size="10" fill="#e58c8c" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">probe: cable absent → BLOCKED</text>
+<text x="376" y="120" font-size="9.5" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Lora, Georgia, serif">runbook ready: ladder/docs/oncard-llm.md</text></svg></div></figure>
+</section>
+
+<section class="step" id="s16">
+    <p class="step-kicker" style="color:#d9bd74">rung 16 · convergence</p>
+    <h2>Step 16 · land the plane</h2>
+    <p class="step-meta"><span class="chip ok">PASS</span><strong>6 tests</strong></p>
+  <p>Finally the branch tip had to <em>become</em> the product. Everything ladder-only moved under <code>ladder/</code> (the toy TPU, the mini-core, the docs, the receipts), the rest of the production tree was imported byte-identically, and a parity test enforces one rule:</p>
+  <blockquote>every file in the product tree exists at the branch tip, byte-identical; the only extras are under <code>ladder/</code>.</blockquote>
+  <p>Result: <strong>1618 of 1618 paths identical, 0 missing, 0 mismatched, 139 extras — all under <code>ladder/</code>.</strong> The branch is the path, and the path ends exactly on the product.</p>
+  <p class="step-meta" style="margin-top:-.2rem">this commit: 1511 files · <b style="color:#7fce9a">+1576727</b> / <b style="color:#e08f8f">−12570</b> lines</p>
+  <div class="codebox"><div class="codebox-head"><span class="fname">ladder/tests/test_step16_parity.py</span><span class="delta"><b>+158</b> lines</span><span class="why">convergence is a test, not a claim</span></div><pre><code data-lang="py"><span class="c"># ladder/tests/test_step16_parity.py — the definition of done, as a test</span>
+<span class="k">for</span> path <span class="k">in</span> product_paths<span class="o">:</span>                          <span class="c"># every path of ca05e24f</span>
+    want <span class="o">=</span> git<span class="o">(</span><span class="s">&quot;rev-parse&quot;</span><span class="o">,</span> f<span class="s">&quot;{PRODUCT}:{path}&quot;</span><span class="o">)</span>
+    have <span class="o">=</span> git<span class="o">(</span><span class="s">&quot;rev-parse&quot;</span><span class="o">,</span> f<span class="s">&quot;HEAD:{path}&quot;</span><span class="o">)</span>
+    <span class="k">if</span> <span class="k">not</span> have<span class="o">:</span>  missing<span class="o">.</span>append<span class="o">(</span>path<span class="o">)</span>
+    <span class="k">elif</span> want <span class="o">!</span><span class="o">=</span> have<span class="o">:</span>  mismatched<span class="o">.</span>append<span class="o">(</span>path<span class="o">)</span>
+<span class="k">assert</span> <span class="k">not</span> missing <span class="k">and</span> <span class="k">not</span> mismatched               <span class="c"># 1618/1618, byte-identical</span>
+
+extras <span class="o">=</span> tracked <span class="o">-</span> product_paths
+<span class="k">assert</span> <span class="b">all</span><span class="o">(</span>p<span class="o">.</span>startswith<span class="o">(</span><span class="s">&quot;ladder/&quot;</span><span class="o">)</span> <span class="k">for</span> p <span class="k">in</span> extras<span class="o">)</span> <span class="c"># 139 extras, all under ladder/</span>
+<span class="k">assert</span> git<span class="o">(</span><span class="s">&quot;diff&quot;</span><span class="o">,</span> <span class="s">&quot;--stat&quot;</span><span class="o">,</span> PRODUCT<span class="o">,</span> <span class="s">&quot;--&quot;</span><span class="o">,</span> <span class="s">&quot;.&quot;</span><span class="o">,</span> <span class="s">&quot;:(exclude)ladder&quot;</span><span class="o">)</span> <span class="o">=</span><span class="o">=</span> <span class="s">&quot;&quot;</span></code></pre></div>
+  <figure class="step-fig"><div class="rung-diagram"><svg viewBox="0 0 860 140" role="img" aria-label="Convergence: the ladder tip is the product tree plus extras under ladder/"><defs><marker id="s16a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#98a2b3"/></marker></defs><rect x="0" y="0" width="860" height="140" fill="transparent"/><rect x="20" y="22" width="250" height="74" rx="6" fill="#131c28" stroke="#334a63"/>
+<text x="145.0" y="55.925" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">product tree @ ca05e24f</text>
+<text x="145.0" y="69.425" font-size="10.5" fill="#9cc2e8" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">1618 paths</text>
+<text x="430" y="66" font-size="26" fill="#d6b083" text-anchor="middle" font-weight="700" font-family="Lora, Georgia, serif">=</text>
+<rect x="430" y="22" width="250" height="74" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="555.0" y="55.925" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">ladder tip</text>
+<text x="555.0" y="69.425" font-size="10.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">1757 paths · 139 extras</text>
+<rect x="700" y="40" width="140" height="40" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="770.0" y="56.575" font-size="9.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">all extras</text>
+<text x="770.0" y="70.075" font-size="9.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">under ladder/</text>
+<rect x="20" y="108" width="470" height="28" rx="6" fill="#12211a" stroke="#2f5a3f"/>
+<text x="255.0" y="125.325" font-size="9.5" fill="#7fce9a" text-anchor="middle" font-weight="600" font-family="Lora, Georgia, serif">git diff outside ladder/ = empty</text>
+<text x="510" y="127" font-size="9.5" fill="#8b93a0" text-anchor="start" font-weight="400" font-family="Lora, Georgia, serif">the tip *is* the product — the ladder is the path</text></svg></div></figure>
+</section>
+
+
+  <hr class="sep">
+
+  <h2 id="numbers">Numbers that kept us honest</h2>
+
+  <div class="stats">
+    <div class="stat green"><div class="n">360</div><div class="l">passing test cases across the ladder</div></div>
+    <div class="stat green"><div class="n">120</div><div class="l">of them are the mini-core: five rungs of a small machine</div></div>
+    <div class="stat blue"><div class="n">1,618</div><div class="l">product paths byte-identical to <code>ca05e24f</code> at the tip</div></div>
+    <div class="stat gold"><div class="n">139</div><div class="l">extra paths — all under <code>ladder/</code></div></div>
+    <div class="stat red"><div class="n">3</div><div class="l">hardware rungs honestly <code>BLOCKED</code> on a missing cable</div></div>
+  </div>
+
+  <p>Every RTL claim is compared bit-exactly against the ISA simulator; every rung writes a receipt with its commit, command, toolchain, per-test verdicts and even thermal state. “It worked on my machine” becomes “here’s the file.”</p>
+
+  <h2 id="lessons">What we’d tell ourselves at the start</h2>
+
+  <ol>
+    <li><strong>Start from the end.</strong> The reference implementation you’re scared of is not your enemy; it’s the answer key. Read it, import its contracts, and build the small version yourself.</li>
+    <li><strong>Make the simulator the boss.</strong> If you can’t state “these two machines must be identical bit for bit,” you don’t have a test — you have a vibe.</li>
+    <li><strong>Write receipts.</strong> Every rung writes a JSON receipt: commit, command, toolchain, per-test verdicts, thermal state. “It worked on my machine” becomes “here’s the file.”</li>
+    <li><strong>Build the toy version first, then delete it.</strong> The mini-core is dead code — that’s the point. Its tests outlive it.</li>
+    <li><strong>Let the hardware be a jerk.</strong> Compilers take minutes, timing takes hours, thermal throttling takes your afternoon. Design the test tiers so the fun part is cheap.</li>
+    <li><strong>Keep the failed attempts.</strong> The upstream bug we found, the wrong epilogue association, the 600-second timeout that hid a frozen process — they’re the most educational lines in the history.</li>
+    <li><strong>One rung per commit.</strong> A clean path is a gift to whoever climbs after you, including future you.</li>
+  </ol>
+
+  <h2 id="try">Try this at home</h2>
+
+  <p>The ladder lives in the openTPU repo, on the local branch <code>ladder/tiny-tpu-to-opentpu</code>:</p>
+
+<pre><code><span style="color:#8b949e"># the branch is in the openTPU clone, in the ladder worktree</span>
+cd ~/openTPU
+git checkout ladder/tiny-tpu-to-opentpu
+python3 ladder/run.py doctor        <span style="color:#8b949e"># what the ladder can see</span>
+python3 ladder/run.py all           <span style="color:#8b949e"># every rung, in order</span></code></pre>
+
+  <p>The roadmap — including every rung’s acceptance criteria and its honest status — is in <code>ladder/README.md</code>. The hardware rungs come with <code>ladder/hardware/probe.py</code>: when it exits 0 you have a cable and a card, and <code>ladder/docs/oncard-llm.md</code> tells you the rest.</p>
+
+  <p>We’re still novices. We still draw everything. The middle steps are missing from almost every hardware story — not because they’re secret, but because nobody wants to write them down. Consider this our attempt.</p>
+
+  <p style="text-align:center;font-size:1.25rem;font-weight:700;margin:2.2rem 0 1rem">ALWAYS TRY THE HACKY WAY —<br>then prove it with an oracle.</p>
+
+  <div class="footnotes">
+    <ol>
+      <li>“The middle” is also where the fun is: unit tests for a quantizer are weirdly satisfying, in a way that config files never are.</li>
+      <li>The full mini-core is about two thousand lines of SystemVerilog. The production core is fifty-five thousand. The mini-core’s job was to make the second number feel readable.</li>
+    </ol>
+  </div>
+
+  <footer>© 2026 the tiny-tpu crew · written while building the ladder · diagrams drawn, as always, before the code.</footer>
+
+</div>
+
+<script>
+/* Tiny, dependency-free syntax highlighter for the code boxes of this post.
+   Languages: sv (SystemVerilog), py (Python), sh, json, mk (Makefile), mdoc (markdown/docs).
+   Runs on DOMContentLoaded; if JS is unavailable the plain snippets stay readable. */
+(function () {
+  var KW = {
+    sv: ['module','endmodule','package','endpackage','input','output','inout','logic','wire','reg',
+         'always','always_ff','always_comb','always_@*','assign','begin','end','case','casez','endcase',
+         'if','else','for','while','repeat','function','endfunction','task','endtask','localparam','parameter',
+         'typedef','struct','enum','packed','signed','unsigned','int','integer','bit','byte','return','generate',
+         'endgenerate','genvar','initial','final','posedge','negedge','default','unique','priority','within'],
+    py: ['def','class','return','if','elif','else','for','while','in','not','and','or','is','None','True','False',
+         'import','from','as','with','yield','lambda','try','except','finally','raise','assert','pass','break',
+         'continue','global','nonlocal','async','await','del','print'],
+    sh: ['cd','make','git','python3','python','export','set','if','then','fi','for','do','done','while','echo',
+         'source','exec','flock','nohup','sudo','which','ls','cat','grep','sed','awk','tee'],
+    mk: ['make','lint','sim-jtag','bit','impl','program','flash','TARGET','CORE_MHZ','DDR','MCOLS','LANES'],
+    json: ['true','false','null'],
+    mdoc: []
+  };
+  var BI = {
+    sv: ['fp_mul','fp_add','q8','i2f48','i2f','mis','systolic','u_slice','rget','memset','readmemh'],
+    py: ['range','len','print','int','float','str','list','dict','set','enumerate','zip','sorted','sum',
+         'np','pytest','assert','isinstance','getattr','bytes','bytearray','argmax','argmin','array_equal',
+         'tolist','default_rng','rev_parse','subprocess','Path','json','open','write_text','read_text'],
+    sh: ['true','false'],
+    mk: [], json: [], mdoc: []
+  };
+  function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function wrap(cls, text) { return '<span class="' + cls + '">' + esc(text) + '</span>'; }
+
+  function highlight(src, lang) {
+    var keywords = KW[lang] || [], builtins = BI[lang] || [], out = [], i = 0, n = src.length;
+    var kwRe = keywords.length ? new RegExp('^(?:' + keywords.map(function(k){
+        return k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }).join('|') + ')(?=\\b|[^A-Za-z0-9_])') : null;
+    var biRe = builtins.length ? new RegExp('^(?:' + builtins.map(function(k){
+        return k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }).join('|') + ')') : null;
+    while (i < n) {
+      var ch = src[i];
+      /* line comments */
+      if ((lang==='sv' && src.substr(i,2)==='//') || (lang==='sh' && ch==='#') ||
+          (lang==='py' && ch==='#') || (lang==='mk' && ch==='#') || (lang==='json' && src.substr(i,2)==='//')) {
+        var e = src.indexOf('\n', i); if (e < 0) e = n;
+        out.push(wrap('c', src.slice(i, e))); i = e; continue;
+      }
+      /* block comments (sv) */
+      if (lang==='sv' && src.substr(i,2)==='/*') {
+        var e2 = src.indexOf('*/', i+2); e2 = (e2<0? n : e2+2);
+        out.push(wrap('c', src.slice(i, e2))); i = e2; continue;
+      }
+      /* strings */
+      if (ch === '"' || ch === "'" || (lang==='sv' && ch==='`')) {
+        var q = ch, e3 = i+1, body = '';
+        while (e3 < n) {
+          if (src[e3] === '\\') { body += src[e3]; e3++; if (e3<n) { body += src[e3]; e3++; } continue; }
+          if (src[e3] === q) { e3++; break; }
+          if (q === '"' && src[e3] === '\n') break;
+          body += src[e3]; e3++;
+        }
+        out.push(wrap(q === '`' ? 'm' : 's', src.slice(i, e3))); i = e3; continue;
+      }
+      /* numbers */
+      if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(src[i+1]||''))) {
+        var m = src.slice(i).match(/^(?:[0-9][0-9_']*(?:\.[0-9]+)?|[.][0-9]+)(?:e[+-]?[0-9]+)?(?:'[dhb][0-9a-fA-FxXzZ_]+)?/);
+        if (m) { out.push(wrap('n', m[0])); i += m[0].length; continue; }
+      }
+      /* keywords / builtins */
+      if (kwRe) { var km = src.slice(i).match(kwRe); if (km) { out.push(wrap('k', km[0])); i += km[0].length; continue; } }
+      if (biRe) { var bm = src.slice(i).match(biRe); if (bm) { out.push(wrap('b', bm[0])); i += bm[0].length; continue; } }
+      /* operators */
+      if ('+-*/%.<>=!&|^~?:,;()[]{}'.indexOf(ch) >= 0) { out.push(wrap('o', ch)); i++; continue; }
+      out.push(esc(ch)); i++;
+    }
+    return out.join('');
+  }
+
+  document.querySelectorAll('.codebox pre > code').forEach(function (el) {
+    if (el.dataset.hlDone || el.querySelector('span')) return;   // already server-highlighted
+    var lang = el.dataset.lang || 'sv';
+    var src = el.textContent;
+    el.innerHTML = highlight(src, lang);
+    el.dataset.hlDone = '1';
+  });
+})();
+</script>
+
+</body>
+</html>

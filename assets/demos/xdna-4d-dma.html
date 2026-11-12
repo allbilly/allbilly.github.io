@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>XDNA DMA — why MemTile MM2S really needs 4D</title>
+<style>
+:root{
+  --bg:#06101d; --panel:#0c1a2b; --panel2:#081522; --line:#294561;
+  --txt:#edf6ff; --mut:#9db2c8; --cyan:#42d8ff; --green:#59e6a7;
+  --amber:#ffc65c; --red:#ff6f7d; --violet:#b995ff; --blue:#579dff;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:1540px;margin:auto;padding:22px}
+h1{font-size:40px;line-height:1.08;margin:0 0 8px} h2{font-size:25px;margin:0 0 5px} h3{margin:8px 0;font-size:18px}
+p{color:var(--mut);margin:6px 0 12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:17px;padding:18px;margin:14px 0;box-shadow:0 12px 30px #0003}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.control{display:flex;flex-direction:column;gap:3px}.control label{font-size:11px;color:var(--mut)}
+input,select,button{font:inherit}input,select{width:78px;background:#071522;color:#fff;border:1px solid var(--line);border-radius:8px;padding:7px}button{background:#102940;color:#fff;border:1px solid #3b6487;border-radius:9px;padding:8px 12px;cursor:pointer;font-weight:750}button:hover{filter:brightness(1.12)}.primary{background:#0c6f91}.danger{background:#642634}.goodbtn{background:#185d45}
+.grid2{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.proofGrid{display:grid;grid-template-columns:1.07fr .93fr;gap:16px}.sideBySide{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.matrix{display:grid;gap:4px;width:max-content;max-width:100%;overflow:auto;padding:3px}.cell{width:53px;height:45px;border:1px solid #34516f;border-radius:6px;background:#091625;display:flex;flex-direction:column;align-items:center;justify-content:center;font:700 11px ui-monospace,monospace;transition:.12s;position:relative}.cell small{font-size:9px;color:var(--mut);font-weight:600}.cell.active{transform:scale(1.08);border-color:var(--cyan);background:#173c58;box-shadow:0 0 15px #42d8ff88;z-index:3}.cell.done{background:#113425;border-color:#33855e}.cell.bad{border-color:var(--red)!important;background:#50232b!important;box-shadow:0 0 16px #ff6f7d88}.cell.pred{border-color:var(--amber);box-shadow:0 0 13px #ffc65c66}.tileWrap{display:flex;gap:12px;flex-wrap:wrap}.tileBox{border:2px solid #35597a;border-radius:12px;padding:8px;background:#071522}.tileBox.activeTile{border-color:var(--violet);box-shadow:0 0 18px #b995ff55}.tileTitle{font:800 12px ui-monospace,monospace;color:var(--violet);margin:0 0 6px}
+.stream{display:flex;gap:4px;flex-wrap:wrap}.tok{min-width:33px;padding:5px 6px;border:1px solid #324d6b;border-radius:6px;background:#081522;text-align:center;font:700 11px ui-monospace,monospace}.tok.active{border-color:var(--violet);background:#3a244c;transform:translateY(-2px)}.tok.done{background:#123623;border-color:#3b8e61}.tok.bad{background:#51232b;border-color:var(--red)}
+.counters{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.ctr{background:#081624;border:1px solid #2c4968;border-radius:9px;padding:8px;transition:.12s}.ctr.changed{border-color:var(--amber);box-shadow:0 0 12px #ffc65c55}.ctr span{font-size:10px;color:var(--mut);display:block}.ctr b{font:800 19px ui-monospace,monospace}.ctr em{font-size:10px;color:var(--mut);font-style:normal}
+.eq,.note,.proofbox{background:#071522;border:1px solid #29435f;border-radius:11px;padding:11px;margin:10px 0}.note{border-left:4px solid var(--amber)}.proofbox{border-color:#405976}.failbox{border-color:#8b3c49;background:#25131a}.passbox{border-color:#2e7859;background:#0e251c}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok{color:var(--green)}.warn{color:var(--amber)}.badText{color:var(--red)}.violet{color:var(--violet)}.cyan{color:var(--cyan)}
+.bar{height:7px;background:#07131f;border-radius:99px;overflow:hidden;margin-top:9px}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--cyan),var(--green))}
+.loopStack{display:grid;gap:6px;margin:10px 0}.loop{border:1px solid #31506d;border-radius:9px;padding:7px 9px;background:#081725;font:700 12px ui-monospace,monospace;transition:.12s}.loop.l0{margin-left:0;color:var(--violet)}.loop.l1{margin-left:20px;color:var(--cyan)}.loop.l2{margin-left:40px;color:var(--green)}.loop.l3{margin-left:60px;color:var(--amber)}.loop.hot{border-color:#fff;background:#16314a;transform:translateX(3px)}
+.stripBases{display:flex;gap:7px;flex-wrap:wrap}.baseChip{padding:8px 9px;border:1px solid #36526f;border-radius:9px;background:#081624;font:700 12px ui-monospace,monospace}.baseChip.hot{border-color:var(--violet);background:#2b2142}.delta{font-weight:800;color:var(--amber)}
+.compareHead{display:flex;justify-content:space-between;align-items:center;gap:8px}.result{font-size:18px;font-weight:850}.bigfail{font:900 28px ui-monospace,monospace;color:var(--red)}.bigpass{font:900 28px ui-monospace,monospace;color:var(--green)}
+.pipeline{display:grid;grid-template-columns:1fr 30px 1fr 30px 1fr 30px 1fr;gap:7px;align-items:center}.stage{background:#081624;border:1px solid #2f4a69;border-radius:11px;padding:10px}.arrow{text-align:center;font-size:25px;color:var(--cyan)}.badge{display:inline-block;border:1px solid #35526f;border-radius:999px;padding:3px 7px;font-size:11px;margin:2px}.small{font-size:12px}.tiny{font-size:11px}.source{font-size:11px;color:#7890a8;margin-top:8px}.source a{color:#7fcfff}.sep{height:1px;background:#26415c;margin:13px 0}
+@media(max-width:1050px){.grid2,.proofGrid,.sideBySide,.grid3{grid-template-columns:1fr}.pipeline{grid-template-columns:1fr}.arrow{transform:rotate(90deg)}h1{font-size:32px}.counters{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body><div class="wrap">
+<div class="card">
+  <h1>Why Step 3 really needs 4D</h1>
+  <p>This version fixes the address model. Step 2 packs each <span class="mono">mct × kct</span> tile into a contiguous MemTile region. Step 3 must then visit <span class="mono">s</span>-wide strips <b>inside each packed kct tile</b>. That creates four independent nested indices.</p>
+  <div class="controls">
+    <div class="control"><label>mct</label><input id="mct" type="number" min="2" max="8" value="4"></div>
+    <div class="control"><label>K</label><input id="K" type="number" min="4" max="32" value="16"></div>
+    <div class="control"><label>kmt</label><input id="kmt" type="number" min="2" max="16" value="8"></div>
+    <div class="control"><label>kct</label><input id="kct" type="number" min="2" max="8" value="4"></div>
+    <div class="control"><label>r</label><input id="r" type="number" min="1" max="4" value="2"></div>
+    <div class="control"><label>s</label><input id="s" type="number" min="1" max="4" value="2"></div>
+    <div class="control"><label>speed</label><select id="speed"><option value="700">slow</option><option value="300" selected>normal</option><option value="110">fast</option></select></div>
+    <button id="rebuild">Rebuild</button><button id="runAll" class="goodbtn">▶ Run all</button><button id="fullscreen">⛶ Full screen</button>
+  </div>
+  <div id="validation" class="note small"></div>
+</div>
+
+<div class="card">
+  <h2>1. ShimTile MM2S — 3D</h2>
+  <p>Read one <span class="mono">mct × K</span> row-major DRAM tile as a sequence of <span class="mono">mct × kmt</span> slabs. Three indices are enough: slab, row, element-in-slab.</p>
+  <div class="controls"><button class="primary" data-play="shim">▶ Play</button><button data-step="shim">Step</button><button data-reset="shim">Reset</button></div>
+  <div class="grid2"><div id="shimMatrix" class="matrix"></div><div>
+    <div class="counters"><div class="ctr"><span>slab q</span><b id="s0">0</b></div><div class="ctr"><span>row i</span><b id="s1">0</b></div><div class="ctr"><span>inside kmt j</span><b id="s2">0</b></div><div class="ctr"><span>DRAM addr</span><b id="s3">0</b></div></div>
+    <div class="eq mono">for q in K/kmt<br>&nbsp;for i in mct<br>&nbsp;&nbsp;for j in kmt<br>&nbsp;&nbsp;&nbsp;addr = i·K + q·kmt + j</div><div class="bar"><i id="shimBar"></i></div>
+  </div></div>
+</div>
+
+<div class="card">
+  <h2>2. MemTile S2MM — 3D, and this changes the physical layout</h2>
+  <p>The incoming <span class="mono">mct × kmt</span> slab is written as consecutive <span class="mono">mct × kct</span> blocks. This tile-major packing is the fact Step 3 must respect.</p>
+  <div class="controls"><button class="primary" data-play="part">▶ Play</button><button data-step="part">Step</button><button data-reset="part">Reset</button></div>
+  <div class="grid2"><div>
+    <h3>Incoming logical tile</h3><div id="partSource" class="matrix"></div>
+    <h3>Physical MemTile after S2MM</h3><div id="partDest" class="tileWrap"></div>
+  </div><div>
+    <div class="counters"><div class="ctr"><span>row i</span><b id="p0">0</b></div><div class="ctr"><span>kct block b</span><b id="p1">0</b></div><div class="ctr"><span>inside kct j</span><b id="p2">0</b></div><div class="ctr"><span>dst physical @</span><b id="p3">0</b></div></div>
+    <div class="eq mono">src = i·kmt + b·kct + j<br>dst = b·(mct·kct) + i·kct + j</div>
+    <div class="note small">After this step, block <span class="mono">b=0</span> occupies one contiguous region, then block <span class="mono">b=1</span>, etc. Step 3 is therefore <b>not</b> reading a plain row-major <span class="mono">mct × kmt</span> matrix.</div><div class="bar"><i id="partBar"></i></div>
+  </div></div>
+</div>
+
+<div class="card" style="border-color:#6c4faa">
+  <h2>3. MemTile MM2S — the actual 4D proof</h2>
+  <p>The required stream takes every <span class="mono">s</span>-wide strip down all <span class="mono">mct</span> rows, then moves to the next strip inside the same <span class="mono">kct</span> tile, and only after that moves to the next packed <span class="mono">kct</span> tile.</p>
+  <div class="controls"><button class="primary" data-play="mm2s">▶ Play required 4D</button><button data-step="mm2s">Step</button><button data-reset="mm2s">Reset</button><button id="playCompare" class="danger">▶ 3D vs 4D</button><button id="search3d">Exhaustive 3D search</button></div>
+
+  <div class="proofGrid">
+    <div>
+      <h3>A. Physical MemTile addresses produced by Step 2</h3>
+      <div id="mm2sTiles" class="tileWrap"></div>
+      <div class="note small">Cell text is <b>physical address</b>. Small text is the logical matrix coordinate. A whole <span class="mono">mct × kct</span> block is contiguous before the next block starts.</div>
+
+      <h3>B. Required four nested loops</h3>
+      <div class="loopStack">
+        <div class="loop l0" id="loopB">for b &nbsp;// which packed kct tile inside kmt</div>
+        <div class="loop l1" id="loopU">for u &nbsp;// which s-wide strip inside kct</div>
+        <div class="loop l2" id="loopI">for i &nbsp;// row inside mct</div>
+        <div class="loop l3" id="loopV">for v &nbsp;// element inside s strip</div>
+      </div>
+      <div class="counters">
+        <div class="ctr" id="ctrB"><span>b: kct tile</span><b id="m0">0</b><em>extent kmt/kct</em></div>
+        <div class="ctr" id="ctrU"><span>u: s-strip</span><b id="m1">0</b><em>extent kct/s</em></div>
+        <div class="ctr" id="ctrI"><span>i: row</span><b id="m2">0</b><em>extent mct</em></div>
+        <div class="ctr" id="ctrV"><span>v: in-strip</span><b id="m3">0</b><em>extent s</em></div>
+      </div>
+      <div class="eq mono" id="mmEq">addr = b·(mct·kct) + u·s + i·kct + v</div>
+      <div class="eq mono">4D sizes = [kmt/kct, kct/s, mct, s]<br>4D strides = [mct·kct, s, kct, 1]</div>
+      <div class="bar"><i id="mm2sBar"></i></div>
+    </div>
+
+    <div>
+      <h3>C. The shortest direct proof: strip bases</h3>
+      <div id="baseChips" class="stripBases"></div>
+      <div id="baseDeltas" class="proofbox mono"></div>
+      <div class="proofbox failbox">
+        <b>Try to collapse <span class="mono">(b,u)</span> into one 3D counter <span class="mono">q</span>.</b>
+        <div class="mono" style="margin-top:7px">3D would need: strip_base(q) = base + q·constant_stride</div>
+        <div id="collapseProof" class="mono" style="margin-top:7px"></div>
+      </div>
+      <div class="note small"><b>This is the missing fourth dimension.</b> A 3D descriptor can keep <span class="mono">i</span> and <span class="mono">v</span>, but then it has only one counter left for both “which strip inside kct” and “which kct tile inside kmt”. Those two cannot be merged because their physical jumps are different.</div>
+
+      <h3>D. 3D vs 4D animated counterexample</h3>
+      <div class="sideBySide">
+        <div class="proofbox failbox"><div class="compareHead"><b>Best collapsed 3D idea</b><span id="threeStatus" class="result">waiting</span></div><div class="tiny mono">q, i, v<br>assume q stride = s</div><div id="threeRead" class="bigfail">—</div><div class="tiny">predicted address</div></div>
+        <div class="proofbox passbox"><div class="compareHead"><b>Required 4D</b><span id="fourStatus" class="result">waiting</span></div><div class="tiny mono">b, u, i, v</div><div id="fourRead" class="bigpass">—</div><div class="tiny">required address</div></div>
+      </div>
+      <div id="compareExplain" class="eq mono">Press “3D vs 4D”.</div>
+      <div id="searchResult" class="proofbox small">Press “Exhaustive 3D search” to test every possible 3D shape factorization for this exact address sequence.</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>4. CompTile S2MM — back to 3D</h2>
+  <p>For one <span class="mono">mct × kct</span> transfer, Step 3 has already made each <span class="mono">s</span>-strip contiguous in the stream. Now <span class="mono">r</span> rows can be linearized with that strip into <span class="mono">z = 0..r·s−1</span>. Only three indices remain: strip-column, microtile-row group, and <span class="mono">r·s</span>.</p>
+  <div class="controls"><button class="primary" data-play="comp">▶ Play</button><button data-step="comp">Step</button><button data-reset="comp">Reset</button></div>
+  <div class="grid2"><div><h3>Incoming stream for one kct tile</h3><div id="compStream" class="stream"></div><h3>Pre-tiled CompTile memory</h3><div id="compDest" class="matrix"></div></div><div>
+    <div class="counters"><div class="ctr"><span>strip u</span><b id="c0">0</b></div><div class="ctr"><span>microtile row g</span><b id="c1">0</b></div><div class="ctr"><span>linear z = r·s</span><b id="c2">0</b></div><div class="ctr"><span>dst @</span><b id="c3">0</b></div></div>
+    <div class="eq mono">for u in kct/s<br>&nbsp;for g in mct/r<br>&nbsp;&nbsp;for z in r·s<br><br>dst = g·(kct/s)·(r·s) + u·(r·s) + z</div>
+    <div class="note small">The important point is not that the tensor “became 3D”. Step 3 already performed the boundary that required distinguishing <span class="mono">b</span> from <span class="mono">u</span>. Step 4 works on one kct tile at a time, so <span class="mono">b</span> is no longer part of this BD.</div><div class="bar"><i id="compBar"></i></div>
+  </div></div>
+</div>
+
+<div class="card"><h2>5. What the paper means</h2>
+  <div class="pipeline">
+    <div class="stage"><b>Shim MM2S — 3D</b><p>mct × K → mct × kmt</p><span class="badge">mct</span><span class="badge">kmt</span><span class="badge">K</span></div><div class="arrow">→</div>
+    <div class="stage"><b>Mem S2MM — 3D</b><p>pack mct × kct blocks</p><span class="badge">mct</span><span class="badge">kct</span><span class="badge">kmt</span></div><div class="arrow">→</div>
+    <div class="stage" style="border-color:#7657ae"><b>Mem MM2S — 4D</b><p>split packed blocks into mct × s strips</p><span class="badge">s</span><span class="badge">mct</span><span class="badge">kct</span><span class="badge">kmt</span></div><div class="arrow">→</div>
+    <div class="stage"><b>Comp S2MM — 3D</b><p>linearize r × s</p><span class="badge">r·s</span><span class="badge">mct</span><span class="badge">kct</span></div>
+  </div>
+  <div class="note"><b>Precise claim:</b> this proves why the Step-3 access sequence cannot be represented by <b>one 3D affine DMA BD</b> for the non-degenerate case <span class="mono">kmt &gt; kct &gt; s</span>. You could still avoid a 4D BD by using multiple 3D BDs, pre-tiling differently, or doing extra software/core shuffles.</div>
+  <div class="source">Sources: <a href="https://arxiv.org/html/2512.13282" target="_blank">Taka et al., Fig. 4 / Sec. 4.3</a> · <a href="https://xilinx.github.io/mlir-aie/dev/AIEDialect/" target="_blank">MLIR-AIE DMA BD documentation</a></div>
+</div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let C={}, S={}, state={}, timers={}, compareTimer=null, runAllTimer=null;
+
+function config(){
+  const c={mct:+$('mct').value,K:+$('K').value,kmt:+$('kmt').value,kct:+$('kct').value,r:+$('r').value,s:+$('s').value};
+  const e=[];
+  if(c.K%c.kmt) e.push('K must be divisible by kmt');
+  if(c.kmt%c.kct) e.push('kmt must be divisible by kct');
+  if(c.kct%c.s) e.push('kct must be divisible by s');
+  if(c.mct%c.r) e.push('mct must be divisible by r');
+  if(c.kmt===c.kct) e.push('For the 4D proof choose kmt > kct (otherwise the outer packed-tile dimension disappears)');
+  if(c.kct===c.s) e.push('For the 4D proof choose kct > s (otherwise the strip-within-tile dimension disappears)');
+  return [c,e];
+}
+function clearAllTimers(){Object.keys(timers).forEach(k=>{clearInterval(timers[k]);timers[k]=null}); if(compareTimer)clearInterval(compareTimer);compareTimer=null;if(runAllTimer)clearTimeout(runAllTimer);runAllTimer=null;}
+function makeMatrix(id,rows,cols,labelFn){const e=$(id);e.innerHTML='';e.style.gridTemplateColumns=`repeat(${cols},53px)`;for(let i=0;i<rows;i++)for(let j=0;j<cols;j++){const d=document.createElement('div');d.className='cell';d.dataset.r=i;d.dataset.c=j;d.dataset.addr=i*cols+j;d.innerHTML=labelFn?labelFn(i,j):`${i*cols+j}`;e.appendChild(d)}}
+function makePackedTiles(id,c,forStep3=false){const host=$(id);host.innerHTML='';for(let b=0;b<c.kmt/c.kct;b++){const box=document.createElement('div');box.className='tileBox';box.dataset.b=b;const t=document.createElement('div');t.className='tileTitle';t.textContent=`kct tile b=${b} · physical @${b*c.mct*c.kct}..${(b+1)*c.mct*c.kct-1}`;box.appendChild(t);const m=document.createElement('div');m.className='matrix';m.style.gridTemplateColumns=`repeat(${c.kct},53px)`;for(let i=0;i<c.mct;i++)for(let j=0;j<c.kct;j++){const phys=b*c.mct*c.kct+i*c.kct+j;const logicalCol=b*c.kct+j;const d=document.createElement('div');d.className='cell';d.dataset.addr=phys;d.dataset.b=b;d.dataset.i=i;d.dataset.j=j;d.innerHTML=`${phys}<small>A[${i},${logicalCol}]</small>`;m.appendChild(d)}box.appendChild(m);host.appendChild(box)}}
+function makeCompDest(c){const rows=c.mct/c.r, cols=(c.kct/c.s)*(c.r*c.s);makeMatrix('compDest',rows,cols,(g,j)=>{const u=Math.floor(j/(c.r*c.s)),z=j%(c.r*c.s);return `${g*cols+j}<small>u${u},z${z}</small>`})}
+function makeStream(id,seq){const e=$(id);e.innerHTML='';seq.forEach((x,n)=>{const d=document.createElement('div');d.className='tok';d.dataset.i=n;d.textContent=x.value;e.appendChild(d)})}
+
+function shimSeq(c){const a=[];for(let q=0;q<c.K/c.kmt;q++)for(let i=0;i<c.mct;i++)for(let j=0;j<c.kmt;j++)a.push({q,i,j,addr:i*c.K+q*c.kmt+j});return a}
+// Incoming logical row-major order; destination is packed kct-tile-major physical memory.
+function partSeq(c){const a=[];for(let i=0;i<c.mct;i++)for(let b=0;b<c.kmt/c.kct;b++)for(let j=0;j<c.kct;j++){const src=i*c.kmt+b*c.kct+j;const dst=b*c.mct*c.kct+i*c.kct+j;a.push({i,b,j,src,dst})}return a}
+// Required MM2S read from packed physical memory: b -> u -> i -> v.
+function mm2sSeq(c){const a=[];for(let b=0;b<c.kmt/c.kct;b++)for(let u=0;u<c.kct/c.s;u++)for(let i=0;i<c.mct;i++)for(let v=0;v<c.s;v++){const addr=b*c.mct*c.kct+u*c.s+i*c.kct+v;const logicalCol=b*c.kct+u*c.s+v;const value=i*c.kmt+logicalCol;a.push({b,u,i,v,addr,value,logicalCol})}return a}
+// Collapsed 3D attempt: q combines b,u. It must choose one constant q-stride. First two strip bases force stride=s.
+function threeAttempt(c){const a=[];const qCount=c.kmt/c.s;for(let q=0;q<qCount;q++)for(let i=0;i<c.mct;i++)for(let v=0;v<c.s;v++){const addr=q*c.s+i*c.kct+v;a.push({q,i,v,addr})}return a}
+// One kct tile only. Incoming order from MM2S is u -> i -> v, and i can be factored as g,rr so z=rr*s+v.
+function compSeq(c){const a=[];const b=0;for(let u=0;u<c.kct/c.s;u++)for(let g=0;g<c.mct/c.r;g++)for(let z=0;z<c.r*c.s;z++){const rr=Math.floor(z/c.s),v=z%c.s,i=g*c.r+rr;const srcAddr=b*c.mct*c.kct+u*c.s+i*c.kct+v;const value=i*c.kmt+u*c.s+v;const dst=g*(c.kct/c.s)*(c.r*c.s)+u*(c.r*c.s)+z;a.push({u,g,z,srcAddr,value,dst})}return a}
+
+function highlightCell(container,addr,cls='active'){document.querySelectorAll(`#${container} .cell`).forEach(x=>x.classList.remove('active','bad','pred'));const el=document.querySelector(`#${container} .cell[data-addr="${addr}"]`);if(el)el.classList.add(cls)}
+function markPacked(container,b,addr,cls='active'){document.querySelectorAll(`#${container} .tileBox`).forEach(x=>x.classList.toggle('activeTile',+x.dataset.b===b));highlightCell(container,addr,cls)}
+function clearVisual(container){document.querySelectorAll(`#${container} .cell`).forEach(x=>x.classList.remove('active','done','bad','pred'));document.querySelectorAll(`#${container} .tileBox`).forEach(x=>x.classList.remove('activeTile'))}
+function streamStep(id,index){document.querySelectorAll(`#${id} .tok`).forEach((t,j)=>{t.classList.toggle('active',j===index);if(j<index)t.classList.add('done');else t.classList.remove('done')})}
+function setBar(id,i,n){$(id).style.width=`${n?100*(i+1)/n:0}%`}
+function stop(name){if(timers[name])clearInterval(timers[name]);timers[name]=null}
+function reset(name,containers=[],bar=null){stop(name);state[name]=0;containers.forEach(clearVisual);if(bar)$(bar).style.width='0%'}
+function play(name,fn){if(timers[name]){stop(name);return}timers[name]=setInterval(fn,+$('speed').value)}
+
+function shimStep(){const seq=S.shim,i=state.shim||0;if(i>=seq.length){stop('shim');return}const x=seq[i];highlightCell('shimMatrix',x.addr);$('s0').textContent=x.q;$('s1').textContent=x.i;$('s2').textContent=x.j;$('s3').textContent=x.addr;setBar('shimBar',i,seq.length);state.shim=i+1}
+function partStep(){const seq=S.part,i=state.part||0;if(i>=seq.length){stop('part');return}const x=seq[i];highlightCell('partSource',x.src);markPacked('partDest',x.b,x.dst);$('p0').textContent=x.i;$('p1').textContent=x.b;$('p2').textContent=x.j;$('p3').textContent=x.dst;setBar('partBar',i,seq.length);state.part=i+1}
+function changedLevel(prev,x){if(!prev)return 'v';if(prev.b!==x.b)return 'b';if(prev.u!==x.u)return 'u';if(prev.i!==x.i)return 'i';return 'v'}
+function lightLoop(level){['B','U','I','V'].forEach(k=>{$(`loop${k}`).classList.remove('hot');$(`ctr${k}`).classList.remove('changed')});const k=level.toUpperCase();$(`loop${k}`).classList.add('hot');$(`ctr${k}`).classList.add('changed')}
+function mm2sStep(){const seq=S.mm2s,i=state.mm2s||0;if(i>=seq.length){stop('mm2s');return}const x=seq[i],prev=i?seq[i-1]:null;markPacked('mm2sTiles',x.b,x.addr);$('m0').textContent=x.b;$('m1').textContent=x.u;$('m2').textContent=x.i;$('m3').textContent=x.v;lightLoop(changedLevel(prev,x));$('mmEq').innerHTML=`addr = ${x.b}·(${C.mct}·${C.kct}) + ${x.u}·${C.s} + ${x.i}·${C.kct} + ${x.v} = <b class="cyan">${x.addr}</b>`;document.querySelectorAll('.baseChip').forEach(ch=>ch.classList.toggle('hot',+ch.dataset.b===x.b && +ch.dataset.u===x.u));setBar('mm2sBar',i,seq.length);state.mm2s=i+1}
+function compStep(){const seq=S.comp,i=state.comp||0;if(i>=seq.length){stop('comp');return}const x=seq[i];streamStep('compStream',i);highlightCell('compDest',x.dst);$('c0').textContent=x.u;$('c1').textContent=x.g;$('c2').textContent=x.z;$('c3').textContent=x.dst;setBar('compBar',i,seq.length);state.comp=i+1}
+
+function buildBaseProof(c){const bases=[];for(let b=0;b<c.kmt/c.kct;b++)for(let u=0;u<c.kct/c.s;u++)bases.push({b,u,base:b*c.mct*c.kct+u*c.s});$('baseChips').innerHTML=bases.map(x=>`<div class="baseChip" data-b="${x.b}" data-u="${x.u}">b${x.b},u${x.u} → @${x.base}</div>`).join('');const ds=bases.slice(1).map((x,i)=>x.base-bases[i].base);$('baseDeltas').innerHTML=`strip bases = [${bases.map(x=>x.base).join(', ')}]<br>successive Δ = [${ds.map(x=>(x>=0?'+':'')+x).join(', ')}]`;
+  if(bases.length>=3){const stride=bases[1].base-bases[0].base,pred=bases[0].base+2*stride,req=bases[2].base;$('collapseProof').innerHTML=`q=0 → ${bases[0].base}<br>q=1 → ${bases[1].base} ⇒ constant stride must be <b>${stride}</b><br>q=2: 3D predicts <b class="badText">${pred}</b>, but required is <b class="ok">${req}</b> → FAIL`;}
+}
+function compareStart(){if(compareTimer){clearInterval(compareTimer);compareTimer=null;return}let i=0;const req=S.mm2s,tri=S.three;$('threeStatus').textContent='running';$('fourStatus').textContent='running';compareTimer=setInterval(()=>{if(i>=req.length){clearInterval(compareTimer);compareTimer=null;$('fourStatus').innerHTML='<span class="ok">MATCH</span>';if(!$('threeStatus').innerHTML.includes('FAIL'))$('threeStatus').innerHTML='<span class="badText">FAIL</span>';return}const a=tri[i],b=req[i],same=a.addr===b.addr;$('threeRead').textContent='@'+a.addr;$('fourRead').textContent='@'+b.addr;markPacked('mm2sTiles',b.b,b.addr,same?'active':'bad');$('compareExplain').innerHTML=`element ${i}: 3D(q=${a.q},i=${a.i},v=${a.v}) predicts @${a.addr}; 4D(b=${b.b},u=${b.u},i=${b.i},v=${b.v}) requires @${b.addr} ${same?'<span class="ok">✓</span>':'<span class="badText">✗ FIRST MISMATCH — q crossed a kct-tile boundary but has no separate b counter.</span>'}`;if(!same){$('threeStatus').innerHTML='<span class="badText">FAIL</span>';$('fourStatus').innerHTML='<span class="ok">CORRECT</span>';clearInterval(compareTimer);compareTimer=null;return}i++},+$('speed').value)}
+function exhaustive3D(){const seq=S.mm2s.map(x=>x.addr),N=seq.length;let tested=0,matches=[];for(let n0=1;n0<=N;n0++){if(N%n0)continue;for(let n1=1;n1<=N/n0;n1++){if(N%(n0*n1))continue;const n2=N/(n0*n1);tested++;const s0=n0>1?seq[1]-seq[0]:0;const s1=n1>1?seq[n0]-seq[0]:0;const s2=n2>1?seq[n0*n1]-seq[0]:0;let k=0,good=true;for(let i2=0;i2<n2&&good;i2++)for(let i1=0;i1<n1&&good;i1++)for(let i0=0;i0<n0;i0++){const pred=seq[0]+i0*s0+i1*s1+i2*s2;if(pred!==seq[k++]){good=false;break}}if(good)matches.push({n0,n1,n2,s0,s1,s2})}}
+  $('searchResult').innerHTML=matches.length?`<span class="warn"><b>${matches.length} matching 3D descriptors found</b></span><br>${matches.map(x=>JSON.stringify(x)).join('<br>')}`:`<span class="ok"><b>0 exact 3D affine descriptors.</b></span><br>Tested ${tested} possible 3D shape factorizations of ${N} accesses. For each shape, the address sequence forces its constant strides; none reproduces the required Step-3 sequence.`}
+function rebuild(){clearAllTimers();const [c,errs]=config();C=c;if(errs.length){$('validation').innerHTML=`<span class="warn"><b>Configuration note:</b> ${errs.join('; ')}</span>`;return}$('validation').innerHTML=`<span class="ok">Proof case is non-degenerate:</span> kmt/kct=${c.kmt/c.kct} packed kct tiles, kct/s=${c.kct/c.s} s-strips per tile, mct=${c.mct} rows. The Step-3 descriptor therefore needs indices (b,u,i,v).`;
+  S.shim=shimSeq(c);S.part=partSeq(c);S.mm2s=mm2sSeq(c);S.three=threeAttempt(c);S.comp=compSeq(c);state={shim:0,part:0,mm2s:0,comp:0};
+  makeMatrix('shimMatrix',c.mct,c.K,(i,j)=>`${i*c.K+j}<small>A[${i},${j}]</small>`);makeMatrix('partSource',c.mct,c.kmt,(i,j)=>`${i*c.kmt+j}<small>A[${i},${j}]</small>`);makePackedTiles('partDest',c);makePackedTiles('mm2sTiles',c,true);makeStream('compStream',S.comp);makeCompDest(c);buildBaseProof(c);
+  ['shimBar','partBar','mm2sBar','compBar'].forEach(id=>$(id).style.width='0%');$('searchResult').textContent='Press “Exhaustive 3D search” to test every possible 3D shape factorization for this exact address sequence.';$('threeRead').textContent='—';$('fourRead').textContent='—';$('threeStatus').textContent='waiting';$('fourStatus').textContent='waiting';$('compareExplain').textContent='Press “3D vs 4D”.';
+}
+const F={shim:shimStep,part:partStep,mm2s:mm2sStep,comp:compStep};
+document.querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>play(b.dataset.play,F[b.dataset.play]));
+document.querySelectorAll('[data-step]').forEach(b=>b.onclick=()=>F[b.dataset.step]());
+document.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>{const n=b.dataset.reset;if(n==='shim')reset(n,['shimMatrix'],'shimBar');if(n==='part')reset(n,['partSource','partDest'],'partBar');if(n==='mm2s'){reset(n,['mm2sTiles'],'mm2sBar');lightLoop('v')}if(n==='comp')reset(n,['compDest'],'compBar')});
+$('playCompare').onclick=compareStart;$('search3d').onclick=exhaustive3D;$('rebuild').onclick=rebuild;$('fullscreen').onclick=()=>document.documentElement.requestFullscreen?.();
+$('runAll').onclick=()=>{rebuild();const delay=+$('speed').value;play('shim',shimStep);runAllTimer=setTimeout(()=>{stop('shim');play('part',partStep);runAllTimer=setTimeout(()=>{stop('part');play('mm2s',mm2sStep);runAllTimer=setTimeout(()=>{stop('mm2s');play('comp',compStep)},S.mm2s.length*delay+500)},S.part.length*delay+500)},Math.min(S.shim.length,64)*delay+500)};
+rebuild();
+</script>
+</body></html>
